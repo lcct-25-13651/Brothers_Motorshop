@@ -4,3 +4,6 @@
 parts.csv
 services.csv
 .vscode/
+
+users.csv
+build.log

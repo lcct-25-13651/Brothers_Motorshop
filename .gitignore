@@ -1,0 +1,6 @@
+*.exe
+*.o
+*.obj
+parts.csv
+services.csv
+.vscode/

@@ -7,3 +7,9 @@ services.csv
 
 users.csv
 build.log
+build_errors.txt
+compile.txt
+full.txt
+link.txt
+syntax.txt
+t.cpp

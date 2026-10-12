@@ -1,30 +1,40 @@
 // ============================================================================
-//  RE Parts Tracker  v2.0
+//  RE Parts Tracker  v2.1
 //  A Bajaj RE Components and Inventory Management System in C++
 //
-//  - Standard C++17, no 3rd-party libraries. Console (CLI) app PLUS an optional
-//    local web dashboard you can open in Chrome (plain sockets, no GUI toolkit).
-//  - NEW: login / logout system (salted + iterated SHA-256 password hashes,
-//    constant-time comparison, hidden password entry, attempt lockout).
-//  - NEW: redesigned console UI (double-border banners, boxed tables, status
-//    panels, colour when the terminal supports it).
-//  - Parts are stored in parts.csv: loaded on start-up and saved
-//    automatically after every create / update / delete.
+//  - Standard C++17, no 3rd-party libraries. Console (CLI) app PLUS a local web
+//    dashboard you can open in Chrome (plain sockets, no GUI toolkit, no JS framework).
+//  - Parts are stored in parts.csv: loaded on start-up and saved after every change.
+//
+//  NEW in v2.1
+//  - Stock history / audit log: every add, edit, delete and +/- adjustment is
+//    appended to history.csv (timestamp, part, change, quantity, new stock level,
+//    user, details) and shown in the dashboard ("Stock history") and console (menu 12).
+//  - Sortable inventory table (click ID / Name / System / Price / Qty headers) and a
+//    printable Reorder list of low-stock parts with the quantity needed (web /reorder,
+//    console menu 13).
+//  - "Download CSV Export" button (parts + history) and automatic backups: before
+//    parts.csv is overwritten, the previous version is copied to
+//    backups/parts_backup_YYYYMMDD_HHMMSS.csv (all kept for 7 days, then the newest
+//    per day for 90 days).
+//  - No hard-coded password or recovery answer. The first start asks you to choose
+//    an admin password and a recovery question/answer; both can be changed later
+//    (console menu 14 or the web "Security" page). Only salted, 20,000-round SHA-256
+//    hashes are stored, in users.csv.
 //
 //  Build (Windows, MSYS2/MinGW-w64 g++ 9 or newer):
-//      g++ -std=c++17 -Wall -Wextra main.cpp -o re_parts_tracker.exe -lws2_32
+//      g++ -std=c++17 main.cpp -o main.exe -lws2_32
 //  Build (Linux / macOS):
-//      g++ -std=c++17 -Wall -Wextra main.cpp -o re_parts_tracker
+//      g++ -std=c++17 main.cpp -o main
 //  Console-only build (no sockets, no -lws2_32 needed):
-//      g++ -std=c++17 -Wall -Wextra -DRE_NO_WEB main.cpp -o re_parts_tracker.exe
+//      g++ -std=c++17 -DRE_NO_WEB main.cpp -o main.exe
 //
-//  Run console : re_parts_tracker.exe          (menu option 11 starts the web mode)
-//  Run in Chrome: re_parts_tracker.exe web     (opens http://localhost:8080)
+//  Run console : main.exe          (menu option 11 starts the web mode)
+//  Run in Chrome: main.exe web     (opens http://localhost:8080)
 //
-//  Default login:  admin / password123   (see the "auth" section to change it)
-//  Forgot password (web): answer the security question "What is the secret admin code?"
-//      default answer RE-ADMIN-2026 (Authenticator::kRecoveryAnswer); new passwords are saved in users.csv.
-//  The console and the web dashboard use the same accounts.
+//  Lost both the password and the recovery answer?  Close the program, delete
+//  users.csv and start it again: the first-time setup will run. (Part data,
+//  history and backups are not touched.)
 //  Tip: use a terminal at least 100 columns wide.
 // ============================================================================
 
@@ -196,6 +206,61 @@ std::vector<std::string> wrap(const std::string& text, size_t width) {
     return lines;
 }
 
+
+// ---- CSV helpers shared by parts.csv, history.csv and users.csv (RFC-4180 style) ----
+std::string csvEscape(const std::string& field) {
+    if (field.find_first_of(",\"\n\r") == std::string::npos) return field;
+    std::string out = "\"";
+    for (char c : field) {
+        if (c == '"') out += "\"\"";
+        else out += c;
+    }
+    out += '"';
+    return out;
+}
+
+std::vector<std::string> splitCSV(const std::string& line) {
+    std::vector<std::string> fields;
+    std::string cur;
+    bool inQuotes = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        char c = line[i];
+        if (inQuotes) {
+            if (c == '"') {
+                if (i + 1 < line.size() && line[i + 1] == '"') { cur += '"'; ++i; }
+                else inQuotes = false;
+            } else cur += c;
+        } else if (c == '"') inQuotes = true;
+        else if (c == ',') { fields.push_back(cur); cur.clear(); }
+        else if (c != '\r') cur += c;
+    }
+    fields.push_back(cur);
+    return fields;
+}
+
+// Newlines would break the one-record-per-line CSV files, so flatten them.
+std::string oneLine(std::string s) {
+    for (char& c : s) if (c == '\n' || c == '\r') c = ' ';
+    return s;
+}
+
+// ---- Time helpers (std::chrono for "now", strftime only for text formatting) ----
+inline std::tm localTime(std::chrono::system_clock::time_point tp) {
+    const std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm out{};
+    if (const std::tm* p = std::localtime(&t)) out = *p;  // the app is single-threaded, so this is safe
+    return out;
+}
+
+inline std::string formatTime(std::chrono::system_clock::time_point tp, const char* fmt) {
+    const std::tm tmv = localTime(tp);
+    char buf[64] = "";
+    std::strftime(buf, sizeof buf, fmt, &tmv);
+    return buf;
+}
+
+inline std::string nowStamp() { return formatTime(std::chrono::system_clock::now(), "%Y-%m-%d %H:%M:%S"); }
+
 }  // namespace util
 
 // ----------------------------------------------------------------------------
@@ -207,8 +272,8 @@ std::vector<std::string> wrap(const std::string& text, size_t width) {
 //  Login compares hashes in constant time and does the same amount of work
 //  for unknown usernames, so the response does not reveal which part was wrong.
 //
-//  To add / change an account: run   re_parts_tracker.exe --make-credential
-//  and paste the line it prints into defaultUsers() below.
+//  The admin account and its recovery phrase are NOT in the source code. They
+//  are created by the first-run setup prompt and stored (hashed) in users.csv.
 // ----------------------------------------------------------------------------
 namespace auth {
 
@@ -304,30 +369,78 @@ bool constantTimeEquals(const std::string& a, const std::string& b) {
 struct Credential {
     std::string username;
     std::string salt;
-    std::string hash;  // hex of hashPassword(salt, password)
+    std::string hash;         // hex of hashPassword(salt, password)
+    std::string recQuestion;  // shown on the "forgot password" page (not secret)
+    std::string recSalt;
+    std::string recHash;      // hex of hashPassword(recSalt, normalised answer); empty = not set up
 };
 
-// ---- Pre-configured accounts (default: admin / password123) ----
-std::vector<Credential> defaultUsers() {
-    return {
-        {"admin", "RE-PT:admin:9f3a1c7e", "e9f105d04cdf49007ae23da0762c82875784a557ea121b4c46118158c1548ed7"},
-    };
-}
+// Rules enforced everywhere a password / recovery phrase is created or changed.
+namespace policy {
+constexpr size_t kMinPassword = 8, kMaxPassword = 128;
+constexpr size_t kMinRecovery = 8, kMaxRecovery = 128;
+constexpr size_t kMinQuestion = 5, kMaxQuestion = 120;
+}  // namespace policy
 
-std::string randomSalt(const std::string& username);  // defined just below
+std::string randomSalt(const std::string& username);  // defined below the class
 
+// ----------------------------------------------------------------------------
+//  There are NO built-in credentials and NO recovery answer in this source
+//  file. The admin account is created by the first-run setup prompt and lives
+//  in users.csv as:  username,salt,hash,recoverySalt,recoveryHash,question
+//  (only salted + stretched hashes are stored; the recovery phrase is hashed
+//  exactly like a password). Both can be changed later - from the console
+//  menu or the web "Security" page - after proving the current password.
+// ----------------------------------------------------------------------------
 class Authenticator {
 public:
-    // ---- "Forgot password" recovery (preset security question) ----
-    // CHANGE kRecoveryAnswer before handing the app to anyone else.
-    static constexpr const char* kRecoveryQuestion = "What is the secret admin code?";
-    static constexpr const char* kRecoveryAnswer = "RE-ADMIN-2026";   // case-insensitive
-    static constexpr const char* kUsersFile = "users.csv";            // saved password changes
+    static constexpr const char* kUsersFile = "users.csv";
+    static constexpr const char* kAdminName = "admin";
 
-    Authenticator() : users_(defaultUsers()) {
-        recoverySalt_ = "RE-PT:recovery:5c1e84ab";
-        recoveryHash_ = hashPassword(recoverySalt_, normAnswer(kRecoveryAnswer));
-        loadSaved();
+    Authenticator() { loadSaved(); }
+
+    // False on a brand-new install: the first-run setup must create the admin account.
+    bool isConfigured() const { return !users_.empty(); }
+    bool hasRecovery(const std::string& username) const {
+        const Credential* c = find(username);
+        return c != nullptr && !c->recHash.empty();
+    }
+    // Question of the (single) admin account, for the "forgot password" page. "" = not set up.
+    std::string recoveryQuestion() const {
+        return users_.empty() || users_.front().recHash.empty() ? std::string() : users_.front().recQuestion;
+    }
+    std::string adminName() const { return users_.empty() ? std::string(kAdminName) : users_.front().username; }
+
+    // ---- Validation (returns an error message, or "" when acceptable) ----
+    static std::string checkPassword(const std::string& pw) {
+        if (pw.size() < policy::kMinPassword || pw.size() > policy::kMaxPassword)
+            return "Password must be " + std::to_string(policy::kMinPassword) + " to " + std::to_string(policy::kMaxPassword) + " characters.";
+        return "";
+    }
+    static std::string checkRecovery(const std::string& question, const std::string& answer) {
+        const std::string q = util::trim(question), a = normAnswer(answer);
+        if (q.size() < policy::kMinQuestion || q.size() > policy::kMaxQuestion)
+            return "The recovery question must be " + std::to_string(policy::kMinQuestion) + " to " + std::to_string(policy::kMaxQuestion) + " characters.";
+        if (a.size() < policy::kMinRecovery || a.size() > policy::kMaxRecovery)
+            return "The recovery answer must be " + std::to_string(policy::kMinRecovery) + " to " + std::to_string(policy::kMaxRecovery) + " characters.";
+        return "";
+    }
+
+    // ---- First-run setup: creates the admin account. Returns "" on success. ----
+    std::string initialSetup(const std::string& password, const std::string& question, const std::string& answer) {
+        if (isConfigured()) return "An account already exists.";
+        std::string err = checkPassword(password);
+        if (err.empty()) err = checkRecovery(question, answer);
+        if (!err.empty()) return err;
+        if (normAnswer(answer) == util::toLower(util::trim(password))) return "The recovery answer must be different from the password.";
+        Credential c;
+        c.username = kAdminName;
+        c.salt = randomSalt(c.username);
+        c.hash = hashPassword(c.salt, password);
+        fillRecovery(c, question, answer);
+        users_.push_back(c);
+        if (!saveUsers()) { users_.clear(); return std::string("Could not write '") + kUsersFile + "'. Check that the folder is writable."; }
+        return "";
     }
 
     // Returns the canonical username on success.
@@ -345,58 +458,128 @@ public:
     // Checks the recovery answer for an existing account (constant-time).
     std::optional<std::string> verifyRecovery(const std::string& username, const std::string& answer) const {
         const Credential* found = find(username);
-        const bool ok = constantTimeEquals(hashPassword(recoverySalt_, normAnswer(answer)), recoveryHash_) && found != nullptr;
+        const bool has = found != nullptr && !found->recHash.empty();
+        const std::string salt = has ? found->recSalt : std::string("RE-PT:no-such-recovery");
+        const std::string computed = hashPassword(salt, normAnswer(answer));
+        const bool ok = constantTimeEquals(computed, has ? found->recHash : std::string(64, '0')) && has;
         if (ok) return found->username;
         return std::nullopt;
     }
 
-    // Sets a new password (fresh salt) and saves it to users.csv. False = unknown user.
+    // Used by the "forgot password" flow (identity already proven by the recovery answer).
     bool setPassword(const std::string& username, const std::string& newPassword) {
-        for (Credential& c : users_) {
-            if (util::equalsIgnoreCase(c.username, username)) {
-                c.salt = randomSalt(c.username);
-                c.hash = hashPassword(c.salt, newPassword);
-                saveOk_ = saveUsers();
-                return true;
-            }
-        }
-        return false;
+        Credential* c = findMutable(username);
+        if (!c) return false;
+        c->salt = randomSalt(c->username);
+        c->hash = hashPassword(c->salt, newPassword);
+        saveOk_ = saveUsers();
+        return true;
     }
+
+    // Change password: needs the current password. Returns "" on success, else an error message.
+    std::string changePassword(const std::string& username, const std::string& current, const std::string& newPassword) {
+        if (!login(username, current)) return "The current password is incorrect.";
+        std::string err = checkPassword(newPassword);
+        if (!err.empty()) return err;
+        const Credential* c = find(username);
+        if (c && !c->recHash.empty() && constantTimeEquals(hashPassword(c->recSalt, normAnswer(newPassword)), c->recHash))
+            return "The new password must be different from the recovery answer.";
+        if (!setPassword(username, newPassword) || !saveOk_) return std::string("Password changed for this session, but '") + kUsersFile + "' could not be saved.";
+        return "";
+    }
+
+    // Change recovery question + answer: needs the current password. Returns "" on success.
+    std::string changeRecovery(const std::string& username, const std::string& currentPassword,
+                               const std::string& question, const std::string& answer) {
+        if (!login(username, currentPassword)) return "The current password is incorrect.";
+        std::string err = checkRecovery(question, answer);
+        if (!err.empty()) return err;
+        if (normAnswer(answer) == util::toLower(util::trim(currentPassword))) return "The recovery answer must be different from the password.";
+        Credential* c = findMutable(username);
+        if (!c) return "Account not found.";
+        fillRecovery(*c, question, answer);
+        if (!saveUsers()) return std::string("Recovery phrase changed for this session, but '") + kUsersFile + "' could not be saved.";
+        return "";
+    }
+
     bool lastSaveOk() const { return saveOk_; }
 
 private:
     std::vector<Credential> users_;
-    std::string recoverySalt_, recoveryHash_;
     bool saveOk_ = true;
 
     static std::string normAnswer(const std::string& s) { return util::toLower(util::trim(s)); }
+
+    static void fillRecovery(Credential& c, const std::string& question, const std::string& answer) {
+        c.recQuestion = util::oneLine(util::trim(question));
+        c.recSalt = randomSalt(c.username + ":rec");
+        c.recHash = hashPassword(c.recSalt, normAnswer(answer));
+    }
 
     const Credential* find(const std::string& username) const {
         for (const Credential& c : users_)
             if (util::equalsIgnoreCase(c.username, username)) return &c;
         return nullptr;
     }
-
-    bool saveUsers() const {
-        std::ofstream out(kUsersFile, std::ios::trunc);
-        if (!out) return false;
-        for (const Credential& c : users_) out << c.username << ',' << c.salt << ',' << c.hash << '\n';
-        out.flush();
-        return static_cast<bool>(out);
+    Credential* findMutable(const std::string& username) {
+        for (Credential& c : users_)
+            if (util::equalsIgnoreCase(c.username, username)) return &c;
+        return nullptr;
     }
 
-    // users.csv (username,salt,hash) overrides the built-in default password.
+    // Written to a temp file and swapped in, so a crash can never leave a half-written
+    // users.csv (which would lock the admin out).
+    bool saveUsers() {
+        const std::string tmp = std::string(kUsersFile) + ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::trunc);
+            if (!out) return saveOk_ = false;
+            for (const Credential& c : users_)
+                out << util::csvEscape(c.username) << ',' << c.salt << ',' << c.hash << ',' << c.recSalt << ',' << c.recHash << ','
+                    << util::csvEscape(c.recQuestion) << '\n';
+            out.flush();
+            if (!out) return saveOk_ = false;
+        }
+        std::error_code ec;
+        // Best effort: owner-only access (honoured on Linux/macOS; mostly ignored on Windows).
+        std::filesystem::permissions(tmp, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::replace, ec);
+        ec.clear();
+        std::filesystem::rename(tmp, kUsersFile, ec);
+        if (ec) {
+            std::filesystem::remove(kUsersFile, ec);
+            std::filesystem::rename(tmp, kUsersFile, ec);
+        }
+        return saveOk_ = !ec;
+    }
+
+    // users.csv: username,salt,hash[,recoverySalt,recoveryHash,question]
+    // (the older 3-column format loads fine; such accounts just have no recovery phrase yet).
     void loadSaved() {
         std::ifstream in(kUsersFile);
+        if (!in) return;
         std::string line;
+        bool sawContent = false;
         while (std::getline(in, line)) {
+            if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF && static_cast<unsigned char>(line[1]) == 0xBB &&
+                static_cast<unsigned char>(line[2]) == 0xBF)
+                line.erase(0, 3);
             if (!line.empty() && line.back() == '\r') line.pop_back();
-            const size_t c1 = line.find(','), c2 = c1 == std::string::npos ? c1 : line.find(',', c1 + 1);
-            if (c2 == std::string::npos) continue;
-            const std::string name = line.substr(0, c1), salt = line.substr(c1 + 1, c2 - c1 - 1), hash = line.substr(c2 + 1);
-            if (hash.size() != 64) continue;
-            for (Credential& u : users_)
-                if (util::equalsIgnoreCase(u.username, name)) { u.salt = salt; u.hash = hash; }
+            if (util::trim(line).empty()) continue;
+            sawContent = true;
+            const std::vector<std::string> f = util::splitCSV(line);
+            if (f.size() < 3 || f[0].empty() || f[2].size() != 64 || find(f[0])) continue;
+            Credential c;
+            c.username = f[0];
+            c.salt = f[1];
+            c.hash = f[2];
+            if (f.size() >= 6 && f[4].size() == 64) { c.recSalt = f[3]; c.recHash = f[4]; c.recQuestion = f[5]; }
+            users_.push_back(c);
+        }
+        if (sawContent && users_.empty()) {  // unreadable file: keep a copy before setup could replace it
+            std::error_code ec;
+            std::filesystem::copy_file(kUsersFile, std::string(kUsersFile) + ".corrupt",
+                                       std::filesystem::copy_options::overwrite_existing, ec);
         }
     }
 };
@@ -406,6 +589,8 @@ std::string randomSalt(const std::string& username) {
     static const char* digits = "0123456789abcdef";
     std::string s = "RE-PT:" + username + ":";
     for (int i = 0; i < 16; ++i) s += digits[rd() % 16];
+    // Mix in the clock so a weak random_device (old MinGW) still gives unique salts.
+    s += digits[static_cast<unsigned>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) % 16];
     return s;
 }
 
@@ -440,16 +625,7 @@ public:
     double stockValue() const { return price_ * quantity_; }
 
     // ---- CSV serialisation (RFC-4180 style quoting) ----
-    static std::string csvEscape(const std::string& field) {
-        if (field.find_first_of(",\"\n\r") == std::string::npos) return field;
-        std::string out = "\"";
-        for (char c : field) {
-            if (c == '"') out += "\"\"";
-            else out += c;
-        }
-        out += '"';
-        return out;
-    }
+    static std::string csvEscape(const std::string& field) { return util::csvEscape(field); }
 
     std::string toCSV() const {
         std::ostringstream os;
@@ -458,25 +634,7 @@ public:
         return os.str();
     }
 
-    // Splits one CSV line into fields, honouring quoted fields.
-    static std::vector<std::string> splitCSV(const std::string& line) {
-        std::vector<std::string> fields;
-        std::string cur;
-        bool inQuotes = false;
-        for (size_t i = 0; i < line.size(); ++i) {
-            char c = line[i];
-            if (inQuotes) {
-                if (c == '"') {
-                    if (i + 1 < line.size() && line[i + 1] == '"') { cur += '"'; ++i; }
-                    else inQuotes = false;
-                } else cur += c;
-            } else if (c == '"') inQuotes = true;
-            else if (c == ',') { fields.push_back(cur); cur.clear(); }
-            else if (c != '\r') cur += c;
-        }
-        fields.push_back(cur);
-        return fields;
-    }
+    static std::vector<std::string> splitCSV(const std::string& line) { return util::splitCSV(line); }
 
     static bool isHeaderLine(const std::string& line) {
         auto f = splitCSV(line);
@@ -529,34 +687,208 @@ private:
 };
 
 // ----------------------------------------------------------------------------
-//  InventoryManager: owns the collection, CRUD, search, alerts, persistence
+//  HistoryEntry / HistoryLog: the stock-movement audit trail (history.csv)
+//
+//  Columns: Timestamp,PartID,PartName,Action,Change,QtyChanged,UpdatedStock,User,Details
+//    Action     : Add Part | Edit Part | Delete Part | Adjust Stock
+//    Change     : "+" stock went up, "-" stock went down, "=" stock unchanged (e.g. a price edit)
+//    QtyChanged : how many units moved (always >= 0; the sign is in Change)
+//  The file is append-only: every record is written the moment the change happens.
+// ----------------------------------------------------------------------------
+struct HistoryEntry {
+    std::string timestamp;  // "YYYY-MM-DD HH:MM:SS" (local time)
+    int partId = 0;
+    std::string partName;
+    std::string action;
+    char change = '=';
+    int qtyChanged = 0;
+    int stockAfter = 0;
+    std::string user;
+    std::string details;
+};
+
+class HistoryLog {
+public:
+    explicit HistoryLog(std::string filename = "history.csv") : filename_(std::move(filename)) { load(); }
+
+    // Appends one record to memory and to the file. Returns false if the file could not be written.
+    bool record(HistoryEntry e) {
+        e.partName = util::oneLine(e.partName);
+        e.details = util::oneLine(e.details);
+        e.user = util::oneLine(e.user);
+        entries_.push_back(e);
+        std::error_code ec;
+        const bool needHeader = !std::filesystem::exists(filename_, ec) || std::filesystem::file_size(filename_, ec) == 0;
+        std::ofstream out(filename_, std::ios::app);
+        if (!out) { lastError_ = "Could not write '" + filename_ + "'."; return false; }
+        if (needHeader) out << kHeader << '\n';
+        out << toLine(e) << '\n';
+        out.flush();
+        if (!out) { lastError_ = "Write error while saving '" + filename_ + "'."; return false; }
+        return true;
+    }
+
+    const std::vector<HistoryEntry>& entries() const { return entries_; }
+
+    // Newest first, at most 'limit' rows (0 = all).
+    std::vector<const HistoryEntry*> recent(size_t limit) const {
+        std::vector<const HistoryEntry*> out;
+        for (size_t i = entries_.size(); i-- > 0;) {
+            if (limit != 0 && out.size() >= limit) break;
+            out.push_back(&entries_[i]);
+        }
+        return out;
+    }
+
+    std::string toCsv() const {
+        std::string out = std::string(kHeader) + "\n";
+        for (const HistoryEntry& e : entries_) out += toLine(e) + "\n";
+        return out;
+    }
+
+    const std::string& filename() const { return filename_; }
+    const std::string& lastError() const { return lastError_; }
+
+private:
+    static constexpr const char* kHeader = "Timestamp,PartID,PartName,Action,Change,QtyChanged,UpdatedStock,User,Details";
+
+    static std::string toLine(const HistoryEntry& e) {
+        std::ostringstream os;
+        os << util::csvEscape(e.timestamp) << ',' << e.partId << ',' << util::csvEscape(e.partName) << ',' << util::csvEscape(e.action)
+           << ',' << e.change << ',' << e.qtyChanged << ',' << e.stockAfter << ',' << util::csvEscape(e.user) << ','
+           << util::csvEscape(e.details);
+        return os.str();
+    }
+
+    void load() {
+        std::ifstream in(filename_);
+        std::string line;
+        bool first = true;
+        while (std::getline(in, line)) {
+            if (first) {
+                first = false;
+                if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF && static_cast<unsigned char>(line[1]) == 0xBB &&
+                    static_cast<unsigned char>(line[2]) == 0xBF)
+                    line.erase(0, 3);
+            }
+            if (util::trim(line).empty()) continue;
+            const std::vector<std::string> f = util::splitCSV(line);
+            if (f.size() < 8) continue;
+            try {
+                HistoryEntry e;
+                e.timestamp = f[0];
+                e.partId = std::stoi(f[1]);  // the header row throws here and is skipped
+                e.partName = f[2];
+                e.action = f[3];
+                e.change = f[4].empty() ? '=' : f[4][0];
+                e.qtyChanged = std::stoi(f[5]);
+                e.stockAfter = std::stoi(f[6]);
+                e.user = f[7];
+                if (f.size() > 8) e.details = f[8];
+                entries_.push_back(e);
+            } catch (const std::exception&) {
+            }
+        }
+    }
+
+    std::string filename_;
+    std::vector<HistoryEntry> entries_;
+    std::string lastError_;
+};
+
+enum class SortKey { Id, Name, Price, Qty, System };
+
+// ----------------------------------------------------------------------------
+//  InventoryManager: owns the collection, CRUD, search, alerts, persistence,
+//  the audit log and the automatic backups.
+//
+//  Every change to a part goes through addPart / updatePart / adjustStock /
+//  removePart, which (1) change the data, (2) save parts.csv - first copying
+//  the previous version into backups/ - and (3) append a line to history.csv.
+//  findById() hands out const pointers only, so nothing can bypass the log.
 // ----------------------------------------------------------------------------
 class InventoryManager {
 public:
-    explicit InventoryManager(std::string filename = "parts.csv") : filename_(std::move(filename)) { load(); }
+    static constexpr const char* kBackupDir = "backups";
+
+    explicit InventoryManager(std::string filename = "parts.csv", std::string historyFile = "history.csv")
+        : filename_(std::move(filename)), history_(std::move(historyFile)) { load(); }
+
+    // Who is making the changes (recorded in the history). Set by the console login / web session.
+    void setActor(const std::string& user) { actor_ = user; }
 
     // ---------- Create ----------
     bool addPart(const Part& p) {
         if (findById(p.id())) return false;  // IDs must be unique
+        lastWarning_.clear();
         parts_.push_back(p);
         save();
+        log(p, "Add Part", p.quantity() > 0 ? '+' : '=', p.quantity(), "new part");
         return true;
     }
 
     // ---------- Read ----------
     const std::vector<Part>& all() const { return parts_; }
 
-    Part* findById(int id) {
-        for (Part& p : parts_) if (p.id() == id) return &p;
+    const Part* findById(int id) const {
+        for (const Part& p : parts_) if (p.id() == id) return &p;
         return nullptr;
+    }
+
+    // ---------- Update (name / system / price / quantity / minimum) ----------
+    // 'np' carries the new values (its id is ignored). Returns false if the part does not exist.
+    bool updatePart(int id, const Part& np) {
+        Part* cur = mut(id);
+        if (!cur) return false;
+        std::string details;
+        auto note = [&details](const std::string& what, const std::string& from, const std::string& to) {
+            if (from == to) return;
+            if (!details.empty()) details += "; ";
+            details += what + ": " + from + " -> " + to;
+        };
+        note("name", cur->name(), np.name());
+        note("system", cur->category(), np.category());
+        note("price", util::money(cur->price()), util::money(np.price()));
+        note("min", std::to_string(cur->minStock()), std::to_string(np.minStock()));
+        const int delta = np.quantity() - cur->quantity();
+        if (details.empty() && delta == 0) return true;  // nothing changed: no save, no log noise
+        lastWarning_.clear();
+        cur->setName(np.name());
+        cur->setCategory(np.category());
+        cur->setPrice(np.price());
+        cur->setQuantity(np.quantity());
+        cur->setMinStock(np.minStock());
+        save();
+        log(*cur, "Edit Part", delta > 0 ? '+' : delta < 0 ? '-' : '=', delta < 0 ? -delta : delta, details);
+        return true;
+    }
+
+    // Adds (delta > 0) or removes (delta < 0) units. Returns "" on success or an error message.
+    std::string adjustStock(int id, long long delta) {
+        Part* p = mut(id);
+        if (!p) return "Part not found.";
+        if (delta == 0) return "The change must not be zero.";
+        const long long n = static_cast<long long>(p->quantity()) + delta;
+        if (n < 0) return "Cannot remove " + std::to_string(-delta) + ": only " + std::to_string(p->quantity()) + " in stock.";
+        if (n > limits::kMaxQty) return "Stock cannot exceed " + std::to_string(limits::kMaxQty) + " units.";
+        lastWarning_.clear();
+        p->setQuantity(static_cast<int>(n));
+        save();
+        log(*p, "Adjust Stock", delta > 0 ? '+' : '-', static_cast<int>(delta < 0 ? -delta : delta), "");
+        return "";
     }
 
     // ---------- Delete ----------
     bool removePart(int id) {
-        auto it = std::remove_if(parts_.begin(), parts_.end(), [id](const Part& p) { return p.id() == id; });
-        if (it == parts_.end()) return false;
-        parts_.erase(it, parts_.end());
+        const Part* found = findById(id);
+        if (!found) return false;
+        lastWarning_.clear();
+        const Part gone = *found;  // copy: the original is about to be erased
+        parts_.erase(std::remove_if(parts_.begin(), parts_.end(), [id](const Part& p) { return p.id() == id; }), parts_.end());
         save();
+        HistoryEntry e = makeEntry(gone, "Delete Part", gone.quantity() > 0 ? '-' : '=', gone.quantity(), "record removed");
+        e.stockAfter = 0;
+        if (!history_.record(e)) lastWarning_ += (lastWarning_.empty() ? "" : " ") + history_.lastError();
         return true;
     }
 
@@ -579,10 +911,44 @@ public:
         return out;
     }
 
+    // ---------- Sorting ----------
+    // Sorts by one column. Equal values are always ordered by ID so the result is stable.
+    std::vector<const Part*> sorted(SortKey key, bool ascending) const {
+        std::vector<const Part*> rows;
+        for (const Part& p : parts_) rows.push_back(&p);
+        std::sort(rows.begin(), rows.end(), [key, ascending](const Part* a, const Part* b) {
+            int cmp = 0;  // <0: a first, >0: b first (for ascending)
+            switch (key) {
+                case SortKey::Id: cmp = a->id() < b->id() ? -1 : a->id() > b->id() ? 1 : 0; break;
+                case SortKey::Name: cmp = util::toLower(a->name()).compare(util::toLower(b->name())); break;
+                case SortKey::Price: cmp = a->price() < b->price() ? -1 : a->price() > b->price() ? 1 : 0; break;
+                case SortKey::Qty: cmp = a->quantity() < b->quantity() ? -1 : a->quantity() > b->quantity() ? 1 : 0; break;
+                case SortKey::System: cmp = util::toLower(a->category()).compare(util::toLower(b->category())); break;
+            }
+            if (cmp != 0) return ascending ? cmp < 0 : cmp > 0;
+            return a->id() < b->id();
+        });
+        return rows;
+    }
+
     // ---------- Monitoring ----------
     std::vector<const Part*> lowStockParts() const {
         std::vector<const Part*> out;
         for (const Part& p : parts_) if (p.isLowStock()) out.push_back(&p);
+        return out;
+    }
+
+    // Low-stock parts with the units needed to get back up to the minimum level,
+    // grouped by vehicle system (handy when ordering from a supplier).
+    struct ReorderLine { const Part* part; int needed; };
+    std::vector<ReorderLine> reorderList() const {
+        std::vector<ReorderLine> out;
+        for (const Part& p : parts_)
+            if (p.isLowStock()) out.push_back({&p, p.minStock() - p.quantity()});
+        std::sort(out.begin(), out.end(), [](const ReorderLine& a, const ReorderLine& b) {
+            const int c = util::toLower(a.part->category()).compare(util::toLower(b.part->category()));
+            return c != 0 ? c < 0 : a.part->id() < b.part->id();
+        });
         return out;
     }
 
@@ -598,9 +964,20 @@ public:
         return out;
     }
 
+    // ---------- History / export ----------
+    const HistoryLog& history() const { return history_; }
+
+    // The exact text of parts.csv as it would be saved right now (used by the download button).
+    std::string toCsv() const {
+        std::string out = "PartID,Name,Category,Price,Quantity,MinStock\n";
+        for (const Part& p : parts_) out += p.toCSV() + "\n";
+        return out;
+    }
+
     // ---------- Persistence ----------
-    // Called after every change. Writes to a temp file first, then swaps it in,
-    // so a crash mid-write cannot destroy the existing data file.
+    // Called after every change. Writes to a temp file first, copies the previous
+    // version into backups/, then swaps the new file in, so neither a crash mid-write
+    // nor an accidental deletion can destroy the data.
     bool save() {
         lastSaveOk_ = false;
         if (saveBlocked_) {
@@ -611,11 +988,11 @@ public:
         {
             std::ofstream out(tmp, std::ios::trunc);
             if (!out) { lastError_ = "Could not write '" + tmp + "'."; return false; }
-            out << "PartID,Name,Category,Price,Quantity,MinStock\n";
-            for (const Part& p : parts_) out << p.toCSV() << '\n';
+            out << toCsv();
             out.flush();
             if (!out) { lastError_ = "Write error while saving '" + tmp + "'."; return false; }
         }
+        backupPrevious();  // never blocks the save; a failure is reported through lastWarning()
         std::error_code ec;
         std::filesystem::rename(tmp, filename_, ec);
         if (ec) {  // some platforms refuse to rename over an existing file
@@ -631,11 +1008,87 @@ public:
     const std::string& filename() const { return filename_; }
     bool lastSaveOk() const { return lastSaveOk_; }
     const std::string& lastError() const { return lastError_; }
+    // Non-fatal problems of the last change (backup or history file could not be written).
+    const std::string& lastWarning() const { return lastWarning_; }
     int skippedLines() const { return skipped_; }            // bad/duplicate rows ignored at load
     bool createdSampleData() const { return seeded_; }       // true on first run
     const std::string& loadProblem() const { return loadProblem_; }
 
 private:
+    // Retention: every backup of the last 7 days is kept; for days 8-90 only the newest
+    // backup of each day is kept; anything older is removed. Only files named
+    // backups/parts_backup_*.csv are ever touched.
+    static constexpr int kKeepAllDays = 7;
+    static constexpr int kKeepDailyDays = 90;
+
+    Part* mut(int id) {
+        for (Part& p : parts_) if (p.id() == id) return &p;
+        return nullptr;
+    }
+
+    HistoryEntry makeEntry(const Part& p, const char* action, char change, int qty, const std::string& details) const {
+        HistoryEntry e;
+        e.timestamp = util::nowStamp();
+        e.partId = p.id();
+        e.partName = p.name();
+        e.action = action;
+        e.change = change;
+        e.qtyChanged = qty;
+        e.stockAfter = p.quantity();
+        e.user = actor_.empty() ? "system" : actor_;
+        e.details = details;
+        return e;
+    }
+
+    void log(const Part& p, const char* action, char change, int qty, const std::string& details) {
+        if (!history_.record(makeEntry(p, action, change, qty, details)))
+            lastWarning_ += (lastWarning_.empty() ? "" : " ") + history_.lastError();
+    }
+
+    // Copies the CURRENT parts.csv (the state before this change) to
+    // backups/parts_backup_YYYYMMDD_HHMMSS.csv.
+    void backupPrevious() {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        if (!fs::exists(filename_, ec) || fs::file_size(filename_, ec) == 0) return;  // nothing to protect yet
+        fs::create_directories(kBackupDir, ec);
+        if (ec) { lastWarning_ += (lastWarning_.empty() ? "" : " ") + std::string("Backup failed: could not create the '") + kBackupDir + "' folder."; return; }
+        const std::string stamp = util::formatTime(std::chrono::system_clock::now(), "%Y%m%d_%H%M%S");
+        std::string target;
+        for (int n = 1; n < 1000; ++n) {  // several changes in the same second get _2, _3, ...
+            target = std::string(kBackupDir) + "/parts_backup_" + stamp + (n > 1 ? "_" + std::to_string(n) : "") + ".csv";
+            if (!fs::exists(target, ec)) break;
+        }
+        ec.clear();
+        fs::copy_file(filename_, target, fs::copy_options::none, ec);
+        if (ec) { lastWarning_ += (lastWarning_.empty() ? "" : " ") + ("Backup failed: " + ec.message()); return; }
+        const std::string today = util::formatTime(std::chrono::system_clock::now(), "%Y%m%d");
+        if (today != lastPruneDay_) { pruneBackups(); lastPruneDay_ = today; }
+    }
+
+    void pruneBackups() {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const auto now = std::chrono::system_clock::now();
+        const std::string keepAll = util::formatTime(now - std::chrono::hours(24 * kKeepAllDays), "%Y%m%d");
+        const std::string keepDaily = util::formatTime(now - std::chrono::hours(24 * kKeepDailyDays), "%Y%m%d");
+        std::vector<std::string> names;
+        for (fs::directory_iterator it(kBackupDir, ec), end; !ec && it != end; it.increment(ec)) {
+            const std::string n = it->path().filename().string();
+            // parts_backup_YYYYMMDD_HHMMSS[_k].csv
+            if (n.size() >= 28 && n.compare(0, 13, "parts_backup_") == 0 && n.compare(n.size() - 4, 4, ".csv") == 0 &&
+                std::all_of(n.begin() + 13, n.begin() + 21, [](unsigned char c) { return std::isdigit(c) != 0; }))
+                names.push_back(n);
+        }
+        std::sort(names.begin(), names.end());  // timestamps sort chronologically
+        for (size_t i = 0; i < names.size(); ++i) {
+            const std::string day = names[i].substr(13, 8);
+            const bool newestOfDay = i + 1 == names.size() || names[i + 1].compare(13, 8, day) != 0;
+            const bool drop = day < keepDaily || (day < keepAll && !newestOfDay);
+            if (drop) fs::remove(fs::path(kBackupDir) / names[i], ec);
+        }
+    }
+
     void load() {
         parts_.clear();
         std::error_code ec;
@@ -688,13 +1141,17 @@ private:
     }
 
     std::string filename_;
+    HistoryLog history_;
     std::vector<Part> parts_;
+    std::string actor_;
     bool lastSaveOk_ = true;
     bool saveBlocked_ = false;
     bool seeded_ = false;
     int skipped_ = 0;
     std::string lastError_;
+    std::string lastWarning_;
     std::string loadProblem_;
+    std::string lastPruneDay_;
 };
 
 // ----------------------------------------------------------------------------
@@ -840,7 +1297,7 @@ void logo() {
     row(kDouble, "", kCyan);
     for (const char* line : art) row(kDouble, line, kCyan, kBoldCyan, Align::Center);
     row(kDouble, "", kCyan);
-    row(kDouble, "Bajaj RE Components & Inventory Management System   v2.0", kCyan, nullptr, Align::Center);
+    row(kDouble, "Bajaj RE Components & Inventory Management System   v2.1", kCyan, nullptr, Align::Center);
     bottom(kDouble, kCyan);
 }
 
@@ -1176,6 +1633,8 @@ struct Response {
     std::string body;
     std::string location;   // non-empty => 303 redirect
     std::string setCookie;  // non-empty => Set-Cookie header
+    std::string contentType = "text/html; charset=utf-8";
+    std::string attachment;  // non-empty => the browser downloads the body under this file name
 };
 
 bool toInt(const std::string& s, int lo, int hi, int& out) {
@@ -1240,6 +1699,12 @@ public:
 
     void destroy(const std::string& token) { sessions_.erase(token); }
 
+    // Signs a user out everywhere (optionally keeping one session), e.g. after a password change.
+    void destroyUser(const std::string& user, const std::string& keepToken = "") {
+        for (auto it = sessions_.begin(); it != sessions_.end();)
+            it = (it->second.user == user && it->first != keepToken) ? sessions_.erase(it) : std::next(it);
+    }
+
 private:
     struct Entry { std::string user; Clock::time_point expires; };
     static constexpr std::chrono::minutes kIdle{30};
@@ -1302,7 +1767,7 @@ public:
 
         const std::string url = "http://localhost:" + std::to_string(bound);
         std::cout << "\n  RE Parts Tracker web dashboard is running at " << url
-                  << "\n  Sign in with your normal account (default: admin / password123)."
+                  << "\n  Sign in with the admin password you chose during setup."
                   << "\n  Keep this window open. Press Ctrl+C to stop.\n";
         if (openBrowser) launchBrowser(url);
 
@@ -1326,6 +1791,8 @@ private:
     std::map<std::string, ResetEntry> resets_;  // short-lived password-reset tokens
     int failedRecovery_ = 0;
     SessionStore::Clock::time_point recoveryLockedUntil_{};
+    int failedReauth_ = 0;  // wrong "current password" attempts on the Security page
+    SessionStore::Clock::time_point reauthLockedUntil_{};
 
     static void launchBrowser(const std::string& url) {
 #ifdef _WIN32
@@ -1409,8 +1876,9 @@ private:
             h << "HTTP/1.1 303 See Other\r\nLocation: " << res.location << "\r\nContent-Length: 0\r\n";
         } else {
             const char* text = res.status == 200 ? "OK" : res.status == 404 ? "Not Found" : "Bad Request";
-            h << "HTTP/1.1 " << res.status << ' ' << text << "\r\nContent-Type: text/html; charset=utf-8\r\n"
+            h << "HTTP/1.1 " << res.status << ' ' << text << "\r\nContent-Type: " << res.contentType << "\r\n"
               << "Content-Length: " << res.body.size() << "\r\n";
+            if (!res.attachment.empty()) h << "Content-Disposition: attachment; filename=\"" << res.attachment << "\"\r\n";
         }
         if (!res.setCookie.empty()) h << "Set-Cookie: " << res.setCookie << "\r\n";
         h << common << "\r\n";
@@ -1436,8 +1904,15 @@ private:
         r.location = location;
         return r;
     }
-    static Response redirectMsg(const std::string& msg, const std::string& kind = "ok") {
-        return redirectTo("/?msg=" + urlEncode(msg) + "&kind=" + kind);
+    static Response redirectMsg(const std::string& msg, const std::string& kind = "ok", const std::string& extra = "") {
+        return redirectTo("/?msg=" + urlEncode(msg) + "&kind=" + kind + extra);
+    }
+    static Response csvDownload(const std::string& baseName, const std::string& csv) {
+        Response r;
+        r.contentType = "text/csv; charset=utf-8";
+        r.attachment = baseName + "_" + util::formatTime(std::chrono::system_clock::now(), "%Y%m%d_%H%M%S") + ".csv";
+        r.body = "\xEF\xBB\xBF" + csv;  // UTF-8 BOM so Excel shows every character correctly
+        return r;
     }
     Response bad(const std::string& msg) const {
         return htmlPage(400, layout("Error", "<div class='card' style='max-width:560px'><h2>Could not complete that</h2>" + flashBox(msg, "err") +
@@ -1485,9 +1960,15 @@ private:
 
         if (!user) return redirectTo("/login");  // everything else needs a session
         curUser_ = *user;
+        inv_.setActor(curUser_);  // every change made during this request is logged under this name
 
         if (r.method == "GET") {
             if (r.path == "/") return htmlPage(200, dashboard(r));
+            if (r.path == "/history") return htmlPage(200, historyPage(r));
+            if (r.path == "/reorder") return htmlPage(200, reorderPage());
+            if (r.path == "/security") return htmlPage(200, securityPage(get(r.query, "msg"), get(r.query, "kind")));
+            if (r.path == "/export.csv") return csvDownload("parts_export", inv_.toCsv());
+            if (r.path == "/export-history.csv") return csvDownload("stock_history", inv_.history().toCsv());
             if (r.path == "/add") return htmlPage(200, addForm(""));
             if (r.path == "/edit") return htmlPage(200, editForm(r));
             if (r.path == "/delete") return htmlPage(200, deleteConfirm(r));
@@ -1502,6 +1983,8 @@ private:
             if (r.path == "/edit") return doEdit(r);
             if (r.path == "/adjust") return doAdjust(r);
             if (r.path == "/delete") return doDelete(r);
+            if (r.path == "/security/password") return doChangePassword(r, token);
+            if (r.path == "/security/recovery") return doChangeRecovery(r);
         }
         return htmlPage(404, layout("Not found", "<div class='card'><h2>Page not found</h2><p class='sub'>Nothing lives at this address.</p><a class='btn' href='/'>Back to inventory</a></div>"));
     }
@@ -1615,6 +2098,24 @@ body.auth{display:grid;place-items:center;padding:24px}
 .m-ic{width:56px;height:56px;margin:0 auto 12px;border-radius:50%;display:grid;place-items:center;background:#fee2e2;color:#dc2626}
 .modal h3{margin:0 0 8px;font-size:1.2rem}.modal p{margin:6px 0;color:#475569;font-size:.92rem}.m-actions{display:flex;gap:10px;justify-content:center;margin-top:20px}
 @keyframes fade{from{opacity:0}}@keyframes pop{from{opacity:0;transform:scale(.93) translateY(8px)}}
+a.sort{display:inline-flex;align-items:center;gap:6px;color:inherit;text-decoration:none}a.sort:hover{color:#fff}
+th.num a.sort{justify-content:flex-end}.arr{font-size:.68rem;opacity:.4}th.on{color:#fff}th.on .arr{opacity:1;color:#5eead4}
+.chg{display:inline-grid;place-items:center;width:26px;height:26px;border-radius:8px;font-weight:800}
+.chg.plus{background:#dcfce7;color:#15803d}.chg.minus{background:#fee2e2;color:#b91c1c}.chg.eq{background:#e2e8f0;color:#475569}
+.tw.short{max-height:340px}.hd{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}.hd h2{margin:0}
+td.det{white-space:normal;color:#475569;max-width:320px}.tot{display:flex;gap:26px;flex-wrap:wrap;margin-top:14px;font-weight:600}.tot span{color:var(--mut);font-weight:500}
+.stat-line{display:flex;align-items:center;gap:8px;font-size:.88rem;margin:0 0 6px}.pill{padding:2px 10px;border-radius:99px;font-size:.74rem;font-weight:700}.pill.on{background:#dcfce7;color:#15803d}.pill.off{background:#fee2e2;color:#b91c1c}
+.print-only{display:none}
+@media print{
+  body,body.app{background:#fff!important;color:#000!important}
+  header.top,.noprint,.flash,.toolbar{display:none!important}
+  main{margin:0;max-width:none;padding:0}
+  .card{box-shadow:none!important;padding:0!important;border-radius:0}
+  .tw{max-height:none!important;overflow:visible!important;border:0!important}
+  thead th{position:static!important;background:#fff!important;color:#000!important;border-bottom:2px solid #000}
+  td{border-bottom:1px solid #999!important;background:#fff!important}
+  .print-only{display:block}
+}
 )html";
 
     static constexpr const char* kJs = R"html(
@@ -1622,7 +2123,7 @@ body.auth{display:grid;place-items:center;padding:24px}
   var $=function(i){return document.getElementById(i)};
   function dismiss(el){el.classList.add('gone');setTimeout(function(){el.remove()},260)}
   document.querySelectorAll('.flash[data-auto]').forEach(function(f){setTimeout(function(){if(f.isConnected)dismiss(f)},6000)});
-  if(/[?&]msg=/.test(location.search)&&history.replaceState)history.replaceState(null,'',location.pathname);
+  if(/[?&]msg=/.test(location.search)&&history.replaceState){var cu=new URL(location.href);cu.searchParams.delete('msg');cu.searchParams.delete('kind');history.replaceState(null,'',cu.pathname+cu.search)}
   var dm=$('dm');
   function closeDel(){if(dm)dm.hidden=true}
   document.addEventListener('click',function(e){
@@ -1630,6 +2131,8 @@ body.auth{display:grid;place-items:center;padding:24px}
     if(t){dismiss(t.closest('.flash,.alert'));return}
     t=e.target.closest('[data-toggle-pw]');
     if(t){var i=t.parentNode.querySelector('input');i.type=i.type==='password'?'text':'password';return}
+    t=e.target.closest('[data-print]');
+    if(t){window.print();return}
     t=e.target.closest('[data-del]');
     if(t&&dm){e.preventDefault();$('dmId').value=t.dataset.id;$('dmText').textContent='['+t.dataset.id+'] '+t.dataset.name;dm.hidden=false;return}
     if(dm&&(e.target===dm||e.target.closest('[data-close]')))closeDel();
@@ -1642,8 +2145,11 @@ body.auth{display:grid;place-items:center;padding:24px}
   var q=$('q');
   if(q){
     var sys=$('sys'),low=$('lowOnly'),clr=$('clr'),none=$('none'),cnt=$('count');
-    var rows=[].slice.call(document.querySelectorAll('tbody tr[data-s]'));
-    var pre=new URLSearchParams(location.search).get('q');if(pre)q.value=pre;
+    var rows=[].slice.call(document.querySelectorAll('#inv tbody tr[data-s]'));
+    var P=new URLSearchParams(location.search);
+    if(P.get('q'))q.value=P.get('q');
+    if(P.get('sys'))sys.value=P.get('sys');
+    if(P.get('low')==='1')low.setAttribute('aria-pressed','true');
     var apply=function(){
       var v=q.value.trim().toLowerCase(),s=sys.value.toLowerCase(),lo=low.getAttribute('aria-pressed')==='true',n=0;
       rows.forEach(function(r){
@@ -1656,6 +2162,17 @@ body.auth{display:grid;place-items:center;padding:24px}
     low.addEventListener('click',function(){low.setAttribute('aria-pressed',low.getAttribute('aria-pressed')==='true'?'false':'true');apply()});
     clr.addEventListener('click',function(){q.value='';apply();q.focus()});
     $('reset').addEventListener('click',function(){q.value='';sys.value='';low.setAttribute('aria-pressed','false');apply()});
+    // Sorting reloads the page (the server sorts); carry the active filters along.
+    document.querySelectorAll('a.sort').forEach(function(a){
+      a.addEventListener('click',function(e){
+        e.preventDefault();
+        var u=new URL(a.href);
+        if(q.value.trim())u.searchParams.set('q',q.value.trim());
+        if(sys.value)u.searchParams.set('sys',sys.value);
+        if(low.getAttribute('aria-pressed')==='true')u.searchParams.set('low','1');
+        location.href=u.pathname+u.search;
+      });
+    });
     apply();
   }
 })();
@@ -1680,6 +2197,10 @@ body.auth{display:grid;place-items:center;padding:24px}
     static constexpr const char* kLogout = "<path d='M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9'/>";
     static constexpr const char* kKey = "<circle cx='7.5' cy='15.5' r='4.5'/><path d='M10.7 12.3L21 2m-3 3l3 3m-6 0l2 2'/>";
     static constexpr const char* kShield = "<path d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/>";
+    static constexpr const char* kDownload = "<path d='M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3'/>";
+    static constexpr const char* kClock = "<circle cx='12' cy='12' r='9'/><path d='M12 7v5l3 2'/>";
+    static constexpr const char* kPrint = "<path d='M6 9V2h12v7M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2'/><path d='M6 14h12v8H6z'/>";
+    static constexpr const char* kCart = "<circle cx='9' cy='20' r='1.4'/><circle cx='18' cy='20' r='1.4'/><path d='M2 3h3l2.7 12.4a2 2 0 0 0 2 1.6h7.7a2 2 0 0 0 2-1.5L21 7H6'/>";
     static constexpr const char* kArrowL = "<path d='M19 12H5m7-7l-7 7 7 7'/>";
 
     static std::string ic(const char* paths, int size = 18) {
@@ -1734,7 +2255,13 @@ body.auth{display:grid;place-items:center;padding:24px}
         std::string h = "<div class='lg'>" + ic(kKey, 28) + "</div><h1>Reset your password</h1>"
                         "<p class='sub'>Answer the recovery question to regain access.</p>";
         if (!error.empty()) h += flashBox(error, "err");
-        h += "<div class='qbox'>" + ic(kShield, 20) + "<span>" + htmlEscape(auth::Authenticator::kRecoveryQuestion) + "</span></div>"
+        const std::string question = auth_.recoveryQuestion();
+        if (question.empty()) {
+            h += flashBox("No recovery phrase has been set up. Sign in and add one on the Security page, or reset the account from the console.", "err") +
+                 "<a class='back' href='/login'>" + ic(kArrowL, 15) + "Back to sign in</a>";
+            return authPage("Forgot password", h);
+        }
+        h += "<div class='qbox'>" + ic(kShield, 20) + "<span>" + htmlEscape(question) + "</span></div>"
              "<form method='post' action='/forgot-password' autocomplete='off'>"
              "<label for='u'>Username</label><div class='field'>" + ic(kUser) +
              "<input id='u' type='text' name='username' placeholder='Your username' required value='" + htmlEscape(user) + "'></div>"
@@ -1760,6 +2287,7 @@ body.auth{display:grid;place-items:center;padding:24px}
         curUser_.clear();
         const auto now = SessionStore::Clock::now();
         const std::string user = util::trim(get(r.form, "username"));
+        if (auth_.recoveryQuestion().empty()) return htmlPage(200, forgotPage(""));
         if (now < recoveryLockedUntil_) {
             const auto left = std::chrono::duration_cast<std::chrono::seconds>(recoveryLockedUntil_ - now).count() + 1;
             return htmlPage(200, forgotPage("Too many attempts. Try again in " + std::to_string(left) + " seconds.", user));
@@ -1788,10 +2316,11 @@ body.auth{display:grid;place-items:center;padding:24px}
             return htmlPage(200, forgotPage("Your reset session expired. Please verify again."));
         }
         const std::string pw = get(r.form, "password");
-        if (pw.size() < 8 || pw.size() > 128) return htmlPage(200, resetPage(token, "Password must be 8 to 128 characters."));
+        if (const std::string perr = auth::Authenticator::checkPassword(pw); !perr.empty()) return htmlPage(200, resetPage(token, perr));
         if (pw != get(r.form, "confirm")) return htmlPage(200, resetPage(token, "The two passwords do not match."));
         if (!auth_.setPassword(it->second.user, pw)) return htmlPage(200, forgotPage("Account not found."));
         const bool saved = auth_.lastSaveOk();
+        sessions_.destroyUser(it->second.user);  // a reset signs the account out everywhere
         resets_.erase(it);
         return redirectTo("/login?msg=" + urlEncode(saved ? "Password updated. You can sign in now."
                                                            : "Password updated for this session, but it could not be saved to users.csv."));
@@ -1806,7 +2335,8 @@ body.auth{display:grid;place-items:center;padding:24px}
         if (!curUser_.empty()) {
             const std::string initial(1, static_cast<char>(std::toupper(static_cast<unsigned char>(curUser_[0]))));
             h += "<form class='who' method='post' action='/logout'><span class='chip'><span class='av'>" + htmlEscape(initial) + "</span>" +
-                 htmlEscape(curUser_) + "</span><button class='btn out sm' type='submit'>" + ic(kLogout, 15) + "Log out</button></form>";
+                 htmlEscape(curUser_) + "</span><a class='btn out sm' href='/security'>" + ic(kShield, 15) + "Security</a>"
+                 "<button class='btn out sm' type='submit'>" + ic(kLogout, 15) + "Log out</button></form>";
         }
         h += "</div></header><main>";
         if (!flash.empty()) h += flashBox(flash, kind);
@@ -1819,14 +2349,50 @@ body.auth{display:grid;place-items:center;padding:24px}
                label + "</span><b>" + value + "</b></div></div>";
     }
 
+    // ---- Sorting (server side): /?sort=id|name|price|qty|system&dir=asc|desc ----
+    struct SortSpec { SortKey key = SortKey::Id; bool asc = true; std::string keyName = "id", dirName = "asc"; };
+
+    static SortSpec parseSort(const Params& q) {
+        static const std::pair<const char*, SortKey> keys[] = {{"id", SortKey::Id}, {"name", SortKey::Name}, {"price", SortKey::Price},
+                                                               {"qty", SortKey::Qty}, {"system", SortKey::System}};
+        SortSpec sp;
+        const std::string k = get(q, "sort"), d = get(q, "dir");
+        for (const auto& kv : keys) if (k == kv.first) { sp.key = kv.second; sp.keyName = kv.first; }
+        if (d == "desc") { sp.asc = false; sp.dirName = "desc"; }
+        return sp;
+    }
+
+    static std::string sortQuery(const SortSpec& sp) { return "&sort=" + sp.keyName + "&dir=" + sp.dirName; }
+
+    static std::string changeChip(const HistoryEntry& e) {
+        const char* cls = e.change == '+' ? "plus" : e.change == '-' ? "minus" : "eq";
+        const char* sym = e.change == '+' ? "+" : e.change == '-' ? "&minus;" : "=";
+        return std::string("<span class='chg ") + cls + "' title='" + (e.change == '+' ? "Stock increased" : e.change == '-' ? "Stock decreased" : "Stock unchanged") +
+               "'>" + sym + "</span>";
+    }
+
+    // The audit-log table (newest entry first). 'details' adds the free-text column.
+    static std::string historyTable(const std::vector<const HistoryEntry*>& rows, bool details, bool shortBox) {
+        std::string h = std::string("<div class='tw") + (shortBox ? " short" : "") + "'><table><thead><tr><th>Time</th><th>ID</th><th>Part name</th><th>Action</th>"
+                        "<th>+/&minus;</th><th class='num'>Qty changed</th><th class='num'>Stock after</th><th>By</th>" +
+                        (details ? "<th>Details</th>" : "") + "</tr></thead><tbody>";
+        for (const HistoryEntry* e : rows) {
+            h += "<tr><td>" + htmlEscape(e->timestamp) + "</td><td><a href='/history?id=" + std::to_string(e->partId) + "'>" + std::to_string(e->partId) +
+                 "</a></td><td class='nm'>" + htmlEscape(e->partName) + "</td><td title='" + htmlEscape(e->details) + "'>" + htmlEscape(e->action) + "</td><td>" +
+                 changeChip(*e) + "</td><td class='num'>" + std::to_string(e->qtyChanged) + "</td><td class='num'>" + std::to_string(e->stockAfter) +
+                 "</td><td>" + htmlEscape(e->user) + "</td>" + (details ? "<td class='det'>" + htmlEscape(e->details) + "</td>" : "") + "</tr>";
+        }
+        if (rows.empty()) h += std::string("<tr><td class='empty' colspan='") + (details ? "9" : "8") + "'>No stock movements recorded yet.</td></tr>";
+        return h + "</tbody></table></div>";
+    }
+
     std::string dashboard(const Request& r) {
         double value = 0;
         long units = 0;
         for (const Part& p : inv_.all()) { value += p.stockValue(); units += p.quantity(); }
         auto low = inv_.lowStockParts();
-        std::vector<const Part*> rows;
-        for (const Part& p : inv_.all()) rows.push_back(&p);
-        std::sort(rows.begin(), rows.end(), [](const Part* a, const Part* b) { return a->id() < b->id(); });
+        const SortSpec sp = parseSort(r.query);
+        const std::vector<const Part*> rows = inv_.sorted(sp.key, sp.asc);
 
         std::string h = "<div class='page-h'><h2>Inventory dashboard</h2><p>Live overview of spare parts, stock levels and value.</p></div>";
         h += "<div class='stats'>" + statCard("blue", kBox, "Total parts", std::to_string(inv_.all().size())) +
@@ -1842,6 +2408,15 @@ body.auth{display:grid;place-items:center;padding:24px}
             h += "</ul></div><button class='fx' type='button' data-dismiss aria-label='Dismiss'>" + ic(kX, 16) + "</button></div>";
         }
 
+        // Clickable, sortable column header: first click = ascending, next click = descending.
+        auto th = [&sp](const char* label, const char* key, SortKey sk, const char* cls) {
+            const bool on = sp.key == sk;
+            const char* nextDir = (on && sp.asc) ? "desc" : "asc";
+            const char* arrow = on ? (sp.asc ? "&#9650;" : "&#9660;") : "&#8597;";
+            return std::string("<th class='") + cls + (on ? " on" : "") + "' aria-sort='" + (on ? (sp.asc ? "ascending" : "descending") : "none") +
+                   "'><a class='sort' href='/?sort=" + key + "&amp;dir=" + nextDir + "' title='Sort by " + label + "'>" + label + "<span class='arr'>" + arrow + "</span></a></th>";
+        };
+
         h += "<div class='card'><div class='toolbar'><div class='search'>" + ic(kSearch) +
              "<input id='q' type='text' placeholder='Search by ID, name or system  ( press / )' autocomplete='off' value='" + htmlEscape(util::trim(get(r.query, "q"))) + "'>"
              "<button id='clr' class='x' type='button' aria-label='Clear search' hidden>" + ic(kX, 14) + "</button></div>"
@@ -1849,8 +2424,11 @@ body.auth{display:grid;place-items:center;padding:24px}
         for (const auto& c : inv_.categories()) h += "<option value='" + htmlEscape(c) + "'>" + htmlEscape(c) + "</option>";
         h += "</select><button id='lowOnly' class='btn ghost tog' type='button' aria-pressed='false'>" + ic(kWarn, 16) + "Low stock only</button>"
              "<button id='reset' class='btn ghost' type='button'>Reset</button><span class='sp'></span>"
+             "<a class='btn ghost' href='/reorder'>" + ic(kCart, 16) + "Reorder list" + (low.empty() ? "" : " (" + std::to_string(low.size()) + ")") + "</a>"
+             "<a class='btn ghost' href='/export.csv'>" + ic(kDownload, 16) + "Download CSV Export</a>"
              "<a class='btn teal' href='/add'>" + ic(kPlus, 16) + "Add new part</a></div>"
-             "<div class='tw'><table><thead><tr><th>ID</th><th>Part name</th><th>System</th><th class='num'>Price (PHP)</th><th class='num'>Qty</th>"
+             "<div class='tw'><table id='inv'><thead><tr>" + th("ID", "id", SortKey::Id, "") + th("Part name", "name", SortKey::Name, "") +
+             th("System", "system", SortKey::System, "") + th("Price (PHP)", "price", SortKey::Price, "num") + th("Qty", "qty", SortKey::Qty, "num") +
              "<th class='num'>Min</th><th>Status</th><th>Adjust stock</th><th>Actions</th></tr></thead><tbody>";
         for (const Part* p : rows) {
             const std::string id = std::to_string(p->id());
@@ -1863,6 +2441,7 @@ body.auth{display:grid;place-items:center;padding:24px}
                  std::to_string(p->minStock()) + "</td><td>" +
                  (out ? "<span class='badge b-out'>OUT OF STOCK</span>" : lowp ? "<span class='badge b-low'>LOW STOCK</span>" : "<span class='badge b-ok'>OK</span>") +
                  "</td><td><form class='adj' method='post' action='/adjust'><input type='hidden' name='id' value='" + id +
+                 "'><input type='hidden' name='sort' value='" + sp.keyName + "'><input type='hidden' name='dir' value='" + sp.dirName +
                  "'><input type='number' name='qty' value='1' min='1' aria-label='Quantity'><button class='sq plus' name='op' value='add' title='Add stock'>+</button>"
                  "<button class='sq minus' name='op' value='remove' title='Remove stock'>&minus;</button></form></td>"
                  "<td><div class='acts'><a class='btn sm ghost' href='/edit?id=" + id + "'>" + ic(kEdit, 14) + "Edit</a>"
@@ -1870,14 +2449,128 @@ body.auth{display:grid;place-items:center;padding:24px}
                  ic(kTrash, 14) + "Delete</a></div></td></tr>";
         }
         h += "</tbody></table><div id='none' class='empty'" + std::string(rows.empty() ? "" : " hidden") + ">No parts match your search.</div></div>"
-             "<div class='meta'>Showing <b id='count'>" + std::to_string(rows.size()) + "</b> of " + std::to_string(rows.size()) + " parts</div></div>";
+             "<div class='meta'>Showing <b id='count'>" + std::to_string(rows.size()) + "</b> of " + std::to_string(rows.size()) + " parts &middot; click a column title to sort</div></div>";
+
+        // ---- Stock history (latest movements) ----
+        h += "<div class='card'><div class='hd'><h2>Stock history</h2><div class='acts'>"
+             "<a class='btn sm ghost' href='/history'>" + ic(kClock, 14) + "Full history</a>"
+             "<a class='btn sm ghost' href='/export-history.csv'>" + ic(kDownload, 14) + "Download history CSV</a></div></div>"
+             "<p class='sub' style='margin-bottom:12px'>Every add, edit, delete and stock adjustment is recorded automatically in <b>" + htmlEscape(inv_.history().filename()) +
+             "</b>. Showing the latest 15.</p>" + historyTable(inv_.history().recent(15), false, true) + "</div>";
 
         h += "<div class='modal-back' id='dm' hidden><div class='modal' role='dialog' aria-modal='true' aria-labelledby='dmT'>"
              "<div class='m-ic'>" + ic(kTrash, 26) + "</div><h3 id='dmT'>Delete this part?</h3><p><b id='dmText'></b></p>"
-             "<p>This permanently removes the record and cannot be undone.</p><form method='post' action='/delete'>"
+             "<p>This removes the record from the inventory. The previous data is kept in the automatic backups folder.</p><form method='post' action='/delete'>"
              "<input type='hidden' name='id' id='dmId'><div class='m-actions'><button type='button' class='btn ghost' data-close>Cancel</button>"
              "<button class='btn danger' type='submit'>Yes, delete</button></div></form></div></div>";
         return layout("Inventory", h, get(r.query, "msg"), get(r.query, "kind"));
+    }
+
+    // ---- Full history page (optionally filtered to one part: /history?id=105) ----
+    std::string historyPage(const Request& r) {
+        constexpr size_t kLimit = 500;
+        int id = 0;
+        const bool filtered = toInt(get(r.query, "id"), 1, limits::kMaxId, id);
+        std::vector<const HistoryEntry*> rows;
+        for (const HistoryEntry* e : inv_.history().recent(0)) {
+            if (filtered && e->partId != id) continue;
+            if (rows.size() >= kLimit) break;
+            rows.push_back(e);
+        }
+        std::string h = "<div class='card'><div class='hd'><h2>Stock history" + (filtered ? " - part " + std::to_string(id) : std::string()) + "</h2><div class='acts'>" +
+                        (filtered ? "<a class='btn sm ghost' href='/history'>All parts</a>" : "") +
+                        "<a class='btn sm ghost' href='/export-history.csv'>" + ic(kDownload, 14) + "Download history CSV</a>"
+                        "<a class='btn sm ghost' href='/'>" + ic(kArrowL, 14) + "Back to inventory</a></div></div>"
+                        "<p class='sub' style='margin-bottom:12px'>Newest first. Showing " + std::to_string(rows.size()) + " of " +
+                        (filtered ? "the matching" : std::to_string(inv_.history().entries().size())) + " record(s)" +
+                        (rows.size() >= kLimit ? " (latest " + std::to_string(kLimit) + "; download the CSV for everything)" : "") + ".</p>" +
+                        historyTable(rows, true, false) + "</div>";
+        return layout("Stock history", h);
+    }
+
+    // ---- Printable reorder list ----
+    std::string reorderPage() {
+        const auto lines = inv_.reorderList();
+        long long units = 0;
+        double cost = 0;
+        for (const auto& l : lines) { units += l.needed; cost += l.needed * l.part->price(); }
+        std::string h = "<div class='card'><div class='hd'><h2>Reorder list</h2><div class='acts noprint'>"
+                        "<button class='btn sm teal' type='button' data-print>" + ic(kPrint, 14) + "Print</button>"
+                        "<a class='btn sm ghost' href='/'>" + ic(kArrowL, 14) + "Back to inventory</a></div></div>"
+                        "<p class='sub'>Parts below their minimum stock, with the quantity needed to get back up to the minimum. Generated " +
+                        htmlEscape(util::nowStamp()) + " by " + htmlEscape(curUser_) + ".</p>";
+        if (lines.empty()) {
+            h += flashBox("All parts are at or above their minimum stock. Nothing to reorder.", "ok");
+        } else {
+            h += "<div class='tw'><table><thead><tr><th>ID</th><th>Part name</th><th>System</th><th class='num'>In stock</th><th class='num'>Minimum</th>"
+                 "<th class='num'>Reorder qty</th><th class='num'>Unit price (PHP)</th><th class='num'>Est. cost (PHP)</th></tr></thead><tbody>";
+            for (const auto& l : lines) {
+                const Part& p = *l.part;
+                h += "<tr class='" + std::string(p.isOutOfStock() ? "out" : "low") + "'><td>" + std::to_string(p.id()) + "</td><td class='nm'>" + htmlEscape(p.name()) +
+                     "</td><td>" + htmlEscape(p.category()) + "</td><td class='num'>" + std::to_string(p.quantity()) + "</td><td class='num'>" + std::to_string(p.minStock()) +
+                     "</td><td class='num'><b>" + std::to_string(l.needed) + "</b></td><td class='num'>" + util::moneyFmt(p.price()) +
+                     "</td><td class='num'>" + util::moneyFmt(l.needed * p.price()) + "</td></tr>";
+            }
+            h += "</tbody></table></div><div class='tot'><div><span>Parts to reorder</span><br>" + std::to_string(lines.size()) + "</div><div><span>Total units</span><br>" +
+                 std::to_string(units) + "</div><div><span>Estimated cost</span><br>PHP " + util::moneyFmt(cost) + "</div></div>";
+        }
+        return layout("Reorder list", h + "</div>");
+    }
+
+    // ---- Security page: change password / recovery phrase ----
+    std::string securityPage(const std::string& flash = "", const std::string& kind = "ok") const {
+        const bool has = auth_.hasRecovery(curUser_);
+        std::string h = "<div class='page-h'><h2>Security</h2><p>Change the admin password or the recovery phrase. Neither is stored in plain text.</p></div>"
+                        "<div class='card' style='max-width:640px'><h2>Change password</h2><p class='sub'>Other devices signed in as this user are signed out.</p>"
+                        "<form method='post' action='/security/password' autocomplete='off'>"
+                        "<label for='cp'>Current password</label>" + pwField("cp", "current", "Current password") +
+                        "<label for='np1'>New password (" + std::to_string(auth::policy::kMinPassword) + "+ characters)</label>" + pwField("np1", "password", "New password") +
+                        "<label for='np2'>Confirm new password</label>" + pwField("np2", "confirm", "Repeat new password") +
+                        "<div class='fa'><button class='btn teal' type='submit'>" + ic(kCheck, 16) + "Update password</button></div></form></div>"
+                        "<div class='card' style='max-width:640px'><h2>Recovery phrase</h2>"
+                        "<p class='stat-line'>Status: <span class='pill " + std::string(has ? "on'>SET UP" : "off'>NOT SET UP") + "</span></p>"
+                        "<p class='sub'>Used on the &ldquo;Forgot password&rdquo; page. Treat it like a second password: anyone who knows the answer can reset the account.</p>"
+                        "<form method='post' action='/security/recovery' autocomplete='off'>"
+                        "<label for='rq'>Recovery question</label><input id='rq' type='text' name='question' required maxlength='" + std::to_string(auth::policy::kMaxQuestion) +
+                        "' value='" + htmlEscape(auth_.recoveryQuestion()) + "' placeholder='e.g. What was the name of my first workshop?'>"
+                        "<label for='ra1'>Recovery answer (" + std::to_string(auth::policy::kMinRecovery) + "+ characters, not case-sensitive)</label>" + pwField("ra1", "answer", "Secret answer") +
+                        "<label for='ra2'>Confirm answer</label>" + pwField("ra2", "answer2", "Repeat the answer") +
+                        "<label for='rp'>Current password (to confirm it is you)</label>" + pwField("rp", "current", "Current password") +
+                        "<div class='fa'><button class='btn teal' type='submit'>" + ic(kShield, 16) + "Save recovery phrase</button></div></form></div>";
+        return layout("Security", h, flash, kind);
+    }
+
+    // Throttles wrong "current password" guesses made from an already signed-in session.
+    bool reauth(const std::string& password, std::string& error) {
+        const auto now = SessionStore::Clock::now();
+        if (now < reauthLockedUntil_) {
+            error = "Too many wrong attempts. Try again in " +
+                    std::to_string(std::chrono::duration_cast<std::chrono::seconds>(reauthLockedUntil_ - now).count() + 1) + " seconds.";
+            return false;
+        }
+        if (auth_.login(curUser_, password)) { failedReauth_ = 0; return true; }
+        if (++failedReauth_ >= 5) { failedReauth_ = 0; reauthLockedUntil_ = now + std::chrono::seconds(30); }
+        error = "The current password is incorrect.";
+        return false;
+    }
+
+    Response doChangePassword(const Request& r, const std::string& token) {
+        std::string err;
+        if (!reauth(get(r.form, "current"), err)) return htmlPage(200, securityPage(err, "err"));
+        if (get(r.form, "password") != get(r.form, "confirm")) return htmlPage(200, securityPage("The two new passwords do not match.", "err"));
+        err = auth_.changePassword(curUser_, get(r.form, "current"), get(r.form, "password"));
+        if (!err.empty()) return htmlPage(200, securityPage(err, "err"));
+        sessions_.destroyUser(curUser_, token);
+        return redirectTo("/security?msg=" + urlEncode("Password updated. Other sessions were signed out.") + "&kind=ok");
+    }
+
+    Response doChangeRecovery(const Request& r) {
+        std::string err;
+        if (!reauth(get(r.form, "current"), err)) return htmlPage(200, securityPage(err, "err"));
+        if (get(r.form, "answer") != get(r.form, "answer2")) return htmlPage(200, securityPage("The two recovery answers do not match.", "err"));
+        err = auth_.changeRecovery(curUser_, get(r.form, "current"), get(r.form, "question"), get(r.form, "answer"));
+        if (!err.empty()) return htmlPage(200, securityPage(err, "err"));
+        return redirectTo("/security?msg=" + urlEncode("Recovery phrase saved.") + "&kind=ok");
     }
 
     std::string systemsDatalist() const {
@@ -1915,7 +2608,7 @@ body.auth{display:grid;place-items:center;padding:24px}
 
     std::string editForm(const Request& r) {
         int id = 0;
-        Part* p = toInt(get(r.query, "id"), 1, limits::kMaxId, id) ? inv_.findById(id) : nullptr;
+        const Part* p = toInt(get(r.query, "id"), 1, limits::kMaxId, id) ? inv_.findById(id) : nullptr;
         if (!p) return notFoundPage();
         return partForm("Update part " + std::to_string(id), "/edit", p, "");
     }
@@ -1923,12 +2616,12 @@ body.auth{display:grid;place-items:center;padding:24px}
     // Fallback confirmation page (used only when JavaScript is unavailable).
     std::string deleteConfirm(const Request& r) {
         int id = 0;
-        Part* p = toInt(get(r.query, "id"), 1, limits::kMaxId, id) ? inv_.findById(id) : nullptr;
+        const Part* p = toInt(get(r.query, "id"), 1, limits::kMaxId, id) ? inv_.findById(id) : nullptr;
         if (!p) return notFoundPage();
         return layout("Delete part",
                       "<div class='card' style='max-width:520px'><h2>Delete this part?</h2><p class='sub'><b>[" + std::to_string(id) + "] " + htmlEscape(p->name()) +
                       "</b><br>" + htmlEscape(p->category()) + " &middot; " + std::to_string(p->quantity()) + " in stock</p>" +
-                      flashBox("This permanently removes the record.", "err") + "<form method='post' action='/delete'><input type='hidden' name='id' value='" +
+                      flashBox("This removes the record (a backup of the previous data is kept).", "err") + "<form method='post' action='/delete'><input type='hidden' name='id' value='" +
                       std::to_string(id) + "'><div class='fa'><button class='btn danger' type='submit'>Yes, delete</button><a class='btn ghost' href='/'>Cancel</a></div></form></div>");
     }
 
@@ -1950,9 +2643,11 @@ body.auth{display:grid;place-items:center;padding:24px}
         return "";
     }
 
-    Response afterSave(const std::string& okMsg) {
-        if (!inv_.lastSaveOk()) return redirectMsg("Changed in memory but NOT saved to disk: " + inv_.lastError(), "err");
-        return redirectMsg(okMsg);
+    // Reports a failed disk write, or a non-fatal problem (backup / history file) after a successful one.
+    Response afterSave(const std::string& okMsg, const std::string& extra = "") {
+        if (!inv_.lastSaveOk()) return redirectMsg("Changed in memory but NOT saved to disk: " + inv_.lastError(), "err", extra);
+        if (!inv_.lastWarning().empty()) return redirectMsg(okMsg + " Warning: " + inv_.lastWarning(), "err", extra);
+        return redirectMsg(okMsg, "ok", extra);
     }
 
     Response doAdd(const Request& r) {
@@ -1965,31 +2660,22 @@ body.auth{display:grid;place-items:center;padding:24px}
 
     Response doEdit(const Request& r) {
         int id = 0;
-        Part* cur = toInt(get(r.form, "id"), 1, limits::kMaxId, id) ? inv_.findById(id) : nullptr;
-        if (!cur) return bad("Part not found.");
+        if (!toInt(get(r.form, "id"), 1, limits::kMaxId, id) || !inv_.findById(id)) return bad("Part not found.");
         Part p;
         std::string err = readPart(r.form, p, false);
         if (!err.empty()) return bad(err);
-        cur->setName(p.name());
-        cur->setCategory(p.category());
-        cur->setPrice(p.price());
-        cur->setQuantity(p.quantity());
-        cur->setMinStock(p.minStock());
-        inv_.save();
+        inv_.updatePart(id, p);
         return afterSave("Part " + std::to_string(id) + " updated and saved.");
     }
 
     Response doAdjust(const Request& r) {
         int id = 0, qty = 0;
-        Part* p = toInt(get(r.form, "id"), 1, limits::kMaxId, id) ? inv_.findById(id) : nullptr;
-        if (!p) return bad("Part not found.");
+        const std::string back = sortQuery(parseSort(r.form));  // keep the table sorted the way the user had it
+        if (!toInt(get(r.form, "id"), 1, limits::kMaxId, id) || !inv_.findById(id)) return bad("Part not found.");
         if (!toInt(get(r.form, "qty"), 1, limits::kMaxQty, qty)) return bad("Enter a whole number of 1 or more.");
-        long long n = static_cast<long long>(p->quantity()) + (get(r.form, "op") == "remove" ? -qty : qty);
-        if (n < 0) return redirectMsg("Cannot remove " + std::to_string(qty) + ": only " + std::to_string(p->quantity()) + " in stock.", "err");
-        if (n > limits::kMaxQty) return redirectMsg("Stock cannot exceed " + std::to_string(limits::kMaxQty) + " units.", "err");
-        p->setQuantity(static_cast<int>(n));
-        inv_.save();
-        return afterSave("Stock of part " + std::to_string(id) + " is now " + std::to_string(n) + ".");
+        const std::string err = inv_.adjustStock(id, get(r.form, "op") == "remove" ? -static_cast<long long>(qty) : qty);
+        if (!err.empty()) return redirectMsg(err, "err", back);
+        return afterSave("Stock of part " + std::to_string(id) + " is now " + std::to_string(inv_.findById(id)->quantity()) + ".", back);
     }
 
     Response doDelete(const Request& r) {
@@ -2014,9 +2700,22 @@ public:
             if (!loginScreen()) break;          // user chose Exit (or input closed)
             const bool exitApp = sessionLoop(); // true = Exit, false = Logout
             ui::gUser.clear();
+            inv_.setActor("");
             if (exitApp) break;
         }
         goodbye();
+    }
+
+    // Runs before anything else. A fresh install has NO password: the admin chooses one here
+    // (plus a recovery question/answer). Returns false if setup could not be completed.
+    bool ensureSetup() {
+        if (!auth_.isConfigured()) return firstRunSetup();
+        if (!auth_.hasRecovery(auth_.adminName())) {
+            ui::notify(ui::Kind::Warning, "No recovery phrase is set for '" + auth_.adminName() +
+                                              "', so \"Forgot password\" is disabled. You can add one now (or later from the menu / the web Security page).");
+            if (ui::confirm("Set up the recovery phrase now?")) changeRecoveryFlow(auth_.adminName());
+        }
+        return true;
     }
 
     // Starts only the Chrome dashboard (run the program with the argument "web").
@@ -2063,6 +2762,7 @@ private:
 
                 if (auto name = auth_.login(user, pass)) {
                     ui::gUser = *name;
+                    inv_.setActor(*name);
                     return true;
                 }
                 const int left = kMaxAttempts - attempt;
@@ -2130,7 +2830,7 @@ private:
         startSession();
         while (true) {
             printMenu();
-            auto c = ui::askInt("Select an option [0-11]: ", 0, 11);
+            auto c = ui::askInt("Select an option [0-14]: ", 0, 14);
             if (!c.ok) return true;  // input closed
             switch (c.value) {
                 case 1: addPart(); break;
@@ -2143,6 +2843,9 @@ private:
                 case 8: browseBySystem(); break;
                 case 9: lowStockReport(); break;
                 case 11: startWebFromMenu(); break;
+                case 12: stockHistory(); break;
+                case 13: reorderReport(); break;
+                case 14: securityMenu(); break;
                 case 10:
                     if (logout()) return false;
                     continue;
@@ -2208,6 +2911,8 @@ private:
         item(7, "Search", "By ID, name or vehicle system");
         item(8, "Browse by vehicle system", "Engine, Braking, Electrical, ...");
         item(9, "Low stock report", "Parts below minimum threshold");
+        item(12, "Stock history", "Audit log of every stock change");
+        item(13, "Reorder list", "Low-stock parts + quantity to order");
         ui::section("WEB");
 #ifndef RE_NO_WEB
         item(11, "Web dashboard (Chrome)", "Open this inventory in your browser");
@@ -2215,6 +2920,7 @@ private:
         item(11, "Web dashboard (disabled)", "Built with -DRE_NO_WEB");
 #endif
         ui::section("SESSION");
+        item(14, "Security settings", "Change password / recovery phrase");
         item(10, "Log out", "Return to the login screen");
         item(0, "Exit application", "Save and quit");
         ui::bottom(ui::kDouble);
@@ -2226,6 +2932,173 @@ private:
         if (inv_.lastSaveOk()) return true;
         ui::notify(ui::Kind::Error, "Change made in memory but NOT saved to disk: " + inv_.lastError());
         return false;
+    }
+
+    // Backup / history problems never block a save, but the user must hear about them.
+    void reportWarning() {
+        if (!inv_.lastWarning().empty()) ui::notify(ui::Kind::Warning, inv_.lastWarning());
+    }
+
+    // ============================ Audit log ===============================
+    void stockHistory() {
+        ui::screen("STOCK HISTORY");
+        const auto rows = inv_.history().recent(25);
+        if (rows.empty()) { ui::notify(ui::Kind::Info, "No stock movements recorded yet."); return; }
+        static const size_t w[8] = {19, 6, 15, 12, 3, 5, 5, 6};
+        static const char* heads[8] = {"Time", "ID", "Part Name", "Action", "+/-", "Qty", "Stock", "By"};
+        auto line = [&](const char* l, const char* m, const char* r) {
+            std::string t = l;
+            for (int i = 0; i < 8; ++i) t += util::rep("─", w[i] + 2) + (i < 7 ? m : r);
+            std::cout << t << '\n';
+        };
+        auto cell = [&](int i, const std::string& text, bool right, const char* color = nullptr) {
+            const std::string c = util::clip(text, w[i]);
+            return " " + ui::paint(right ? util::padLeft(c, w[i]) : util::padRight(c, w[i]), color) + " ";
+        };
+        std::cout << '\n';
+        line("┌", "┬", "┐");
+        std::cout << "│";
+        for (int i = 0; i < 8; ++i) std::cout << cell(i, heads[i], i == 1 || (i >= 4 && i <= 6), ui::kBoldCyan) << "│";
+        std::cout << '\n';
+        line("├", "┼", "┤");
+        for (const HistoryEntry* e : rows) {
+            const char* color = e->change == '+' ? ui::kGreen : e->change == '-' ? ui::kYellow : nullptr;
+            std::cout << "│" << cell(0, e->timestamp, false) << "│" << cell(1, std::to_string(e->partId), true) << "│" << cell(2, e->partName, false) << "│"
+                      << cell(3, e->action, false) << "│" << cell(4, std::string(1, e->change), true, color) << "│" << cell(5, std::to_string(e->qtyChanged), true)
+                      << "│" << cell(6, std::to_string(e->stockAfter), true) << "│" << cell(7, e->user, false) << "│\n";
+        }
+        line("└", "┴", "┘");
+        std::cout << "  Latest " << rows.size() << " of " << inv_.history().entries().size() << " record(s), newest first. Full log: "
+                  << inv_.history().filename() << "\n";
+    }
+
+    // ============================ Reorder list ============================
+    void reorderReport() {
+        ui::screen("REORDER LIST");
+        const auto lines = inv_.reorderList();
+        if (lines.empty()) { ui::notify(ui::Kind::Success, "All parts are at or above their minimum threshold. Nothing to reorder."); return; }
+        static const size_t w[7] = {6, 20, 12, 6, 6, 9, 12};
+        static const char* heads[7] = {"ID", "Part Name", "System", "Stock", "Min", "Order qty", "Est. cost"};
+        auto line = [&](const char* l, const char* m, const char* r) {
+            std::string t = l;
+            for (int i = 0; i < 7; ++i) t += util::rep("─", w[i] + 2) + (i < 6 ? m : r);
+            std::cout << t << '\n';
+        };
+        auto cell = [&](int i, const std::string& text, const char* color = nullptr) {
+            const std::string c = util::clip(text, w[i]);
+            return " " + ui::paint(i == 1 || i == 2 ? util::padRight(c, w[i]) : util::padLeft(c, w[i]), color) + " ";
+        };
+        std::cout << '\n';
+        line("┌", "┬", "┐");
+        std::cout << "│";
+        for (int i = 0; i < 7; ++i) std::cout << cell(i, heads[i], ui::kBoldCyan) << "│";
+        std::cout << '\n';
+        line("├", "┼", "┤");
+        long long units = 0;
+        double cost = 0;
+        for (const auto& l : lines) {
+            const Part& p = *l.part;
+            units += l.needed;
+            cost += l.needed * p.price();
+            const char* color = p.isOutOfStock() ? ui::kBoldRed : ui::kYellow;
+            std::cout << "│" << cell(0, std::to_string(p.id()), color) << "│" << cell(1, p.name(), color) << "│" << cell(2, p.category(), color) << "│"
+                      << cell(3, std::to_string(p.quantity()), color) << "│" << cell(4, std::to_string(p.minStock()), color) << "│"
+                      << cell(5, std::to_string(l.needed), color) << "│" << cell(6, util::moneyFmt(l.needed * p.price()), color) << "│\n";
+        }
+        line("└", "┴", "┘");
+        std::cout << "  " << lines.size() << " part(s) to reorder  |  " << units << " unit(s)  |  estimated cost PHP " << util::moneyFmt(cost)
+                  << "\n  Tip: the web dashboard has a printable version of this list.\n";
+    }
+
+    // ===================== First-run setup & security =====================
+    // Asks twice (hidden) until both entries match and pass 'check'. Returns false on EOF.
+    bool askSecret(const std::string& label, const std::string& again, std::string& out, std::string (*check)(const std::string&)) {
+        while (true) {
+            std::string a, b;
+            if (!ui::readPassword(label, a)) return false;
+            if (check) {
+                const std::string err = check(a);
+                if (!err.empty()) { ui::problem(err); continue; }
+            }
+            if (!ui::readPassword(again, b)) return false;
+            if (a != b) { ui::problem("The two entries do not match. Try again."); continue; }
+            out = a;
+            return true;
+        }
+    }
+
+    static std::string checkAnswerOnly(const std::string& a) { return auth::Authenticator::checkRecovery("question", a); }
+
+    // Asks for a recovery question + answer. Returns false on EOF.
+    bool askRecovery(std::string& question, std::string& answer, const std::string& currentQuestion = "") {
+        while (true) {
+            if (!currentQuestion.empty()) std::cout << "  Current question: " << currentQuestion << '\n';
+            ui::hint("Pick a question only you can answer, e.g. \"What was the name of my first workshop?\"");
+            if (!ui::readLine("Recovery question: ", question)) return false;
+            if (question.empty() && !currentQuestion.empty()) question = currentQuestion;
+            const std::string err = auth::Authenticator::checkRecovery(question, std::string(auth::policy::kMinRecovery, 'x'));
+            if (!err.empty()) { ui::problem(err); continue; }
+            ui::hint("The answer is stored hashed, like a password. At least " + std::to_string(auth::policy::kMinRecovery) + " characters.");
+            return askSecret("Recovery answer: ", "Repeat the answer: ", answer, &checkAnswerOnly);
+        }
+    }
+
+    bool firstRunSetup() {
+        ui::clear();
+        ui::logo();
+        ui::notify(ui::Kind::Info, "FIRST-TIME SETUP. This copy has no admin account yet. Choose a password and a recovery phrase. "
+                                   "They are saved only as salted hashes in '" + std::string(auth::Authenticator::kUsersFile) + "'. "
+                                   "(If you ever lose both, delete that file and start the program again.)");
+        std::cout << "\n  Account name: " << auth::Authenticator::kAdminName << "\n\n";
+        while (true) {
+            std::string pw, q, a;
+            ui::hint("Admin password (" + std::to_string(auth::policy::kMinPassword) + "+ characters):");
+            if (!askSecret("New password: ", "Repeat password: ", pw, &auth::Authenticator::checkPassword)) { std::cerr << "\n  Setup cancelled.\n"; return false; }
+            std::cout << '\n';
+            if (!askRecovery(q, a)) { std::cerr << "\n  Setup cancelled.\n"; return false; }
+            const std::string err = auth_.initialSetup(pw, q, a);
+            if (err.empty()) {
+                ui::notify(ui::Kind::Success, "Setup complete. Sign in as '" + std::string(auth::Authenticator::kAdminName) + "' with the password you just chose.");
+                ui::pause();
+                return true;
+            }
+            ui::notify(ui::Kind::Error, err);
+        }
+    }
+
+    void changePasswordFlow(const std::string& user) {
+        std::string cur, np;
+        if (!ui::readPassword("Current password: ", cur)) return;
+        if (!auth_.login(user, cur)) { ui::notify(ui::Kind::Error, "The current password is incorrect."); return; }
+        if (!askSecret("New password: ", "Repeat new password: ", np, &auth::Authenticator::checkPassword)) return;
+        const std::string err = auth_.changePassword(user, cur, np);
+        ui::notify(err.empty() ? ui::Kind::Success : ui::Kind::Error, err.empty() ? "Password updated and saved." : err);
+    }
+
+    void changeRecoveryFlow(const std::string& user) {
+        std::string cur, q, a;
+        if (!ui::readPassword("Current password: ", cur)) return;
+        if (!auth_.login(user, cur)) { ui::notify(ui::Kind::Error, "The current password is incorrect."); return; }
+        if (!askRecovery(q, a, auth_.recoveryQuestion())) return;
+        const std::string err = auth_.changeRecovery(user, cur, q, a);
+        ui::notify(err.empty() ? ui::Kind::Success : ui::Kind::Error, err.empty() ? "Recovery phrase updated and saved." : err);
+    }
+
+    void securityMenu() {
+        while (true) {
+            ui::screen("SECURITY SETTINGS");
+            std::cout << '\n';
+            ui::top(ui::kSingle, "ACCOUNT", ui::kCyan);
+            ui::row(ui::kSingle, "User: " + ui::gUser + "      Recovery phrase: " + (auth_.hasRecovery(ui::gUser) ? "set" : "NOT SET"), ui::kCyan);
+            ui::row(ui::kSingle, "[1] Change password     [2] Change recovery question / answer     [0] Back", ui::kCyan);
+            ui::bottom(ui::kSingle, ui::kCyan);
+            auto c = ui::askInt("Select [0-2]: ", 0, 2);
+            if (!c.ok || c.value == 0) return;
+            std::cout << '\n';
+            if (c.value == 1) changePasswordFlow(ui::gUser);
+            else changeRecoveryFlow(ui::gUser);
+            ui::pause();
+        }
     }
 
     // ============================== Create ================================
@@ -2253,6 +3126,7 @@ private:
         Part p(id.value, *name, *sys, price.value, qty.value, minq.value);
         if (inv_.addPart(p)) {
             if (saved()) ui::notify(ui::Kind::Success, "Part " + std::to_string(p.id()) + " (" + p.name() + ") added and saved.");
+            reportWarning();
             if (p.isLowStock()) ui::notify(ui::Kind::Warning, "This part is already below its minimum threshold.");
         }
     }
@@ -2271,7 +3145,7 @@ private:
         std::cout << '\n';
         auto id = ui::askInt("Part ID: ", 1, limits::kMaxId);
         if (!id.ok) return;
-        Part* p = inv_.findById(id.value);
+        const Part* p = inv_.findById(id.value);
         if (!p) { ui::notify(ui::Kind::Error, "No part with ID " + std::to_string(id.value) + "."); return; }
         ui::printDetail(*p);
     }
@@ -2282,7 +3156,7 @@ private:
         std::cout << '\n';
         auto id = ui::askInt("Part ID to update: ", 1, limits::kMaxId);
         if (!id.ok) return;
-        Part* p = inv_.findById(id.value);
+        const Part* p = inv_.findById(id.value);
         if (!p) { ui::notify(ui::Kind::Error, "No part with ID " + std::to_string(id.value) + "."); return; }
         ui::printDetail(*p);
         std::cout << '\n';
@@ -2305,14 +3179,13 @@ private:
         auto minq = ui::askInt("New minimum threshold [" + std::to_string(p->minStock()) + "]: ", 0, limits::kMaxQty, true);
         if (!minq.ok) return;
 
-        p->setName(newName);
-        p->setCategory(newSys);
-        if (!price.blank) p->setPrice(price.value);
-        if (!qty.blank) p->setQuantity(qty.value);
-        if (!minq.blank) p->setMinStock(minq.value);
-        inv_.save();
+        const Part updated(p->id(), newName, newSys, price.blank ? p->price() : price.value,
+                           qty.blank ? p->quantity() : qty.value, minq.blank ? p->minStock() : minq.value);
+        inv_.updatePart(id.value, updated);  // saves, backs up the old file and writes the history entry
+        p = inv_.findById(id.value);
 
         if (saved()) ui::notify(ui::Kind::Success, "Part " + std::to_string(p->id()) + " updated and saved.");
+        reportWarning();
         ui::printDetail(*p);
         ui::showLowStockAlert(inv_);  // re-check after stock/threshold change
     }
@@ -2322,26 +3195,17 @@ private:
         std::cout << '\n';
         auto id = ui::askInt("Part ID: ", 1, limits::kMaxId);
         if (!id.ok) return;
-        Part* p = inv_.findById(id.value);
+        const Part* p = inv_.findById(id.value);
         if (!p) { ui::notify(ui::Kind::Error, "No part with ID " + std::to_string(id.value) + "."); return; }
         std::cout << "\n  " << ui::paint(p->name(), ui::kBoldCyan) << " - current stock: " << p->quantity()
                   << " (min " << p->minStock() << ")\n";
         ui::hint("Enter a positive number to ADD stock (e.g. 10) or a negative one to REMOVE (e.g. -3).");
         auto delta = ui::askInt("Change: ", -limits::kMaxQty, limits::kMaxQty);
         if (!delta.ok) return;
-        long long newQty = static_cast<long long>(p->quantity()) + delta.value;
-        if (newQty < 0) {
-            ui::notify(ui::Kind::Error, "Cannot remove " + std::to_string(-delta.value) + ": only " +
-                                            std::to_string(p->quantity()) + " in stock.");
-            return;
-        }
-        if (newQty > limits::kMaxQty) {
-            ui::notify(ui::Kind::Error, "Stock cannot exceed " + std::to_string(limits::kMaxQty) + " units.");
-            return;
-        }
-        p->setQuantity(static_cast<int>(newQty));
-        inv_.save();
-        if (saved()) ui::notify(ui::Kind::Success, "Stock updated and saved. New quantity: " + std::to_string(p->quantity()));
+        const std::string err = inv_.adjustStock(id.value, delta.value);
+        if (!err.empty()) { ui::notify(ui::Kind::Error, err); return; }
+        if (saved()) ui::notify(ui::Kind::Success, "Stock updated and saved. New quantity: " + std::to_string(inv_.findById(id.value)->quantity()));
+        reportWarning();
         ui::showLowStockAlert(inv_);
     }
 
@@ -2351,15 +3215,16 @@ private:
         std::cout << '\n';
         auto id = ui::askInt("Part ID to delete: ", 1, limits::kMaxId);
         if (!id.ok) return;
-        Part* p = inv_.findById(id.value);
+        const Part* p = inv_.findById(id.value);
         if (!p) { ui::notify(ui::Kind::Error, "No part with ID " + std::to_string(id.value) + "."); return; }
         ui::printDetail(*p);
         std::cout << '\n';
-        ui::notify(ui::Kind::Warning, "Deleting a part permanently removes its record.");
+        ui::notify(ui::Kind::Warning, "Deleting a part removes its record (the previous data is kept in the backups folder).");
         std::cout << '\n';
         if (ui::confirm("Permanently delete this part?")) {
             inv_.removePart(id.value);
             if (saved()) ui::notify(ui::Kind::Success, "Part deleted and changes saved.");
+            reportWarning();
         } else {
             ui::notify(ui::Kind::Info, "Deletion cancelled. Nothing was changed.");
         }
@@ -2430,27 +3295,11 @@ private:
 };
 
 // ----------------------------------------------------------------------------
-//  Optional helper:  re_parts_tracker.exe --make-credential
-//  Prints a ready-to-paste account line (salted hash) for defaultUsers().
-// ----------------------------------------------------------------------------
-int makeCredential() {
-    std::string user, p1, p2;
-    std::cout << "Create a credential line for auth::defaultUsers()\n";
-    if (!ui::readLine("Username: ", user) || user.empty()) { std::cerr << "Username required.\n"; return 1; }
-    if (!ui::readPassword("Password: ", p1) || p1.size() < 8) { std::cerr << "Use a password of at least 8 characters.\n"; return 1; }
-    if (!ui::readPassword("Repeat password: ", p2) || p1 != p2) { std::cerr << "Passwords do not match.\n"; return 1; }
-    const std::string salt = auth::randomSalt(user);
-    std::cout << "\nPaste this into defaultUsers():\n\n    {\"" << user << "\", \"" << salt << "\", \""
-              << auth::hashPassword(salt, p1) << "\"},\n\n";
-    return 0;
-}
-
-// ----------------------------------------------------------------------------
 int main(int argc, char** argv) {
     ui::ConsoleSession console;  // UTF-8 + colour set-up, restored on exit
     const std::string arg = argc > 1 ? util::toLower(argv[1]) : "";
-    if (arg == "--make-credential") return makeCredential();
     App app;
+    if (!app.ensureSetup()) return 1;  // first run: choose the admin password + recovery phrase
     if (arg == "web" || arg == "--web") app.runWeb();
     else app.run();
     return 0;

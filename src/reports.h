@@ -52,4 +52,40 @@ struct ReorderItem {
 };
 std::vector<ReorderItem> reorderList(const std::vector<inv::Part>& parts);  // most short first
 
+// ---- Receivables ("utang") ----
+struct CustomerBalance {
+    std::string customer;
+    int openInvoices = 0;
+    double billed = 0, paid = 0, balance = 0;   // over the customer's OPEN invoices only
+    std::string oldestDate;                      // date of the oldest open invoice (YYYY-MM-DD)
+    int oldestDays = 0;                          // its age in days
+};
+// Customers who owe money, largest balance first. Names are grouped ignoring case/extra spaces.
+std::vector<CustomerBalance> receivablesByCustomer(const std::vector<inv::Invoice>& invoices, std::time_t now);
+double totalReceivable(const std::vector<inv::Invoice>& invoices);
+int openInvoiceCount(const std::vector<inv::Invoice>& invoices);
+std::string customerKey(const std::string& name);   // grouping key (lower-case, single spaces)
+
+// ---- End-of-day cashier summary ----
+struct MethodTotal { std::string method; int count = 0; double amount = 0; };
+struct DailyCashReport {
+    std::string date;                       // YYYY-MM-DD
+    int invoiceCount = 0;                   // invoices created that day
+    int paidCount = 0, partialCount = 0, unpaidCount = 0;   // their status at the END of that day
+    double grossSales = 0;                  // total of those invoices (parts + services)
+    double partsSales = 0, serviceSales = 0;
+    double collected = 0;                   // every payment received that day = net cash collected
+    double collectedOnToday = 0;            // ...of which on invoices made that same day
+    double collectedOnOlder = 0;            // ...of which on earlier credit invoices (utang payments)
+    double creditExtended = 0;              // unpaid part of that day's invoices at close of day
+    double outstandingNow = 0;              // all customers' open balances right now (not date dependent)
+    int customersOwing = 0;
+    std::vector<MethodTotal> byMethod;      // only methods that were used, biggest first
+    std::vector<const inv::Invoice*> invoices;   // that day's invoices, oldest first
+    std::vector<const inv::Payment*> payments;   // that day's payments, oldest first
+};
+// Valid "YYYY-MM-DD" -> true.
+bool validDate(const std::string& date);
+DailyCashReport dailyCashReport(const std::vector<inv::Invoice>& invoices, const std::vector<inv::Payment>& payments, const std::string& date);
+
 }  // namespace reports

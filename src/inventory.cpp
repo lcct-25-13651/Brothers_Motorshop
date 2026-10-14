@@ -1,6 +1,8 @@
 #include "inventory.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <set>
@@ -14,7 +16,8 @@ namespace inv {
 namespace {
 const char* kBom = "\xEF\xBB\xBF";
 const char* kPartsHeader = "PartID,Name,Category,Price,Quantity,MinStock,CostPrice,CompatibleModels";
-const char* kInvoiceHeader = "invoice_no,timestamp,customer,username,line_type,part_id,description,qty,unit_price";
+const char* kInvoiceHeader = "invoice_no,timestamp,customer,username,line_type,part_id,description,qty,unit_price,amount_paid,payment_status";
+const char* kPaymentHeader = "timestamp,invoice_no,username,amount,method,balance_after,note";
 
 std::string key(std::string s) {  // header-name normaliser: "Min Stock" -> "minstock"
     std::string o;
@@ -62,6 +65,39 @@ std::optional<Part> Part::fromCsv(const std::vector<std::string>& f) {
     if (f.size() > 6 && util::parseDouble(f[6], 0, limits::kMaxPrice, cost)) part.setCostPrice(cost);  // optional columns
     if (f.size() > 7) part.setCompatibleModels(util::oneLine(util::trim(f[7])));
     return part;
+}
+
+std::vector<std::string> splitModels(const std::string& text) {
+    std::vector<std::string> out;
+    std::string cur;
+    auto flush = [&]() {
+        std::string t;  // trim + collapse inner whitespace
+        bool space = false;
+        for (unsigned char ch : cur) {
+            if (std::isspace(ch)) { space = !t.empty(); continue; }
+            if (space) t += ' ';
+            space = false;
+            t += static_cast<char>(ch);
+        }
+        cur.clear();
+        if (t.empty()) return;
+        for (const std::string& e : out) if (util::equalsIgnoreCase(e, t)) return;
+        out.push_back(t);
+    };
+    for (char ch : text) {
+        if (ch == ',' || ch == ';' || ch == '|' || ch == '\n' || ch == '\r') flush(); else cur += ch;
+    }
+    flush();
+    return out;
+}
+
+std::vector<std::string> Part::modelList() const { return splitModels(compatibleModels_); }
+
+bool Part::fitsModel(const std::string& model) const {
+    const std::string want = util::trim(model);
+    if (want.empty()) return false;
+    for (const std::string& m : splitModels(compatibleModels_)) if (util::equalsIgnoreCase(m, want)) return true;
+    return false;
 }
 
 const std::vector<std::string>& standardSystems() {
@@ -131,31 +167,127 @@ std::string MovementLog::toCsv() const {
     return out;
 }
 
-// ================================================================ Invoices
+// ================================================================ Payments / Invoices
+const char* payStatusName(PayStatus s) {
+    switch (s) {
+        case PayStatus::Paid: return "Paid";
+        case PayStatus::Partial: return "Partial";
+        case PayStatus::Unpaid: return "Unpaid";
+    }
+    return "Paid";
+}
+
+const std::vector<std::string>& paymentMethods() {
+    static const std::vector<std::string> m = {"Cash", "GCash", "Maya", "Bank transfer", "Card"};
+    return m;
+}
+
+std::string canonicalMethod(const std::string& s) {
+    const std::string t = util::trim(s);
+    for (const std::string& m : paymentMethods()) if (util::equalsIgnoreCase(m, t)) return m;
+    return "";
+}
+
 double Invoice::total() const {
     double t = 0;
     for (const InvoiceLine& l : lines) t += l.total();
     return t;
 }
 
-InvoiceBook::InvoiceBook(std::string file) : file_(std::move(file)) {
+double Invoice::balance() const { return std::max(0.0, util::round2(util::round2(total()) - amountPaid)); }
+
+PayStatus Invoice::status() const {
+    if (balance() <= 0.0) return PayStatus::Paid;
+    return amountPaid <= 0.0 ? PayStatus::Unpaid : PayStatus::Partial;
+}
+
+PaymentLog::PaymentLog(std::string file) : file_(std::move(file)) {
     for (const auto& f : util::readCsvFile(file_)) {
-        if (f.size() < 9 || f[0] == "invoice_no") continue;
+        if (f.size() < 5 || f[0] == "timestamp") continue;
+        double amount = 0, bal = 0;
+        if (!util::parseDouble(f[3], 0, 1e12, amount)) continue;
+        if (f.size() > 5) util::parseDouble(f[5], 0, 1e12, bal);
+        Payment p;
+        p.timestamp = f[0]; p.invoiceNo = f[1]; p.user = f[2]; p.amount = amount; p.method = f[4]; p.balanceAfter = bal;
+        if (f.size() > 6) p.note = f[6];
+        entries_.push_back(std::move(p));
+    }
+}
+
+bool PaymentLog::record(Payment p) {
+    p.user = util::oneLine(p.user);
+    p.note = util::oneLine(p.note);
+    entries_.push_back(p);
+    return util::appendLine(file_, kPaymentHeader,
+                            util::csvEscape(p.timestamp) + ',' + util::csvEscape(p.invoiceNo) + ',' + util::csvEscape(p.user) + ',' + util::money(p.amount) + ',' +
+                                util::csvEscape(p.method) + ',' + util::money(p.balanceAfter) + ',' + util::csvEscape(p.note));
+}
+
+std::vector<const Payment*> PaymentLog::forInvoice(const std::string& number) const {
+    std::vector<const Payment*> out;
+    for (const Payment& p : entries_) if (p.invoiceNo == number) out.push_back(&p);
+    return out;
+}
+
+double PaymentLog::paidFor(const std::string& number) const {
+    double t = 0;
+    for (const Payment& p : entries_) if (p.invoiceNo == number) t = util::round2(t + p.amount);
+    return t;
+}
+
+namespace {
+std::string invoiceRow(const Invoice& inv, const InvoiceLine& l) {
+    return util::csvEscape(inv.number) + ',' + util::csvEscape(inv.timestamp) + ',' + util::csvEscape(inv.customer) + ',' + util::csvEscape(inv.user) + ',' +
+           (l.kind == InvoiceLine::Kind::Service ? "SERVICE" : "PART") + ',' + std::to_string(l.partId) + ',' + util::csvEscape(l.description) + ',' +
+           std::to_string(l.qty) + ',' + util::money(l.unitPrice) + ',' + util::money(inv.amountPaid) + ',' + payStatusName(inv.status());
+}
+}  // namespace
+
+InvoiceBook::InvoiceBook(std::string file) : file_(std::move(file)) {
+    std::map<std::string, size_t> index;
+    int skipped = 0;
+    bool legacy = false;
+    for (const auto& f : util::readCsvFile(file_)) {
+        if (f.empty()) continue;
+        if (f[0] == "invoice_no") { legacy = f.size() < 11; continue; }
         long long pid = 0, qty = 0;
         double price = 0;
-        if (!util::parseInt(f[7], 1, limits::kMaxQty, qty) || !util::parseDouble(f[8], 0, 1e12, price)) continue;
+        if (f.size() < 9 || !util::parseInt(f[7], 1, limits::kMaxQty, qty) || !util::parseDouble(f[8], 0, 1e12, price)) { ++skipped; continue; }
         util::parseInt(f[5], 0, limits::kMaxId, pid);
-        Invoice* cur = nullptr;
-        for (Invoice& i : invoices_) if (i.number == f[0]) { cur = &i; break; }
-        if (!cur) {
-            invoices_.push_back({f[0], f[1], f[2], f[3], {}});
-            cur = &invoices_.back();
+        auto it = index.find(f[0]);
+        if (it == index.end()) {
+            Invoice inv;
+            inv.number = f[0]; inv.timestamp = f[1]; inv.customer = f[2]; inv.user = f[3];
+            inv.amountPaid = -1.0;  // resolved below once every line is known
+            if (f.size() > 9) { double paid = 0; inv.amountPaid = util::parseDouble(f[9], 0, 1e12, paid) ? util::round2(paid) : 0.0; }
+            invoices_.push_back(std::move(inv));
+            it = index.emplace(f[0], invoices_.size() - 1).first;
         }
+        Invoice& cur = invoices_[it->second];
         InvoiceLine l;
         l.kind = f[4] == "SERVICE" ? InvoiceLine::Kind::Service : InvoiceLine::Kind::Part;
         l.partId = static_cast<int>(pid); l.description = f[6]; l.qty = static_cast<int>(qty); l.unitPrice = price;
-        cur->lines.push_back(l);
+        cur.lines.push_back(l);
     }
+    for (Invoice& inv : invoices_) {
+        const double total = util::round2(inv.total());
+        if (inv.amountPaid < 0) inv.amountPaid = total;               // 9-column (pre-credit) file: those sales were paid at the till
+        inv.amountPaid = std::min(inv.amountPaid, total);             // never more than the bill
+    }
+    if (skipped > 0) {  // the rewrite below/at the next payment would drop damaged rows: keep an untouched copy first
+        std::error_code ec;
+        fs::copy_file(file_, file_ + ".bak", fs::copy_options::overwrite_existing, ec);
+        warning_ = std::to_string(skipped) + " malformed row(s) in invoices.csv were skipped (original kept as invoices.csv.bak).";
+    }
+    if (legacy && !invoices_.empty()) save();  // upgrade the file to the 11-column layout (the start-up backup holds the original)
+}
+
+bool InvoiceBook::save() {
+    std::string out = std::string(kInvoiceHeader) + "\n";
+    for (const Invoice& inv : invoices_)
+        for (const InvoiceLine& l : inv.lines) out += invoiceRow(inv, l) + "\n";
+    if (!util::writeFileAtomic(file_, out)) { warning_ = "Could not write invoices.csv - check disk space/permissions."; return false; }
+    return true;
 }
 
 std::string InvoiceBook::nextNumber() const {
@@ -172,12 +304,7 @@ std::string InvoiceBook::nextNumber() const {
 bool InvoiceBook::add(const Invoice& inv) {
     invoices_.push_back(inv);
     bool ok = true;
-    for (const InvoiceLine& l : inv.lines)
-        ok &= util::appendLine(file_, kInvoiceHeader,
-                               util::csvEscape(inv.number) + ',' + util::csvEscape(inv.timestamp) + ',' + util::csvEscape(inv.customer) + ',' +
-                                   util::csvEscape(inv.user) + ',' + (l.kind == InvoiceLine::Kind::Service ? "SERVICE" : "PART") + ',' +
-                                   std::to_string(l.partId) + ',' + util::csvEscape(l.description) + ',' + std::to_string(l.qty) + ',' +
-                                   util::money(l.unitPrice));
+    for (const InvoiceLine& l : inv.lines) ok &= util::appendLine(file_, kInvoiceHeader, invoiceRow(inv, l));
     return ok;
 }
 
@@ -186,13 +313,26 @@ const Invoice* InvoiceBook::find(const std::string& number) const {
     return nullptr;
 }
 
+bool InvoiceBook::setAmountPaid(const std::string& number, double newPaid) {
+    for (Invoice& i : invoices_) {
+        if (i.number != number) continue;
+        const double old = i.amountPaid;
+        i.amountPaid = util::round2(newPaid);
+        if (!save()) { i.amountPaid = old; return false; }
+        return true;
+    }
+    return false;
+}
+
 // ================================================================ Inventory
 Inventory::Inventory(std::string dataDir)
-    : dir_(std::move(dataDir)), moves_(path("movements.csv")), invoices_(path("invoices.csv")) {
+    : dir_(std::move(dataDir)), moves_(path("movements.csv")), invoices_(path("invoices.csv")), payments_(path("payments.csv")) {
     std::error_code ec;
     fs::create_directories(dir_, ec);
     load();
     reconcileLedger();
+    reconcilePayments();
+    if (!invoices_.warning().empty()) warning_ += (warning_.empty() ? "" : " ") + invoices_.warning();
 }
 
 std::string Inventory::path(const char* name) const { return (fs::path(dir_) / name).string(); }
@@ -264,6 +404,7 @@ Result Inventory::addPart(const Part& p, const std::string& actor) {
     const std::string err = Part::validate(p.id(), p.name(), p.category(), p.price(), p.quantity(), p.minStock());
     if (!err.empty()) return Result::fail(err);
     if (find(p.id())) return Result::fail("A part with ID " + std::to_string(p.id()) + " already exists.");
+    if (p.compatibleModels().size() > kMaxModelsText) return Result::fail("Compatible models text is too long (max " + std::to_string(kMaxModelsText) + " characters).");
     warning_.clear();
     parts_.push_back(p);
     if (!save()) { parts_.pop_back(); return Result::fail(warning_); }
@@ -271,15 +412,18 @@ Result Inventory::addPart(const Part& p, const std::string& actor) {
     return Result::success("Part added.");
 }
 
-Result Inventory::updatePart(int id, const std::string& name, const std::string& category, double price, int minStock, const std::string& actor) {
+Result Inventory::updatePart(int id, const std::string& name, const std::string& category, double price, int minStock, const std::string& actor,
+                             const std::optional<std::string>& models) {
     (void)actor;
     Part* cur = mut(id);
     if (!cur) return Result::fail("Part not found.");
     const std::string err = Part::validate(id, name, category, price, cur->quantity(), minStock);
     if (!err.empty()) return Result::fail(err);
+    if (models && models->size() > kMaxModelsText) return Result::fail("Compatible models text is too long (max " + std::to_string(kMaxModelsText) + " characters).");
     const Part old = *cur;
     warning_.clear();
     cur->setName(name); cur->setCategory(category); cur->setPrice(price); cur->setMinStock(minStock);
+    if (models) cur->setCompatibleModels(util::oneLine(util::trim(*models)));
     if (!save()) { *cur = old; return Result::fail(warning_); }
     return Result::success("Part updated.");
 }
@@ -326,9 +470,11 @@ Result Inventory::adjust(int id, long long delta, const std::string& actor, cons
     return Result::success("Stock updated.");
 }
 
-CheckoutResult Inventory::checkout(const std::string& customerIn, const std::vector<InvoiceLine>& in, const std::string& actor) {
-    auto fail = [](const std::string& m) { return CheckoutResult{false, m, ""}; };
-    const std::string customer = util::oneLine(util::trim(customerIn).empty() ? std::string("Walk-in customer") : util::trim(customerIn));
+CheckoutResult Inventory::checkout(const std::string& customerIn, const std::vector<InvoiceLine>& in, const std::string& actor, double amountPaid,
+                                   const std::string& methodIn) {
+    auto fail = [](const std::string& m) { return CheckoutResult{false, m, "", 0, 0}; };
+    const bool anonymous = util::trim(customerIn).empty() || util::equalsIgnoreCase(util::trim(customerIn), "Walk-in customer");
+    const std::string customer = util::oneLine(anonymous ? std::string("Walk-in customer") : util::trim(customerIn));
     if (customer.size() > 80) return fail("Customer name is too long (max 80).");
     if (in.empty()) return fail("Add at least one part or service.");
 
@@ -358,6 +504,14 @@ CheckoutResult Inventory::checkout(const std::string& customerIn, const std::vec
             return fail("Not enough stock for \"" + p->name() + "\": " + std::to_string(p->quantity()) + " available, " + std::to_string(n.second) + " requested.");
     }
 
+    // Payment at the till: negative = in full. Less than the bill = credit sale, which needs a named customer.
+    const double total = util::round2(invoice.total());
+    const double paidNow = amountPaid < 0 ? total : util::round2(amountPaid);
+    if (!(paidNow <= total)) return fail("The amount paid (" + util::moneyFmt(paidNow) + ") is more than the invoice total (" + util::moneyFmt(total) + ").");
+    std::string method = canonicalMethod(methodIn);
+    if (paidNow > 0 && method.empty()) return fail("Choose a valid payment method.");
+    if (paidNow < total && anonymous) return fail("A credit sale (partial or no payment) needs a customer name - walk-in customers must pay in full.");
+
     warning_.clear();
     const std::vector<Part> before = parts_;
     for (const auto& n : need) mut(n.first)->setQuantity(mut(n.first)->quantity() - static_cast<int>(n.second));
@@ -367,6 +521,7 @@ CheckoutResult Inventory::checkout(const std::string& customerIn, const std::vec
     invoice.timestamp = util::nowStamp();
     invoice.customer = customer;
     invoice.user = actor;
+    invoice.amountPaid = paidNow;
     // One SALE movement per part line; resulting_stock is the running level after that line.
     std::map<int, int> running;
     for (const auto& n : need) running[n.first] = mut(n.first)->quantity() + static_cast<int>(n.second);
@@ -379,7 +534,69 @@ CheckoutResult Inventory::checkout(const std::string& customerIn, const std::vec
         if (!moves_.record(m)) warning_ = "movements.csv could not be written.";
     }
     if (!invoices_.add(invoice)) warning_ += (warning_.empty() ? "" : " ") + std::string("invoices.csv could not be written.");
-    return {true, "Sale recorded.", invoice.number};
+    if (paidNow > 0) {
+        Payment pay;
+        pay.timestamp = invoice.timestamp; pay.invoiceNo = invoice.number; pay.user = actor; pay.amount = paidNow; pay.method = method;
+        pay.balanceAfter = util::round2(total - paidNow); pay.note = "paid at sale";
+        if (!payments_.record(pay)) warning_ += (warning_.empty() ? "" : " ") + std::string("payments.csv could not be written.");
+    }
+    return {true, "Sale recorded.", invoice.number, paidNow, util::round2(total - paidNow)};
+}
+
+PaymentResult Inventory::recordPayment(const std::string& invoiceNo, double amountIn, const std::string& methodIn, const std::string& noteIn,
+                                       const std::string& actor, double expectedBalance) {
+    auto fail = [](const std::string& m) { PaymentResult r; r.message = m; return r; };
+    const Invoice* inv = invoices_.find(invoiceNo);
+    if (!inv) return fail("Invoice not found.");
+    const double balance = inv->balance();
+    if (balance <= 0) return fail(invoiceNo + " is already fully paid.");
+    if (expectedBalance >= 0 && std::abs(util::round2(expectedBalance) - balance) > 0.004)
+        return fail("The balance of " + invoiceNo + " changed since you opened the payment page (now " + util::moneyFmt(balance) + "). Check the invoice and try again.");
+    const double amount = util::round2(amountIn);
+    if (!(amount > 0)) return fail("Enter a payment amount greater than zero.");
+    if (amount > balance) return fail("The payment (" + util::moneyFmt(amount) + ") is more than the balance owed (" + util::moneyFmt(balance) + ").");
+    const std::string method = canonicalMethod(methodIn);
+    if (method.empty()) return fail("Choose a valid payment method.");
+    const std::string note = util::oneLine(util::trim(noteIn));
+    if (note.size() > 80) return fail("Note is too long (max 80 characters).");
+
+    warning_.clear();
+    const double newPaid = util::round2(inv->amountPaid + amount);
+    if (!invoices_.setAmountPaid(invoiceNo, newPaid)) return fail(invoices_.warning());
+    inv = invoices_.find(invoiceNo);
+    Payment p;
+    p.timestamp = util::nowStamp(); p.invoiceNo = invoiceNo; p.user = actor; p.amount = amount; p.method = method; p.note = note;
+    p.balanceAfter = inv->balance();
+    if (!payments_.record(p)) warning_ = "payments.csv could not be written.";
+    PaymentResult r;
+    r.ok = true; r.applied = amount; r.balance = inv->balance(); r.status = inv->status(); r.customer = inv->customer;
+    r.message = "Payment of " + util::moneyFmt(amount) + " recorded for " + invoiceNo + (r.balance > 0 ? "; balance " + util::moneyFmt(r.balance) + "." : " - fully paid.");
+    return r;
+}
+
+// Every payment on an invoice must be in payments.csv so the daily cash report adds up. Invoices from before credit
+// tracking (or whose payment row was lost to a failed write) get an opening "payment" at the invoice time.
+void Inventory::reconcilePayments() {
+    for (const Invoice& inv : invoices_.all()) {
+        const double missing = util::round2(inv.amountPaid - payments_.paidFor(inv.number));
+        if (missing <= 0) continue;
+        Payment p;
+        p.timestamp = inv.timestamp; p.invoiceNo = inv.number; p.user = "system"; p.amount = missing; p.method = "Cash";
+        p.balanceAfter = util::round2(util::round2(inv.total()) - inv.amountPaid); p.note = "opening balance";
+        if (!payments_.record(p)) { warning_ = "payments.csv could not be written."; return; }
+    }
+}
+
+std::vector<std::string> Inventory::allModels() const {
+    std::vector<std::string> out;
+    for (const Part& p : parts_)
+        for (const std::string& m : p.modelList()) {
+            bool seen = false;
+            for (const std::string& e : out) if (util::equalsIgnoreCase(e, m)) { seen = true; break; }
+            if (!seen) out.push_back(m);
+        }
+    std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) { return util::toLower(a) < util::toLower(b); });
+    return out;
 }
 
 // ---------------------------------------------------------------- CSV import
@@ -389,7 +606,7 @@ ImportSummary Inventory::importCsv(const std::string& text, const std::string& a
     if (rows.empty()) { sum.problems.push_back("The file is empty."); return sum; }
 
     // Column positions: by header name when a header row is present, otherwise parts.csv order.
-    int cId = 0, cName = 1, cCat = 2, cPrice = 3, cQty = 4, cMin = 5, cCost = -1;
+    int cId = 0, cName = 1, cCat = 2, cPrice = 3, cQty = 4, cMin = 5, cCost = -1, cModels = -1;
     size_t first = 0;
     long long dummy;
     if (!util::parseInt(rows[0][0], 0, limits::kMaxId, dummy)) {
@@ -404,6 +621,7 @@ ImportSummary Inventory::importCsv(const std::string& text, const std::string& a
             else if (k == "quantity" || k == "qty" || k == "stock" || k == "stocklevel") cQty = c;
             else if (k == "minstock" || k == "min" || k == "minimum" || k == "reorderlevel") cMin = c;
             else if (k == "unitcost" || k == "cost") cCost = c;
+            else if (k == "compatiblemodels" || k == "models" || k == "compatible" || k == "vehiclemodels") cModels = c;
         }
         first = 1;
         if (cId < 0 || cQty < 0) { sum.problems.push_back("Header row needs at least an ID column and a Quantity column."); return sum; }
@@ -438,6 +656,11 @@ ImportSummary Inventory::importCsv(const std::string& text, const std::string& a
             if (!util::parseInt(cell(r, cMin), 0, limits::kMaxQty, mn)) { sum.problems.push_back(where + "invalid minimum stock."); ++sum.skipped; continue; }
             p.setMinStock(static_cast<int>(mn));
         }
+        if (!cell(r, cModels).empty()) {
+            const std::string models = util::oneLine(cell(r, cModels));
+            if (models.size() > kMaxModelsText) { sum.problems.push_back(where + "compatible models text is too long."); ++sum.skipped; continue; }
+            p.setCompatibleModels(models);
+        }
         const int delta = static_cast<int>(qty) - (cur ? cur->quantity() : 0);
         p.setQuantity(static_cast<int>(qty));
         const std::string err = Part::validate(p.id(), p.name(), p.category(), p.price(), p.quantity(), p.minStock());
@@ -452,7 +675,7 @@ ImportSummary Inventory::importCsv(const std::string& text, const std::string& a
         } else {
             Part* c = mut(o.part.id());
             const bool changed = c->name() != o.part.name() || c->category() != o.part.category() || c->price() != o.part.price() ||
-                                 c->minStock() != o.part.minStock() || o.delta != 0;
+                                 c->minStock() != o.part.minStock() || c->compatibleModels() != o.part.compatibleModels() || o.delta != 0;
             if (c->price() != o.part.price()) sum.priceChanges.push_back({c->id(), c->name(), c->price(), o.part.price()});
             *c = o.part;
             if (changed) ++sum.updated; else ++sum.unchanged;

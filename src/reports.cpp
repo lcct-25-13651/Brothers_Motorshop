@@ -1,6 +1,9 @@
 #include "reports.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 
 #include "util.h"
@@ -131,6 +134,119 @@ std::vector<ReorderItem> reorderList(const std::vector<inv::Part>& parts) {
         if (p.isLowStock()) out.push_back({&p, p.minStock() - p.quantity()});
     std::sort(out.begin(), out.end(), [](const ReorderItem& a, const ReorderItem& b) { return a.suggestedQty > b.suggestedQty; });
     return out;
+}
+
+// ================================================================ receivables
+std::string customerKey(const std::string& name) {
+    std::string out;
+    bool space = false;
+    for (unsigned char ch : name) {
+        if (std::isspace(ch)) { space = !out.empty(); continue; }
+        if (space) out += ' ';
+        space = false;
+        out += static_cast<char>(std::tolower(ch));
+    }
+    return out;
+}
+
+std::vector<CustomerBalance> receivablesByCustomer(const std::vector<inv::Invoice>& invoices, std::time_t now) {
+    std::map<std::string, CustomerBalance> by;
+    for (const inv::Invoice& i : invoices) {
+        if (i.balance() <= 0) continue;
+        CustomerBalance& c = by[customerKey(i.customer)];
+        if (c.customer.empty()) c.customer = i.customer;
+        ++c.openInvoices;
+        c.billed = util::round2(c.billed + i.total());
+        c.paid = util::round2(c.paid + i.amountPaid);
+        c.balance = util::round2(c.balance + i.balance());
+        const std::string day = i.timestamp.substr(0, 10);
+        if (c.oldestDate.empty() || day < c.oldestDate) {
+            c.oldestDate = day;
+            const auto t = util::parseStamp(day + " 00:00:00");
+            c.oldestDays = t ? std::max(0, static_cast<int>((now - *t) / kDay)) : 0;
+        }
+    }
+    std::vector<CustomerBalance> out;
+    for (auto& kv : by) out.push_back(kv.second);
+    std::sort(out.begin(), out.end(), [](const CustomerBalance& a, const CustomerBalance& b) {
+        if (a.balance != b.balance) return a.balance > b.balance;
+        return customerKey(a.customer) < customerKey(b.customer);
+    });
+    return out;
+}
+
+double totalReceivable(const std::vector<inv::Invoice>& invoices) {
+    double t = 0;
+    for (const inv::Invoice& i : invoices) t = util::round2(t + i.balance());
+    return t;
+}
+
+int openInvoiceCount(const std::vector<inv::Invoice>& invoices) {
+    int n = 0;
+    for (const inv::Invoice& i : invoices) if (i.balance() > 0) ++n;
+    return n;
+}
+
+// ================================================================ daily cash report
+bool validDate(const std::string& date) {
+    if (date.size() != 10 || date[4] != '-' || date[7] != '-') return false;
+    for (size_t i : {0u, 1u, 2u, 3u, 5u, 6u, 8u, 9u}) if (!std::isdigit(static_cast<unsigned char>(date[i]))) return false;
+    const int y = std::atoi(date.substr(0, 4).c_str()), m = std::atoi(date.substr(5, 2).c_str()), d = std::atoi(date.substr(8, 2).c_str());
+    if (y < 1970 || m < 1 || m > 12 || d < 1) return false;   // (mktime would silently roll 2026-02-30 into March)
+    static const int days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    const bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    return d <= days[m - 1] + (m == 2 && leap ? 1 : 0);
+}
+
+DailyCashReport dailyCashReport(const std::vector<inv::Invoice>& invoices, const std::vector<inv::Payment>& payments, const std::string& date) {
+    DailyCashReport r;
+    r.date = date;
+    auto onDay = [&](const std::string& stamp) { return stamp.compare(0, 10, date) == 0; };
+    auto upToDay = [&](const std::string& stamp) { return stamp.substr(0, 10) <= date; };
+
+    std::map<std::string, const inv::Invoice*> todays;
+    for (const inv::Invoice& i : invoices) {
+        if (!onDay(i.timestamp)) continue;
+        todays[i.number] = &i;
+        r.invoices.push_back(&i);
+        ++r.invoiceCount;
+        r.grossSales = util::round2(r.grossSales + i.total());
+        for (const inv::InvoiceLine& l : i.lines) {
+            if (l.kind == inv::InvoiceLine::Kind::Service) r.serviceSales = util::round2(r.serviceSales + l.total());
+            else r.partsSales = util::round2(r.partsSales + l.total());
+        }
+    }
+
+    std::map<std::string, MethodTotal> methods;
+    std::map<std::string, double> paidByEndOfDay;   // for today's invoices
+    for (const inv::Payment& p : payments) {
+        if (todays.count(p.invoiceNo) && upToDay(p.timestamp)) paidByEndOfDay[p.invoiceNo] = util::round2(paidByEndOfDay[p.invoiceNo] + p.amount);
+        if (!onDay(p.timestamp)) continue;
+        r.payments.push_back(&p);
+        r.collected = util::round2(r.collected + p.amount);
+        if (todays.count(p.invoiceNo)) r.collectedOnToday = util::round2(r.collectedOnToday + p.amount);
+        else r.collectedOnOlder = util::round2(r.collectedOnOlder + p.amount);
+        MethodTotal& m = methods[p.method];
+        m.method = p.method;
+        ++m.count;
+        m.amount = util::round2(m.amount + p.amount);
+    }
+    for (const inv::Invoice* i : r.invoices) {
+        const double total = util::round2(i->total()), paid = std::min(total, paidByEndOfDay[i->number]);
+        const double owing = util::round2(total - paid);
+        r.creditExtended = util::round2(r.creditExtended + owing);
+        if (owing <= 0) ++r.paidCount; else if (paid <= 0) ++r.unpaidCount; else ++r.partialCount;
+    }
+    for (auto& kv : methods) r.byMethod.push_back(kv.second);
+    std::sort(r.byMethod.begin(), r.byMethod.end(), [](const MethodTotal& a, const MethodTotal& b) {
+        if (a.amount != b.amount) return a.amount > b.amount;
+        return a.method < b.method;
+    });
+    std::stable_sort(r.payments.begin(), r.payments.end(), [](const inv::Payment* a, const inv::Payment* b) { return a->timestamp < b->timestamp; });
+    std::stable_sort(r.invoices.begin(), r.invoices.end(), [](const inv::Invoice* a, const inv::Invoice* b) { return a->timestamp < b->timestamp; });
+    r.outstandingNow = totalReceivable(invoices);
+    r.customersOwing = static_cast<int>(receivablesByCustomer(invoices, std::time(nullptr)).size());
+    return r;
 }
 
 }  // namespace reports

@@ -173,6 +173,10 @@ struct WebApp::Impl {
         add("GET", "/invoice", &Impl::invoicePage, P::Sell);
         add("POST", "/invoice", &Impl::doInvoice, P::Sell);
         add("GET", "/invoices", &Impl::invoiceList, P::Sell);
+        add("GET", "/receivables", &Impl::receivablesPage, P::Receivables);
+        add("GET", "/payment", &Impl::paymentPage, P::Receivables);
+        add("POST", "/payment", &Impl::doPayment, P::Receivables);
+        add("GET", "/cash-report", &Impl::cashReportPage, P::CashReport);
         add("GET", "/reports", &Impl::reportsPage, P::ViewReports);
         add("GET", "/movements", &Impl::movementsPage, P::ViewReports);
         add("GET", "/audit", &Impl::auditPage, P::ViewAudit);
@@ -212,6 +216,30 @@ struct WebApp::Impl {
         return util::parseInt(c.param(name), lo, hi, v) ? static_cast<int>(v) : dflt;
     }
 
+    // Money typed by a person: allows "1,200.50" and surrounding spaces. Blank -> false.
+    static bool parseMoneyText(const std::string& in, double& out) {
+        std::string s;
+        for (char ch : util::trim(in)) if (ch != ',') s += ch;
+        return !s.empty() && util::parseDouble(s, 0, inv::limits::kMaxPrice, out);
+    }
+    static std::string statusTag(inv::PayStatus s) {
+        const char* cls = s == inv::PayStatus::Paid ? "ok" : s == inv::PayStatus::Partial ? "low" : "out";
+        return std::string("<span class='tag ") + cls + "'>" + inv::payStatusName(s) + "</span>";
+    }
+    static std::string methodSelect(const std::string& chosen, const char* name = "method") {
+        std::string o = std::string("<select name='") + name + "'>";
+        const std::string pick = inv::canonicalMethod(chosen).empty() ? "Cash" : inv::canonicalMethod(chosen);
+        for (const std::string& m : inv::paymentMethods()) o += "<option" + std::string(m == pick ? " selected" : "") + ">" + h(m) + "</option>";
+        return o + "</select>";
+    }
+    std::string customersDatalist() const {
+        std::set<std::string> seen;
+        std::string o = "<datalist id='custs'>";
+        for (const inv::Invoice& i : inv.invoices().all())
+            if (i.customer != "Walk-in customer" && seen.insert(reports::customerKey(i.customer)).second && seen.size() <= 500) o += "<option value='" + h(i.customer) + "'>";
+        return o + "</datalist>";
+    }
+
     // ------------------------------------------------------------------ layout
     std::string head(const std::string& title) const {
         return "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -227,6 +255,8 @@ struct WebApp::Impl {
             };
             o += "<header class='top'><span class='brand'>&#9881; " + h(cfg.shopName) + "</span><nav>" + link("/", "Inventory");
             if (auth::allowed(c.role, P::Sell)) o += link("/invoice", "New sale") + link("/invoices", "Invoices");
+            if (auth::allowed(c.role, P::Receivables)) o += link("/receivables", "Receivables / Utang");
+            if (auth::allowed(c.role, P::CashReport)) o += link("/cash-report", "Daily cash report");
             if (auth::allowed(c.role, P::AddPart)) o += link("/add", "Add part");
             if (auth::allowed(c.role, P::ViewReports)) o += link("/reports", "Reports") + link("/movements", "Movements");
             if (auth::allowed(c.role, P::ExportData)) o += link("/data", "Data &amp; backups");
@@ -331,6 +361,17 @@ struct WebApp::Impl {
         return "<span class='tag ok'>OK</span>";
     }
 
+    static std::string modelsText(const inv::Part& p) {   // "Bajaj RE 4S, Bajaj RE Compact"
+        std::string o;
+        for (const std::string& m : p.modelList()) o += (o.empty() ? "" : ", ") + m;
+        return o;
+    }
+    static std::string modelsKey(const inv::Part& p) {    // "bajaj re 4s|bajaj re compact" (matched exactly by the filter)
+        std::string o;
+        for (const std::string& m : p.modelList()) o += (o.empty() ? "" : "|") + m;
+        return o;
+    }
+
     void dashboard(Ctx& c) {
         using P = auth::Permission;
         const auto& parts = inv.parts();
@@ -340,22 +381,27 @@ struct WebApp::Impl {
         std::set<std::string> systems(inv::standardSystems().begin(), inv::standardSystems().end());
         for (const inv::Part& p : parts) { units += p.quantity(); value += p.stockValue(); low += p.isLowStock(); systems.insert(p.category()); }
 
+        const std::vector<std::string> models = inv.allModels();
+        const std::string wantModel = util::trim(c.param("model"));
         std::string b = "<h1>Inventory</h1><div class='stats'><div class='stat'><span>Parts</span><b>" + num(static_cast<long long>(parts.size())) + "</b></div>"
                         "<div class='stat'><span>Units in stock</span><b>" + num(units) + "</b></div>";
         if (auth::allowed(c.role, P::ViewReports)) b += "<div class='stat'><span>Stock value</span><b>" + php(value) + "</b></div>";
         b += std::string("<div class='stat") + (low ? " warn" : "") + "'><span>Below minimum</span><b>" + num(low) + "</b></div></div>";
 
-        b += "<div class='card'><div class='bar'><input id='q' type='search' placeholder='Search by ID, name or system...' autocomplete='off'>"
+        b += "<div class='card'><div class='bar'><input id='q' type='search' placeholder='Search by ID, name, system or vehicle model...' autocomplete='off'>"
              "<select id='sys'><option value=''>All vehicle systems</option>";
         for (const std::string& s : systems) b += "<option>" + h(s) + "</option>";
+        b += "</select><select id='model' title='Show only parts that fit this vehicle'><option value=''>All vehicle models</option>";
+        for (const std::string& m : models) b += "<option" + std::string(util::equalsIgnoreCase(m, wantModel) ? " selected" : "") + ">" + h(m) + "</option>";
         b += "</select><label class='inline mut'><input id='lowonly' type='checkbox'> Low stock only</label><span id='count' class='mut grow'></span>";
         if (auth::allowed(c.role, P::AddPart)) b += "<a class='btn' href='/add'>+ Add part</a>";
-        b += "</div><table id='inv'><thead><tr><th data-sort='id' data-type='num'>ID</th><th data-sort='name'>Part</th><th data-sort='cat'>System</th>"
+        b += "</div><table id='inv'><thead><tr><th data-sort='id' data-type='num'>ID</th><th data-sort='name'>Part</th><th data-sort='cat'>System</th><th>Fits (vehicle models)</th>"
              "<th class='n' data-sort='price' data-type='num'>Price</th><th class='n' data-sort='qty' data-type='num'>Stock</th><th class='n'>Min</th><th>Status</th><th></th></tr></thead><tbody>";
         for (const inv::Part& p : parts) {
             b += "<tr" + std::string(p.isLowStock() ? " class='low'" : "") + " data-id='" + num(p.id()) + "' data-name='" + h(util::toLower(p.name())) +
-                 "' data-cat='" + h(util::toLower(p.category())) + "' data-price='" + util::money(p.price()) + "' data-qty='" + num(p.quantity()) +
+                 "' data-cat='" + h(util::toLower(p.category())) + "' data-models='" + h(util::toLower(modelsKey(p))) + "' data-price='" + util::money(p.price()) + "' data-qty='" + num(p.quantity()) +
                  "' data-low='" + (p.isLowStock() ? "1" : "0") + "'><td>" + num(p.id()) + "</td><td>" + h(p.name()) + "</td><td>" + h(p.category()) +
+                 "</td><td class='fits'>" + (p.modelList().empty() ? std::string("<span class='mut'>-</span>") : h(modelsText(p))) +
                  "</td><td class='n'>" + php(p.price()) + "</td><td class='n'>" + num(p.quantity()) + "</td><td class='n'>" + num(p.minStock()) + "</td><td>" +
                  statusTag(p) + "</td><td class='right'>";
             const std::string id = "?id=" + num(p.id());
@@ -424,7 +470,9 @@ struct WebApp::Impl {
                         "<div><label>Vehicle system</label><input name='category' list='systems' required></div>"
                         "<div><label>Price (&#8369;)</label><input name='price' type='number' step='0.01' min='0' required></div>"
                         "<div><label>Opening stock</label><input name='qty' type='number' min='0' value='0' required></div>"
-                        "<div><label>Minimum stock</label><input name='min' type='number' min='0' value='5' required></div></div>" + systemsDatalist() +
+                        "<div><label>Minimum stock</label><input name='min' type='number' min='0' value='5' required></div></div>"
+                        "<label>Compatible vehicle models <span class='mut'>(optional, separate with commas)</span></label>"
+                        "<input name='models' maxlength='300' style='width:100%' placeholder='Bajaj RE 4S, Bajaj RE Compact, Bajaj RE Maxima'>" + systemsDatalist() +
                         "<p><button type='submit'>Save part</button> <a class='btn sec' href='/'>Cancel</a></p></form></div>";
         html(c, layout(c, "Add part", b));
     }
@@ -443,7 +491,9 @@ struct WebApp::Impl {
         std::string name, cat;
         std::string err = readPart(c, id, name, cat, price, qty, mn, true);
         if (err.empty()) {
-            const inv::Result r = inv.addPart(inv::Part(static_cast<int>(id), name, cat, price, static_cast<int>(qty), static_cast<int>(mn)), c.user());
+            inv::Part part(static_cast<int>(id), name, cat, price, static_cast<int>(qty), static_cast<int>(mn));
+            part.setCompatibleModels(util::oneLine(util::trim(c.param("models"))));
+            const inv::Result r = inv.addPart(part, c.user());
             if (r.ok) return redirect(c, msgUrl("/", "Part " + num(id) + " added.", true));
             err = r.message;
         }
@@ -456,7 +506,9 @@ struct WebApp::Impl {
                         "<input type='hidden' name='id' value='" + num(p->id()) + "'><div class='grid'><div><label>Name</label><input name='name' maxlength='80' value='" + h(p->name()) + "' required></div>"
                         "<div><label>Vehicle system</label><input name='category' list='systems' value='" + h(p->category()) + "' required></div>"
                         "<div><label>Price (&#8369;)</label><input name='price' type='number' step='0.01' min='0' value='" + util::money(p->price()) + "' required></div>"
-                        "<div><label>Minimum stock</label><input name='min' type='number' min='0' value='" + num(p->minStock()) + "' required></div></div>" + systemsDatalist() +
+                        "<div><label>Minimum stock</label><input name='min' type='number' min='0' value='" + num(p->minStock()) + "' required></div></div>"
+                        "<label>Compatible vehicle models <span class='mut'>(separate with commas)</span></label>"
+                        "<input name='models' maxlength='300' style='width:100%' value='" + h(p->compatibleModels()) + "' placeholder='Bajaj RE 4S, Bajaj RE Compact, Bajaj RE Maxima'>" + systemsDatalist() +
                         "<p class='mut'>Current stock is " + num(p->quantity()) + ". Change it with <a href='/stock?id=" + num(p->id()) + "'>Restock / Adjust</a> so the movement is logged.</p>"
                         "<p><button type='submit'>Save changes</button> <a class='btn sec' href='/'>Cancel</a></p></form></div>";
         html(c, layout(c, "Edit part", b));
@@ -466,14 +518,18 @@ struct WebApp::Impl {
         const inv::Part* cur = inv.find(id);
         if (!cur) return redirect(c, msgUrl("/", "Part not found.", false));
         const double oldPrice = cur->price();
-        const std::string oldName = cur->name();
+        const std::string oldName = cur->name(), oldModels = cur->compatibleModels();
         long long dummy = 0, mn = 0;
         double price = 0;
         std::string name, cat;
         std::string err = readPart(c, dummy, name, cat, price, dummy, mn, false);
         if (err.empty()) {
-            const inv::Result r = inv.updatePart(id, name, cat, price, static_cast<int>(mn), c.user());
+            std::optional<std::string> models;   // a request without the field (old form) leaves the models alone
+            if (c.req.has_param("models")) models = c.param("models");
+            const inv::Result r = inv.updatePart(id, name, cat, price, static_cast<int>(mn), c.user(), models);
             if (r.ok) {
+                if (models && inv.find(id) && inv.find(id)->compatibleModels() != oldModels)
+                    audit.record(c.user(), "PART_MODELS_CHANGED", "Part " + num(id) + " " + oldName + ": [" + oldModels + "] -> [" + inv.find(id)->compatibleModels() + "]", c.ip);
                 if (price != oldPrice)
                     audit.record(c.user(), "PRICE_CHANGE", "Part " + num(id) + " " + oldName + ": " + util::money(oldPrice) + " -> " + util::money(price), c.ip);
                 return redirect(c, msgUrl("/", "Part " + num(id) + " updated.", true));
@@ -507,7 +563,7 @@ struct WebApp::Impl {
         const std::string no = c.param("no");
         if (!no.empty()) return receipt(c, no);
         std::string b = "<h1>New sale / invoice</h1><div class='card'><form method='post' action='/invoice'>" + tokenField(c) +
-                        "<label>Customer name</label><input name='customer' maxlength='80' placeholder='Walk-in customer' value='" + h(c.param("customer")) + "'>"
+                        "<label>Customer name <span class='mut'>(required for credit / utang)</span></label><input name='customer' list='custs' maxlength='80' placeholder='Walk-in customer' value='" + h(c.param("customer")) + "'>" + customersDatalist() +
                         "<h2>Parts <span class='mut'>(type or pick a part ID - the catalogue price is applied)</span></h2><table><thead><tr><th>Part ID</th><th>Quantity</th></tr></thead><tbody>";
         const std::string pre = c.param("part");
         for (int i = 1; i <= kPartRows; ++i) {
@@ -522,13 +578,18 @@ struct WebApp::Impl {
         for (int i = 1; i <= kSvcRows; ++i)
             b += "<tr><td><input name='s_desc_" + num(i) + "' maxlength='100' value='" + h(c.param("s_desc_" + num(i))) + "'></td><td><input name='s_qty_" + num(i) +
                  "' type='number' min='1' value='" + h(c.param("s_qty_" + num(i))) + "'></td><td><input name='s_price_" + num(i) + "' type='number' step='0.01' min='0' value='" + h(c.param("s_price_" + num(i))) + "'></td></tr>";
-        b += "</tbody></table><p><button type='submit'>Record sale &amp; create receipt</button> <a class='btn sec' href='/'>Cancel</a></p></form></div>";
+        b += "</tbody></table><h2>Payment</h2><div class='grid'><div><label>Amount paid now (&#8369;) - leave blank if paid in full</label>"
+             "<input name='amount_paid' inputmode='decimal' autocomplete='off' placeholder='full amount' value='" + h(c.param("amount_paid")) + "'></div>"
+             "<div><label>Payment method</label>" + methodSelect(c.param("method")) + "</div></div>"
+             "<p class='mut'>Credit sale (utang): type what the customer pays now (0 if nothing). The rest is tracked under <b>Receivables / Utang</b> and needs a customer name.</p>"
+             "<p><button type='submit'>Record sale &amp; create receipt</button> <a class='btn sec' href='/'>Cancel</a></p></form></div>";
         html(c, layout(c, "New sale", b));
     }
 
     void doInvoice(Ctx& c) {
         auto back = [&](const std::string& msg) {  // keep what was typed
-            std::string q = "/invoice?customer=" + util::urlEncode(c.param("customer"));
+            std::string q = "/invoice?customer=" + util::urlEncode(c.param("customer")) + "&amount_paid=" + util::urlEncode(c.param("amount_paid")) +
+                            "&method=" + util::urlEncode(c.param("method"));
             for (int i = 1; i <= kPartRows; ++i) q += "&p_id_" + num(i) + "=" + util::urlEncode(c.param("p_id_" + num(i))) + "&p_qty_" + num(i) + "=" + util::urlEncode(c.param("p_qty_" + num(i)));
             for (int i = 1; i <= kSvcRows; ++i)
                 q += "&s_desc_" + num(i) + "=" + util::urlEncode(c.param("s_desc_" + num(i))) + "&s_qty_" + num(i) + "=" + util::urlEncode(c.param("s_qty_" + num(i))) +
@@ -558,34 +619,194 @@ struct WebApp::Impl {
             l.kind = inv::InvoiceLine::Kind::Service; l.description = desc; l.qty = static_cast<int>(qty); l.unitPrice = price;
             lines.push_back(l);
         }
-        const inv::CheckoutResult r = inv.checkout(c.param("customer"), lines, c.user());
+        double paid = -1.0;   // blank = paid in full
+        if (!util::trim(c.param("amount_paid")).empty() && !parseMoneyText(c.param("amount_paid"), paid)) return back("Amount paid must be a valid amount (or leave it blank).");
+        const inv::CheckoutResult r = inv.checkout(c.param("customer"), lines, c.user(), paid, c.param("method").empty() ? "Cash" : c.param("method"));
         if (!r.ok) return back(r.message);
+        if (r.balance > 0) {
+            const inv::Invoice* v = inv.invoices().find(r.invoiceNumber);
+            audit.record(c.user(), "CREDIT_SALE", r.invoiceNumber + " " + (v ? v->customer : std::string()) + ": total " + util::money(r.paid + r.balance) + ", paid " + util::money(r.paid) +
+                                                   ", balance " + util::money(r.balance), c.ip);
+        }
         redirect(c, "/invoice?no=" + util::urlEncode(r.invoiceNumber));
     }
 
     void receipt(Ctx& c, const std::string& no) {
         const inv::Invoice* v = inv.invoices().find(no);
         if (!v) return redirect(c, msgUrl("/invoices", "Invoice not found.", false));
-        std::string b = "<p class='noprint'><button data-print>&#128424; Print receipt</button> <a class='btn sec' href='/invoice'>New sale</a> <a class='btn sec' href='/invoices'>All invoices</a></p>"
+        std::string b = "<p class='noprint'><button data-print>&#128424; Print receipt</button> <a class='btn sec' href='/invoice'>New sale</a> <a class='btn sec' href='/invoices'>All invoices</a>" +
+                        (v->balance() > 0 && auth::allowed(c.role, auth::Permission::Receivables) ? " <a class='btn' href='/payment?no=" + util::urlEncode(v->number) + "'>Record payment</a>" : std::string()) + "</p>"
                         "<div class='receipt'><h1>" + h(cfg.shopName) + "</h1><div class='sub'>Official receipt</div><div class='meta'><div><b>Invoice:</b> " + h(v->number) +
                         "<br><b>Customer:</b> " + h(v->customer) + "</div><div class='right'><b>Date:</b> " + h(v->timestamp.substr(0, 10)) + "<br><b>Time:</b> " + h(v->timestamp.size() > 11 ? v->timestamp.substr(11) : "") +
                         "<br><b>Served by:</b> " + h(v->user) + "</div></div><table><thead><tr><th>Item</th><th>Type</th><th class='n'>Qty</th><th class='n'>Unit price</th><th class='n'>Amount</th></tr></thead><tbody>";
         for (const inv::InvoiceLine& l : v->lines)
             b += "<tr><td>" + h(l.description) + (l.kind == inv::InvoiceLine::Kind::Part ? " <span class='mut'>#" + num(l.partId) + "</span>" : "") + "</td><td>" +
                  (l.kind == inv::InvoiceLine::Kind::Part ? "Part" : "Service") + "</td><td class='n'>" + num(l.qty) + "</td><td class='n'>" + php(l.unitPrice) + "</td><td class='n'>" + php(l.total()) + "</td></tr>";
-        b += "</tbody><tfoot><tr><td colspan='4' class='n'>TOTAL</td><td class='n'>" + php(v->total()) + "</td></tr></tfoot></table><p class='thanks'>Thank you for your business!</p></div>";
+        b += "</tbody><tfoot><tr><td colspan='4' class='n'>TOTAL</td><td class='n'>" + php(v->total()) + "</td></tr>";
+        if (v->status() != inv::PayStatus::Paid)
+            b += "<tr class='sub'><td colspan='4' class='n'>Paid to date</td><td class='n'>" + php(v->amountPaid) + "</td></tr>"
+                 "<tr><td colspan='4' class='n'>BALANCE DUE</td><td class='n minus'>" + php(v->balance()) + "</td></tr>";
+        b += "</tfoot></table><p>Payment status: " + statusTag(v->status()) + "</p>";
+        const auto pays = inv.payments().forInvoice(v->number);
+        if (!pays.empty()) {
+            b += "<h2>Payments received</h2><table><thead><tr><th>Date</th><th>Method</th><th>Received by</th><th>Note</th><th class='n'>Amount</th><th class='n'>Balance after</th></tr></thead><tbody>";
+            for (const inv::Payment* p : pays)
+                b += "<tr><td>" + h(p->timestamp) + "</td><td>" + h(p->method) + "</td><td>" + h(p->user) + "</td><td>" + h(p->note) + "</td><td class='n'>" + php(p->amount) + "</td><td class='n'>" + php(p->balanceAfter) + "</td></tr>";
+            b += "</tbody></table>";
+        }
+        b += "<p class='thanks'>Thank you for your business!</p></div>";
         html(c, layout(c, "Receipt " + no, b));
     }
 
     void invoiceList(Ctx& c) {
-        std::string b = "<h1>Invoices</h1><div class='card'><table><thead><tr><th>Invoice</th><th>Date</th><th>Customer</th><th>Served by</th><th class='n'>Total</th><th></th></tr></thead><tbody>";
+        const std::string want = util::toLower(c.param("status"));   // "", paid, partial, unpaid
+        auto tab = [&](const std::string& key, const std::string& text) {
+            return "<a class='btn sm" + std::string(want == key ? "" : " sec") + "' href='/invoices" + (key.empty() ? "" : "?status=" + key) + "'>" + text + "</a> ";
+        };
+        std::string b = "<h1>Invoices</h1><p>" + tab("", "All") + tab("unpaid", "Unpaid") + tab("partial", "Partial") + tab("paid", "Paid") + "</p>"
+                        "<div class='card'><table><thead><tr><th>Invoice</th><th>Date</th><th>Customer</th><th>Served by</th><th class='n'>Total</th><th class='n'>Paid</th><th class='n'>Balance</th><th>Status</th><th></th></tr></thead><tbody>";
         const auto& all = inv.invoices().all();
         int shown = 0;
-        for (size_t i = all.size(); i-- > 0 && shown < 300; ++shown)
-            b += "<tr><td>" + h(all[i].number) + "</td><td>" + h(all[i].timestamp) + "</td><td>" + h(all[i].customer) + "</td><td>" + h(all[i].user) + "</td><td class='n'>" + php(all[i].total()) +
-                 "</td><td class='right'><a class='btn sm sec' href='/invoice?no=" + util::urlEncode(all[i].number) + "'>View / print</a></td></tr>";
-        if (all.empty()) b += "<tr><td colspan='6' class='mut'>No invoices yet.</td></tr>";
+        for (size_t i = all.size(); i-- > 0 && shown < 300;) {
+            const inv::Invoice& v = all[i];
+            if (!want.empty() && util::toLower(inv::payStatusName(v.status())) != want) continue;
+            ++shown;
+            b += "<tr><td>" + h(v.number) + "</td><td>" + h(v.timestamp) + "</td><td>" + h(v.customer) + "</td><td>" + h(v.user) + "</td><td class='n'>" + php(v.total()) +
+                 "</td><td class='n'>" + php(v.amountPaid) + "</td><td class='n'>" + (v.balance() > 0 ? "<b class='minus'>" + php(v.balance()) + "</b>" : php(0)) + "</td><td>" + statusTag(v.status()) +
+                 "</td><td class='right'>" + (v.balance() > 0 ? "<a class='btn sm' href='/payment?no=" + util::urlEncode(v.number) + "'>Record payment</a> " : std::string()) +
+                 "<a class='btn sm sec' href='/invoice?no=" + util::urlEncode(v.number) + "'>View / print</a></td></tr>";
+        }
+        if (!shown) b += "<tr><td colspan='9' class='mut'>" + std::string(all.empty() ? "No invoices yet." : "No invoices with that status.") + "</td></tr>";
         html(c, layout(c, "Invoices", b + "</tbody></table></div>"));
+    }
+
+    // ------------------------------------------------------------------ receivables / utang (Staff + Admin)
+    void receivablesPage(Ctx& c) {
+        const std::time_t now = std::time(nullptr);
+        const auto& all = inv.invoices().all();
+        const auto debtors = reports::receivablesByCustomer(all, now);
+        const std::string only = reports::customerKey(c.param("customer"));
+        std::string shownName;
+        for (const auto& d : debtors) if (reports::customerKey(d.customer) == only) shownName = d.customer;
+
+        std::string b = "<h1>Receivables / Utang</h1><div class='stats'><div class='stat" + std::string(debtors.empty() ? "" : " warn") + "'><span>Total outstanding</span><b>" + php(reports::totalReceivable(all)) + "</b></div>"
+                        "<div class='stat'><span>Customers with a balance</span><b>" + num(static_cast<long long>(debtors.size())) + "</b></div>"
+                        "<div class='stat'><span>Open invoices</span><b>" + num(reports::openInvoiceCount(all)) + "</b></div></div>";
+
+        b += "<h2>Customer balances</h2><div class='card'><table><thead><tr><th>Customer</th><th class='n'>Open invoices</th><th class='n'>Billed</th><th class='n'>Paid</th><th class='n'>Balance</th><th>Oldest unpaid</th><th></th></tr></thead><tbody>";
+        for (const auto& d : debtors)
+            b += "<tr><td><b>" + h(d.customer) + "</b></td><td class='n'>" + num(d.openInvoices) + "</td><td class='n'>" + php(d.billed) + "</td><td class='n'>" + php(d.paid) +
+                 "</td><td class='n'><b class='minus'>" + php(d.balance) + "</b></td><td>" + h(d.oldestDate) + " <span class='mut'>(" + num(d.oldestDays) + " day" + (d.oldestDays == 1 ? "" : "s") + ")</span></td>"
+                 "<td class='right'><a class='btn sm sec' href='/receivables?customer=" + util::urlEncode(d.customer) + "'>View invoices</a></td></tr>";
+        if (debtors.empty()) b += "<tr><td colspan='7' class='mut'>Nobody owes the shop anything right now.</td></tr>";
+        b += "</tbody></table></div>";
+
+        b += "<h2>" + (shownName.empty() ? std::string("Open invoices") : "Open invoices - " + h(shownName)) + "</h2>";
+        if (!shownName.empty()) b += "<p><a class='btn sm sec' href='/receivables'>Show all customers</a></p>";
+        b += "<div class='card'><table><thead><tr><th>Invoice</th><th>Date</th><th>Customer</th><th class='n'>Total</th><th class='n'>Paid</th><th class='n'>Balance</th><th>Status</th><th></th></tr></thead><tbody>";
+        int shown = 0;
+        for (size_t i = all.size(); i-- > 0 && shown < 300;) {   // newest first
+            const inv::Invoice& v = all[i];
+            if (v.balance() <= 0 || (!shownName.empty() && reports::customerKey(v.customer) != only)) continue;
+            ++shown;
+            b += "<tr><td>" + h(v.number) + "</td><td>" + h(v.timestamp.substr(0, 10)) + "</td><td>" + h(v.customer) + "</td><td class='n'>" + php(v.total()) + "</td><td class='n'>" + php(v.amountPaid) +
+                 "</td><td class='n'><b class='minus'>" + php(v.balance()) + "</b></td><td>" + statusTag(v.status()) + "</td><td class='right'><a class='btn sm' href='/payment?no=" + util::urlEncode(v.number) +
+                 "'>Record payment</a> <a class='btn sm sec' href='/invoice?no=" + util::urlEncode(v.number) + "'>View</a></td></tr>";
+        }
+        if (!shown) b += "<tr><td colspan='8' class='mut'>No open invoices.</td></tr>";
+        html(c, layout(c, "Receivables", b + "</tbody></table></div>"));
+    }
+
+    void paymentPage(Ctx& c) {
+        const std::string no = c.param("no");
+        const inv::Invoice* v = inv.invoices().find(no);
+        if (!v) return redirect(c, msgUrl("/receivables", "Invoice not found.", false));
+        if (v->balance() <= 0) return redirect(c, msgUrl("/invoice?no=" + util::urlEncode(no), "That invoice is already fully paid.", true));
+        std::string b = "<h1>Record payment - " + h(v->number) + "</h1><div class='grid'><div class='card'><h2>" + h(v->customer) + "</h2>"
+                        "<table class='kv'><tr><td>Invoice date</td><td>" + h(v->timestamp.substr(0, 10)) + "</td></tr><tr><td>Invoice total</td><td class='n'>" + php(v->total()) + "</td></tr>"
+                        "<tr><td>Paid so far</td><td class='n'>" + php(v->amountPaid) + "</td></tr><tr><td><b>Balance owed</b></td><td class='n'><b class='minus'>" + php(v->balance()) + "</b></td></tr>"
+                        "<tr><td>Status</td><td class='n'>" + statusTag(v->status()) + "</td></tr></table>"
+                        "<p><a href='/invoice?no=" + util::urlEncode(v->number) + "'>View invoice</a></p></div>"
+                        "<div class='card'><h2>Payment received</h2><form method='post' action='/payment'>" + tokenField(c) + "<input type='hidden' name='no' value='" + h(v->number) + "'>"
+                        "<input type='hidden' name='balance' value='" + util::money(v->balance()) + "'>"
+                        "<label>Amount (&#8369;) - the full balance is pre-filled; type less for a partial / installment payment</label>"
+                        "<input name='amount' inputmode='decimal' autocomplete='off' value='" + util::money(v->balance()) + "' required>"
+                        "<label>Payment method</label>" + methodSelect(c.param("method")) +
+                        "<label>Note (optional, e.g. reference no.)</label><input name='note' maxlength='80'>"
+                        "<p><button type='submit'>Save payment</button> <a class='btn sec' href='/receivables'>Cancel</a></p></form></div></div>";
+        const auto pays = inv.payments().forInvoice(v->number);
+        if (!pays.empty()) {
+            b += "<h2>Payments so far</h2><div class='card'><table><thead><tr><th>Date</th><th>Method</th><th>Received by</th><th>Note</th><th class='n'>Amount</th></tr></thead><tbody>";
+            for (const inv::Payment* p : pays)
+                b += "<tr><td>" + h(p->timestamp) + "</td><td>" + h(p->method) + "</td><td>" + h(p->user) + "</td><td>" + h(p->note) + "</td><td class='n'>" + php(p->amount) + "</td></tr>";
+            b += "</tbody></table></div>";
+        }
+        html(c, layout(c, "Record payment", b));
+    }
+
+    void doPayment(Ctx& c) {
+        const std::string no = c.param("no");
+        const std::string back = "/payment?no=" + util::urlEncode(no);
+        double amount = 0, expected = -1.0;
+        if (!parseMoneyText(c.param("amount"), amount)) return redirect(c, msgUrl(back, "Enter the payment amount as a number.", false));
+        if (!c.param("balance").empty() && !util::parseDouble(c.param("balance"), 0, inv::limits::kMaxPrice, expected)) expected = -1.0;
+        const inv::PaymentResult r = inv.recordPayment(no, amount, c.param("method"), c.param("note"), c.user(), expected);
+        if (!r.ok) return redirect(c, msgUrl(inv.invoices().find(no) && inv.invoices().find(no)->balance() > 0 ? back : "/receivables", r.message, false));
+        const std::string note = util::trim(c.param("note"));
+        audit.record(c.user(), "PAYMENT_RECORDED", no + " " + r.customer + ": " + util::money(r.applied) + " via " + inv::canonicalMethod(c.param("method")) + ", balance " + util::money(r.balance) + " (" +
+                                                       inv::payStatusName(r.status) + ")" + (note.empty() ? "" : " - " + util::oneLine(note)), c.ip);
+        redirect(c, msgUrl("/invoice?no=" + util::urlEncode(no), r.message, true));
+    }
+
+    // ------------------------------------------------------------------ end-of-day cashier summary (Staff + Admin)
+    void cashReportPage(Ctx& c) {
+        const std::string today = util::formatTime(std::time(nullptr), "%Y-%m-%d");
+        std::string date = util::trim(c.param("date")), warn;
+        if (date.empty()) date = today;
+        else if (!reports::validDate(date)) { warn = "<div class='flash err noprint'>That is not a valid date - showing today.</div>"; date = today; }
+        const reports::DailyCashReport r = reports::dailyCashReport(inv.invoices().all(), inv.payments().all(), date);
+
+        double cash = 0;
+        for (const auto& m : r.byMethod) if (m.method == "Cash") cash = m.amount;
+        auto row = [](const std::string& label, const std::string& value, bool bold = false, bool indent = false) {
+            return "<tr><td" + std::string(indent ? " class='indent'" : "") + ">" + (bold ? "<b>" + label + "</b>" : label) + "</td><td class='n'>" + (bold ? "<b>" + value + "</b>" : value) + "</td></tr>";
+        };
+
+        std::string b = warn + "<form method='get' action='/cash-report' class='bar noprint'><label class='inline'>Report date</label><input type='date' name='date' value='" + h(date) + "' max='" + h(today) + "'>"
+                        "<button class='sm sec' type='submit'>Show</button>" + (date != today ? " <a class='btn sm sec' href='/cash-report'>Today</a>" : std::string()) +
+                        " <button type='button' data-print>&#128424; Print report</button></form>"
+                        "<div class='report'><h1>" + h(cfg.shopName) + "</h1><div class='sub'>Daily cash report &middot; register close-out</div>"
+                        "<div class='meta'><div><b>Date:</b> " + h(date) + "</div><div class='right'><b>Printed:</b> " + h(util::nowStamp()) + "<br><b>By:</b> " + h(c.user()) + "</div></div>"
+                        "<div class='cols'><div><h2>Sales</h2><table class='kv'>" +
+                        row("Invoices issued", num(r.invoiceCount)) +
+                        row("Paid in full", num(r.paidCount), false, true) + row("Partial payment", num(r.partialCount), false, true) + row("Unpaid (all credit)", num(r.unpaidCount), false, true) +
+                        row("Parts sales", php(r.partsSales), false, true) + row("Service / labour sales", php(r.serviceSales), false, true) +
+                        row("Gross sales", php(r.grossSales), true) + "</table></div>"
+                        "<div><h2>Money collected</h2><table class='kv'>" +
+                        row("Net collected today (all methods)", php(r.collected), true) +
+                        row("on today's invoices", php(r.collectedOnToday), false, true) + row("on earlier credit invoices (utang payments)", php(r.collectedOnOlder), false, true) +
+                        row("Credit given today (unpaid at close)", php(r.creditExtended)) +
+                        row("All unpaid credit sales, every customer", php(r.outstandingNow), true) +
+                        row(num(r.customersOwing) + " customer(s) still owe the shop (as of now)", "", false, true) + "</table></div></div>"
+                        "<h2>Payment method breakdown</h2><table><thead><tr><th>Method</th><th class='n'>Payments</th><th class='n'>Amount</th></tr></thead><tbody>";
+        int count = 0;
+        for (const auto& m : r.byMethod) { b += "<tr><td>" + h(m.method) + "</td><td class='n'>" + num(m.count) + "</td><td class='n'>" + php(m.amount) + "</td></tr>"; count += m.count; }
+        if (r.byMethod.empty()) b += "<tr><td colspan='3' class='mut'>No payments were received on this date.</td></tr>";
+        else b += "<tr class='tot'><td>Total</td><td class='n'>" + num(count) + "</td><td class='n'>" + php(r.collected) + "</td></tr>";
+        b += "</tbody></table>"
+             "<h2>Cash drawer</h2><table class='kv'>" + row("Expected cash in drawer (Cash payments only)", php(cash), true) +
+             "<tr><td>Counted cash</td><td class='n line'>&nbsp;</td></tr><tr><td>Over / short</td><td class='n line'>&nbsp;</td></tr></table>"
+             "<h2>Invoices issued</h2><table><thead><tr><th>Invoice</th><th>Time</th><th>Customer</th><th class='n'>Total</th><th class='n'>Balance now</th><th>Status now</th></tr></thead><tbody>";
+        for (const inv::Invoice* v : r.invoices)
+            b += "<tr><td>" + h(v->number) + "</td><td>" + h(v->timestamp.size() > 11 ? v->timestamp.substr(11) : "") + "</td><td>" + h(v->customer) + "</td><td class='n'>" + php(v->total()) + "</td><td class='n'>" +
+                 php(v->balance()) + "</td><td>" + statusTag(v->status()) + "</td></tr>";
+        if (r.invoices.empty()) b += "<tr><td colspan='6' class='mut'>No invoices on this date.</td></tr>";
+        b += "</tbody></table><h2>Payments received</h2><table><thead><tr><th>Time</th><th>Invoice</th><th>Method</th><th>Received by</th><th class='n'>Amount</th></tr></thead><tbody>";
+        for (const inv::Payment* p : r.payments)
+            b += "<tr><td>" + h(p->timestamp.size() > 11 ? p->timestamp.substr(11) : "") + "</td><td>" + h(p->invoiceNo) + "</td><td>" + h(p->method) + "</td><td>" + h(p->user) + "</td><td class='n'>" + php(p->amount) + "</td></tr>";
+        if (r.payments.empty()) b += "<tr><td colspan='5' class='mut'>No payments on this date.</td></tr>";
+        b += "</tbody></table><div class='sigs'><div>Prepared by (cashier)</div><div>Checked by (owner / manager)</div></div></div>";
+        html(c, layout(c, "Daily cash report", b));
     }
 
     // ------------------------------------------------------------------ reports (Admin)

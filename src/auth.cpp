@@ -25,10 +25,12 @@ std::optional<Role> parseRole(const std::string& s) {
 
 bool allowed(Role role, Permission p) {
     if (role == Role::Admin) return true;
-    switch (p) {  // Staff: sell, view inventory, adjust stock - nothing else.
+    switch (p) {  // Staff: sell, view inventory, adjust stock, take payments on credit, close the register - nothing else.
         case Permission::ViewInventory:
         case Permission::Sell:
         case Permission::AdjustStock:
+        case Permission::Receivables:
+        case Permission::CashReport:
             return true;
         default:
             return false;

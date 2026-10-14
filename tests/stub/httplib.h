@@ -8,6 +8,7 @@ namespace httplib {
 using Params = std::multimap<std::string, std::string>;
 struct Request {
     std::string method, path, remote_addr = "127.0.0.1", body; Params params; std::map<std::string, std::string> headers;
+    bool has_param(const std::string& k) const { return params.find(k) != params.end(); }
     std::string get_param_value(const std::string& k, size_t = 0) const { auto i = params.find(k); return i == params.end() ? "" : i->second; }
     std::string get_header_value(const std::string& k, size_t = 0) const { auto i = headers.find(k); return i == headers.end() ? "" : i->second; }
 };

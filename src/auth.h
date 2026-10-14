@@ -20,6 +20,8 @@ enum class Permission {
     ViewInventory,  // everyone
     Sell,           // create invoices / sales
     AdjustStock,    // restock + stock adjustments
+    Receivables,    // see customer balances + record payments (utang) -> Staff + Admin
+    CashReport,     // end-of-day register close-out report -> Staff + Admin
     AddPart,        // sets a price  -> Admin
     EditPart,       // price/name/min stock -> Admin
     DeletePart,     // Admin
@@ -119,7 +121,8 @@ struct AuditEntry {
 };
 
 // Events: LOGIN, LOGIN_FAILED, LOGOUT, PRICE_CHANGE, RECORD_DELETED, PASSWORD_RESET,
-//         PASSWORD_CHANGED, USER_CREATED, USER_DELETED, ROLE_CHANGED, BACKUP, IMPORT, ACCESS_DENIED
+//         PASSWORD_CHANGED, USER_CREATED, USER_DELETED, ROLE_CHANGED, BACKUP, IMPORT, ACCESS_DENIED,
+//         CREDIT_SALE, PAYMENT_RECORDED, PART_MODELS_CHANGED
 class AuditLog {
 public:
     explicit AuditLog(std::string file = "audit.csv");

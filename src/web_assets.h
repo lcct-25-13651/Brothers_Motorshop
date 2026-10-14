@@ -49,8 +49,21 @@ label{display:block;font-size:.85rem;color:var(--mut);margin:.7rem 0 .2rem}
 .receipt h1{text-align:center;margin:0}.receipt .sub{text-align:center;color:var(--mut);margin-bottom:1.2rem}
 .receipt .meta{display:flex;justify-content:space-between;gap:1rem;margin-bottom:1rem}.receipt tfoot td{font-weight:700;font-size:1.1rem;border-top:2px solid var(--ink);border-bottom:0}
 .receipt .thanks{text-align:center;color:var(--mut);margin-top:1.5rem}
-@media print{body{background:#fff}header.top,.noprint,.flash{display:none!important}main{margin:0;max-width:none;padding:0}
-.receipt{border:0;padding:0}.card{border:0;padding:0}.stat{border:1px solid #ccc}}
+.receipt tfoot tr.sub td{border-top:0;font-weight:400;font-size:1rem}
+td.fits{font-size:.85rem;color:var(--mut);max-width:230px}
+.kv td{padding:.3rem .6rem}.kv td.indent{padding-left:1.6rem;color:var(--mut)}.kv td.n{white-space:nowrap}
+td.line{border-bottom:1px solid var(--ink);min-width:160px}
+tr.tot td{font-weight:700;border-top:2px solid var(--ink)}
+.report{max-width:900px;margin:0 auto;background:#fff;padding:1.6rem 2rem;border:1px solid var(--line)}
+.report h1{text-align:center;margin:0}.report .sub{text-align:center;color:var(--mut);margin-bottom:1rem}
+.report .meta{display:flex;justify-content:space-between;gap:1rem;margin-bottom:.6rem}
+.report h2{margin:1.1rem 0 .4rem;font-size:1rem;border-bottom:1px solid var(--line);padding-bottom:.2rem}
+.report .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:0 1.5rem}
+.report .sigs{display:flex;justify-content:space-between;gap:3rem;margin-top:3.2rem}
+.report .sigs div{flex:1;border-top:1px solid var(--ink);padding-top:.25rem;text-align:center;font-size:.85rem}
+@media print{@page{margin:12mm}body{background:#fff;font-size:12px}header.top,.noprint,.flash{display:none!important}main{margin:0;max-width:none;padding:0}
+.receipt{border:0;padding:0}.report{border:0;padding:0;max-width:none}.card{border:0;padding:0}.stat{border:1px solid #ccc}
+tr{page-break-inside:avoid}.report h2{page-break-after:avoid}.report .cols{grid-template-columns:1fr 1fr}.tag{border:1px solid #999;background:#fff!important;color:#000!important}}
 )CSS";
 
 inline constexpr const char* kJs = R"JS(
@@ -59,16 +72,24 @@ inline constexpr const char* kJs = R"JS(
   // ---- Inventory table: live search, system filter, low-stock filter, column sorting ----
   var tbl = document.getElementById('inv');
   if (tbl) {
-    var q = document.getElementById('q'), sys = document.getElementById('sys'),
+    var q = document.getElementById('q'), sys = document.getElementById('sys'), mdl = document.getElementById('model'),
         low = document.getElementById('lowonly'), cnt = document.getElementById('count'),
         body = tbl.tBodies[0], rows = Array.prototype.slice.call(body.rows),
         sortKey = null, sortDir = 1;
+    // Search text matches ID, name, system AND compatible vehicle models; every word typed must match somewhere.
+    rows.forEach(function (r) {
+      var d = r.dataset;
+      r.hay = (d.id + ' ' + d.name + ' ' + d.cat + ' ' + (d.models || '').split('|').join(' ')).toLowerCase();
+    });
     function apply() {
-      var t = q.value.trim().toLowerCase(), s = sys.value.toLowerCase(), n = 0;
+      var words = q.value.trim().toLowerCase().split(/\s+/).filter(Boolean),
+          s = sys.value.toLowerCase(), m = mdl ? mdl.value.toLowerCase() : '', n = 0;
       rows.forEach(function (r) {
         var d = r.dataset;
-        var ok = (!t || d.id.indexOf(t) !== -1 || d.name.indexOf(t) !== -1 || d.cat.indexOf(t) !== -1) &&
-                 (!s || d.cat === s) && (!low.checked || d.low === '1');
+        var ok = words.every(function (w) { return r.hay.indexOf(w) !== -1; }) &&
+                 (!s || d.cat === s) &&
+                 (!m || (d.models ? d.models.split('|') : []).indexOf(m) !== -1) &&   // exact model, parts with no model data are hidden
+                 (!low.checked || d.low === '1');
         r.hidden = !ok;
         if (ok) n++;
       });
@@ -89,6 +110,7 @@ inline constexpr const char* kJs = R"JS(
     }
     q.addEventListener('input', apply);
     sys.addEventListener('change', apply);
+    if (mdl) mdl.addEventListener('change', apply);
     low.addEventListener('change', apply);
     Array.prototype.forEach.call(tbl.querySelectorAll('th[data-sort]'), function (th) {
       th.addEventListener('click', function () { sortBy(th); });

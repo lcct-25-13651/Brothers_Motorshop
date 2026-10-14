@@ -16,6 +16,7 @@ bool equalsIgnoreCase(const std::string& a, const std::string& b);
 std::string oneLine(std::string s);              // newlines -> spaces (1 record = 1 line)
 std::string money(double v);                     // "1234.50" (CSV form)
 std::string moneyFmt(double v);                  // "1,234.50" (display form)
+double round2(double v);                         // round to whole centavos (avoids 0.1+0.2 drift)
 std::string htmlEscape(const std::string& s);
 std::string urlEncode(const std::string& s);
 

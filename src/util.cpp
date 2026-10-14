@@ -225,4 +225,6 @@ bool appendLine(const std::string& path, const std::string& header, const std::s
     return static_cast<bool>(out);
 }
 
+double round2(double v) { return std::round(v * 100.0) / 100.0; }
+
 }  // namespace util

@@ -13,7 +13,7 @@ namespace inv {
 
 namespace {
 const char* kBom = "\xEF\xBB\xBF";
-const char* kPartsHeader = "PartID,Name,Category,Price,Quantity,MinStock";
+const char* kPartsHeader = "PartID,Name,Category,Price,Quantity,MinStock,CostPrice,CompatibleModels";
 const char* kInvoiceHeader = "invoice_no,timestamp,customer,username,line_type,part_id,description,qty,unit_price";
 
 std::string key(std::string s) {  // header-name normaliser: "Min Stock" -> "minstock"
@@ -26,7 +26,8 @@ std::string key(std::string s) {  // header-name normaliser: "Min Stock" -> "min
 // ================================================================ Part
 std::string Part::toCsv() const {
     return std::to_string(id_) + ',' + util::csvEscape(name_) + ',' + util::csvEscape(category_) + ',' + util::money(price_) + ',' +
-           std::to_string(quantity_) + ',' + std::to_string(minStock_);
+           std::to_string(quantity_) + ',' + std::to_string(minStock_) + ',' + util::money(costPrice_) + ',' +
+           util::csvEscape(compatibleModels_);
 }
 
 std::string Part::validate(int id, const std::string& name, const std::string& category, double price, int qty, int minStock) {
@@ -56,7 +57,11 @@ std::optional<Part> Part::fromCsv(const std::vector<std::string>& f) {
         name = util::trim(f[1]);
     } else return std::nullopt;
     if (!Part::validate(static_cast<int>(id), name, cat, price, static_cast<int>(qty), static_cast<int>(mn)).empty()) return std::nullopt;
-    return Part(static_cast<int>(id), name, cat, price, static_cast<int>(qty), static_cast<int>(mn));
+    Part part(static_cast<int>(id), name, cat, price, static_cast<int>(qty), static_cast<int>(mn));
+    double cost = 0;
+    if (f.size() > 6 && util::parseDouble(f[6], 0, limits::kMaxPrice, cost)) part.setCostPrice(cost);  // optional columns
+    if (f.size() > 7) part.setCompatibleModels(util::oneLine(util::trim(f[7])));
+    return part;
 }
 
 const std::vector<std::string>& standardSystems() {
@@ -473,7 +478,8 @@ std::string Inventory::partsCsv() const {
     std::string out = std::string(kBom) + kPartsHeader + "\r\n";
     for (const Part& p : parts_)
         out += std::to_string(p.id()) + ',' + util::csvSafe(p.name()) + ',' + util::csvSafe(p.category()) + ',' + util::money(p.price()) + ',' +
-               std::to_string(p.quantity()) + ',' + std::to_string(p.minStock()) + "\r\n";
+               std::to_string(p.quantity()) + ',' + std::to_string(p.minStock()) + ',' + util::money(p.costPrice()) + ',' +
+               util::csvSafe(p.compatibleModels()) + "\r\n";
     return out;
 }
 

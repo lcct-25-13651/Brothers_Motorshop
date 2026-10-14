@@ -26,6 +26,8 @@ public:
     double price() const { return price_; }
     int quantity() const { return quantity_; }
     int minStock() const { return minStock_; }
+    double costPrice() const { return costPrice_; }                     // what one unit costs the shop (0 = unknown)
+    const std::string& compatibleModels() const { return compatibleModels_; }
     bool isLowStock() const { return quantity_ < minStock_; }
     double stockValue() const { return price_ * quantity_; }
 
@@ -34,9 +36,11 @@ public:
     void setPrice(double v) { price_ = v; }
     void setQuantity(int v) { quantity_ = v; }
     void setMinStock(int v) { minStock_ = v; }
+    void setCostPrice(double v) { costPrice_ = v; }
+    void setCompatibleModels(const std::string& v) { compatibleModels_ = v; }
 
     std::string toCsv() const;
-    static std::optional<Part> fromCsv(const std::vector<std::string>& fields);  // 6-col or legacy 4-col
+    static std::optional<Part> fromCsv(const std::vector<std::string>& fields);  // 8-col, 6-col or legacy 4-col
     // Empty string = valid, otherwise the reason.
     static std::string validate(int id, const std::string& name, const std::string& category, double price, int qty, int minStock);
 
@@ -45,6 +49,8 @@ private:
     std::string name_, category_;
     double price_ = 0.0;
     int quantity_ = 0, minStock_ = 0;
+    double costPrice_ = 0.0;
+    std::string compatibleModels_;
 };
 
 // Vehicle systems offered in drop-downs (data may contain others; they are listed too).

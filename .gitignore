@@ -3,6 +3,7 @@
 re_parts_tracker
 smoke_test
 web_e2e
+seed_data
 build/
 # runtime data - never commit
 parts.csv

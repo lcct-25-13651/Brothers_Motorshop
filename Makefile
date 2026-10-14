@@ -36,7 +36,12 @@ e2e: tests/web_e2e.cpp src/web.cpp $(CORE) $(wildcard src/*.h) tests/stub/httpli
 	$(CXX) $(CXXFLAGS) -Isrc -Itests/stub tests/web_e2e.cpp src/web.cpp $(CORE) -o web_e2e$(EXE)
 	./web_e2e$(EXE)
 
-clean:
-	rm -f $(TARGET) smoke_test$(EXE) web_e2e$(EXE)
+# Imports the client's supplier-receipt parts into ./parts.csv (safe to re-run, see tools/seed_data.cpp).
+seed: tools/seed_data.cpp
+	$(CXX) $(CXXFLAGS) tools/seed_data.cpp -o seed_data$(EXE)
+	./seed_data$(EXE)
 
-.PHONY: all test e2e clean
+clean:
+	rm -f $(TARGET) smoke_test$(EXE) web_e2e$(EXE) seed_data$(EXE)
+
+.PHONY: all test e2e seed clean

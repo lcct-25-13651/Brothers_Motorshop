@@ -49,3 +49,18 @@ one `VOID` row per part line is appended to `movements.csv` (positive quantity, 
 go back up. A services-only invoice gets one marker row (part_id 0, quantity 0). An `INVOICE_VOIDED` event is written to `audit.csv`.
 A voided invoice is shown as VOIDED, cannot be voided twice, and its sales/services no longer count in revenue or Top Sellers
 (they drop out of their original period). If a part on the invoice has since been deleted, re-add it with the same ID first.
+
+## Importing the client's receipt (tools/seed_data.cpp)
+Standalone C++17 tool that adds the 75 parts from the supplier receipt to `parts.csv` (schema
+`id,part_name,vehicle_system,selling_price,quantity,min_stock,cost_price,compatible_models`).
+```
+make seed        # or: g++ -std=c++17 -O2 -Wall -Wextra tools/seed_data.cpp -o seed_data && ./seed_data [path/to/parts.csv]
+```
+- Supplier numbers (e.g. `36AA4028`) are not numeric, so each part gets the next free internal ID (from 1001) and the supplier
+  number is kept in the name as `[36AA4028]` - the search box finds it.
+- `selling_price` = SRP from the receipt, `quantity` = received quantity, `min_stock` = 5 (or the quantity if lower).
+- `cost_price` is an **estimate** (80 % of SRP, constant `kCostRatio` in the tool). Replace it with real costs.
+- `vehicle_system` is inferred from the description (Engine, Braking, Electrical, Transmission, Chassis): check the odd ones.
+- Re-running is safe: parts already present (matched by the `[supplier number]` tag) are not touched, so live stock is never reset.
+  The previous file is copied to `parts.csv.bak`; an unreadable `parts.csv` is never overwritten.
+- The app now keeps the `cost_price` and `compatible_models` columns when it saves.

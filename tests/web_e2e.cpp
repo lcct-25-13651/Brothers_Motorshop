@@ -291,6 +291,54 @@ int main() {
         { auto* e = &au.entries(); std::string ev; for (auto& x : *e) ev += x.event + ","; for (const char* n : {"CUSTOMER_ADDED", "CUSTOMER_UPDATED", "CUSTOMER_ARCHIVED", "CUSTOMER_RESTORED", "CUSTOMER_DELETED", "VEHICLE_ADDED", "VEHICLE_UPDATED", "VEHICLE_ARCHIVED", "VEHICLE_RESTORED"}) { if (!has(ev, n)) { std::cerr << "missing audit event " << n << "\n"; ++fails; } } }
     }
 
+    // ===== Phase 4: job orders - the HTML page and the JSON API behind the real session gate =====
+    {
+        r = s.call("GET", "/jobs", {}, ck);
+        CHECK(r.status == 200 && has(r.body, "Job orders") && has(r.body, ">Job orders<") && has(r.body, "data-csrf=\"") &&
+              has(r.body, "src=\"/static/jobs.js\""));
+        std::string acsrf;
+        { auto at = r.body.find("data-csrf=\""); if (at != std::string::npos) acsrf = r.body.substr(at + 11, 64); }
+        CHECK(acsrf.size() == 64);
+        const std::map<std::string, std::string> tok{{"X-CSRF-Token", acsrf}};
+
+        r = s.call("POST", "/api/jobs", {{"plate", "ABC123"}, {"complaint", "Engine knock"}}, ck, "", tok);
+        CHECK(r.status == 201 && has(r.body, "\"job_no\":\"JOB-000001\"") && has(r.body, "\"status\":\"Open\""));
+        const int stock103 = in.find(103)->quantity();
+        r = s.call("POST", "/api/jobs/JOB-000001/lines", {}, ck, "{\"kind\":\"Part\",\"part_id\":103,\"quantity\":2}", tok);
+        CHECK(r.status == 201 && in.find(103)->quantity() == stock103 - 2);          // stock goes at once
+        r = s.call("POST", "/api/jobs/JOB-000001/lines", {}, ck, "{\"kind\":\"Labor\",\"service_id\":1}", tok);
+        CHECK(r.status == 201 && has(r.body, "\"labor_fee\":300.00"));
+        r = s.call("GET", "/api/jobs", {}, ck);
+        CHECK(r.status == 200 && has(r.body, "\"grand_total\":660.00"));      // 2 x 180 + 300
+        r = s.call("POST", "/api/jobs/JOB-000001/status", {}, ck, "{\"status\":\"In progress\"}", tok);
+        CHECK(r.status == 200);
+        r = s.call("DELETE", "/api/jobs/JOB-000001/lines/1", {}, ck, "", tok);
+        CHECK(r.status == 200 && in.find(103)->quantity() == stock103);              // ...and comes straight back
+
+        // Staff work with jobs, but the service catalogue is Admin-only
+        std::string acsrf2;
+        { std::string p2 = s.call("GET", "/jobs", {}, ck2).body; auto at = p2.find("data-csrf=\"");
+          if (at != std::string::npos) acsrf2 = p2.substr(at + 11, 64); }
+        const std::map<std::string, std::string> tok2{{"X-CSRF-Token", acsrf2}};
+        CHECK(s.call("GET", "/jobs", {}, ck2).status == 200);
+        CHECK(s.call("GET", "/api/services", {}, ck2).status == 200);
+        CHECK(s.call("POST", "/api/services", {}, ck2, "{\"name\":\"Wash\"}", tok2).status == 403);
+
+        // a cross-site post has no token; a signed-out caller gets 401
+        CHECK(s.call("POST", "/api/jobs", {{"complaint", "x"}}, ck, "", {}).status == 403);   // no CSRF token
+        CHECK(s.call("GET", "/api/jobs", {}, "").status == 401);
+        CHECK(s.call("GET", "/jobs", {}, "").headers["Location"] == "/login");
+
+        std::string jev;
+        for (auto& e : au.entries()) jev += e.event + ",";
+        for (const char* n : {"JOB_CREATED", "JOB_LINE_ADDED", "JOB_LINE_REMOVED", "JOB_STATUS"}) CHECK(has(jev, n));
+        CHECK(fs::exists(dir + "/jobs.csv") && fs::exists(dir + "/job_lines.csv") && fs::exists(dir + "/services.csv"));
+        { std::ifstream f(dir + "/jobs.csv"); std::string js; js.assign(std::istreambuf_iterator<char>(f), {});
+          CHECK(js.rfind("job_no,opened,customer_id,vehicle_id,odometer,complaint,mechanic,status,closed,notes,invoice_no", 0) == 0); }
+        { std::ifstream f(dir + "/services.csv"); std::string ss; ss.assign(std::istreambuf_iterator<char>(f), {});
+          CHECK(has(ss, "Change Oil") && has(ss, "Brake Pad Replacement") && has(ss, "Engine Overhaul")); }
+    }
+
     // admin pages
     r = s.call("GET", "/reports", {}, ck); CHECK(r.status == 200 && has(r.body, "Reorder list") && has(r.body, "Dead stock") && has(r.body, "Headlight Bulb") && has(r.body, "Top-selling"));
     r = s.call("GET", "/export/movements.csv", {}, ck); CHECK(r.body.rfind("\xEF\xBB\xBF", 0) == 0 && has(r.body, "SALE") && has(r.body, "ADJUSTMENT"));

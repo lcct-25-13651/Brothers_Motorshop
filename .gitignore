@@ -3,6 +3,8 @@
 re_parts_tracker
 smoke_test
 web_e2e
+jobs_test
+api_e2e
 seed_data
 build/
 # runtime data - never commit
@@ -36,6 +38,10 @@ audit.csv
 parts_*.csv
 parts.csv.*
 backups/
+
+# Phase 4 runtime data (job orders hold customer data - never commit)
+jobs.csv
+job_lines.csv
 
 # Phase 2/3 runtime data (customer records are personal data - never commit)
 customers.csv

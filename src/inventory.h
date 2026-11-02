@@ -75,7 +75,10 @@ std::vector<std::string> splitModels(const std::string& text);
 constexpr size_t kMaxModelsText = 300;
 
 // ---------------------------------------------------------------- Stock movements
-enum class MoveType { Restock, Sale, Adjustment, Delete };
+// Phase 4 adds JOB_ISSUE (a part fitted on a job order) and JOB_RETURN (line removed / job cancelled).
+// They carry stock exactly like a sale but are NOT revenue: billing a job (Phase 5) is what creates the
+// invoice, so reports stay correct while stock is already spoken for.
+enum class MoveType { Restock, Sale, Adjustment, Delete, JobIssue, JobReturn };
 const char* moveName(MoveType t);
 std::optional<MoveType> parseMove(const std::string& s);
 
@@ -241,6 +244,17 @@ public:
     Result setSourcing(int id, int supplierId, std::optional<double> costPrice, const std::string& actor);
     Result restock(int id, int qty, double unitCost, const std::string& actor, const std::string& ref = "");
     Result adjust(int id, long long delta, const std::string& actor, const std::string& ref = "");  // ADJUSTMENT
+
+    // Phase 4: one part of a job order / return. `qty` is signed (negative = leaves the shelf).
+    struct StockDelta {
+        int partId = 0;
+        int qty = 0;
+    };
+    // Applies every delta in ONE all-or-nothing step: the whole batch is validated first, parts.csv is
+    // written once and one movement row per part is appended with the given type / ref. If a part is
+    // missing, would go below zero (or above the maximum) or the file cannot be written, nothing changes.
+    // This is the only way job orders touch stock, so a job can never half-deduct a batch of lines.
+    Result applyStock(const std::vector<StockDelta>& deltas, MoveType type, const std::string& actor, const std::string& ref);
 
     // A sale = invoice. Part lines use the catalogue price (callers cannot override it).
     // amountPaid < 0 means "paid in full". Less than the total makes it a credit sale (utang): a named customer is

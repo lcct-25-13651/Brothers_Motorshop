@@ -32,6 +32,7 @@ bool allowed(Role role, Permission p) {
         case Permission::Receivables:
         case Permission::CashReport:
         case Permission::Customers:
+        case Permission::Jobs:            // Phase 4: the whole floor works with job orders
             return true;
         default:
             return false;

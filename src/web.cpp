@@ -20,7 +20,11 @@
 #include <sstream>
 
 #include "httplib.h"
+#include "api.h"
 #include "crm.h"
+#include "jobs.h"
+#include "jobs_ui.h"
+#include "json.h"
 #include "reports.h"
 #include "util.h"
 #include "login_bg_asset.h"
@@ -86,6 +90,7 @@ struct WebApp::Impl {
     sup::SupplierBook suppliers;   // Phase 2
     sup::PurchaseLog purchases;
     crm::Registry people;          // Phase 3: customers + vehicles
+    jobs::JobBook jobbook;         // Phase 4: job orders / repair tickets
     std::map<std::string, Session> sessions;
     auth::LoginThrottle throttle;
     static constexpr std::chrono::minutes kIdle{30};
@@ -94,6 +99,7 @@ struct WebApp::Impl {
         suppliers.open(inv.dataDir());
         purchases.open(inv.dataDir());
         people.open(inv.dataDir());
+        jobbook.open(inv.dataDir(), inv, &audit, &people);
         svr.set_payload_max_length(8 * 1024 * 1024);
         svr.set_exception_handler([](const httplib::Request&, httplib::Response& res, std::exception_ptr) {
             res.status = 500;
@@ -132,10 +138,17 @@ struct WebApp::Impl {
         auto handler = [this, fn, perm, pub, path](const httplib::Request& req, httplib::Response& res) {
             std::lock_guard<std::mutex> lock(mtx);
             res.set_header("X-Content-Type-Options", "nosniff");
-            res.set_header("X-Frame-Options", "DENY");
             res.set_header("Referrer-Policy", "same-origin");
             res.set_header("Cache-Control", "no-store");
-            res.set_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; form-action 'self'");
+            // Framing is refused unless the operator asked for it (--allow-embedding).
+            if (!cfg.allowEmbedding) {
+                res.set_header("X-Frame-Options", "DENY");
+                res.set_header("Content-Security-Policy",
+                               "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; form-action 'self'");
+            } else {
+                res.set_header("Content-Security-Policy",
+                               "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'self'");
+            }
             Ctx c{req, res};
             c.ip = req.remote_addr;
             if (!users.isConfigured()) {  // brand-new install: only the setup page works
@@ -222,6 +235,93 @@ struct WebApp::Impl {
         add("POST", "/suppliers/toggle", &Impl::doSupplierToggle, P::ManageSuppliers);
         add("GET", "/account", &Impl::accountPage);
         add("POST", "/account/password", &Impl::doAccountPassword);
+        add("GET", "/jobs", &Impl::jobsPage, P::Jobs);
+        add("GET", "/static/jobs.js", &Impl::jobsJsFile, P::Jobs);
+        apiRoutes();
+    }
+
+    // ------------------------------------------------------------------ Phase 4: the JSON API
+    // Sessions, roles and CSRF stay here (single source of truth); api.cpp only knows job logic.
+    void apiRoutes() {
+        api::Deps deps;
+        deps.inv = &inv;
+        deps.jobs = &jobbook;
+        deps.people = &people;
+        deps.audit = &audit;
+        deps.shopName = cfg.shopName;
+        deps.corsOrigin = cfg.corsOrigin;
+        deps.dataLock = &mtx;   // the same mutex every HTML request is served under
+        api::registerRoutes(svr, deps,
+                            [this](const httplib::Request& rq, httplib::Response& rs, auth::Permission need, api::Credentials& out) {
+                                return apiAuthorize(rq, rs, need, out);
+                            });
+    }
+
+    // JSON answer for a refused API call (the web pages get HTML instead, see forbidden()).
+    static void apiDeny(Ctx& c, int status, const std::string& error) {
+        c.res.status = status;
+        c.res.set_content(json::obj({{"ok", json::boolean(false)}, {"error", json::str(error)}, {"status", json::num(status)}}),
+                          "application/json; charset=utf-8");
+    }
+
+    bool apiAuthorize(const httplib::Request& req, httplib::Response& res, auth::Permission need, api::Credentials& out) {
+        Ctx c{req, res};
+        c.ip = req.remote_addr;
+        if (!users.isConfigured()) {
+            apiDeny(c, 401, "This shop has no accounts yet - open the app and create the Admin account.");
+            return false;
+        }
+        std::string token;
+        c.sess = sessionFor(req, &token);
+        if (!c.sess) {
+            apiDeny(c, 401, "Not signed in (open the app in a browser and log in).");
+            return false;
+        }
+        const auto role = users.roleOf(c.sess->user);
+        if (!role) {
+            sessions.erase(token);
+            apiDeny(c, 401, "That account no longer exists.");
+            return false;
+        }
+        c.role = *role;
+        if (!auth::allowed(c.role, need)) {
+            audit.record(c.user(), "ACCESS_DENIED", std::string(req.method) + " " + req.path, c.ip);
+            apiDeny(c, 403, "Your role (" + std::string(auth::roleName(c.role)) + ") is not allowed to do that.");
+            return false;
+        }
+        if (req.method != "GET" && req.method != "OPTIONS") {
+            // The token may ride in the X-CSRF-Token header (fetch), as a form field or inside a JSON body.
+            std::string given = req.get_header_value("X-CSRF-Token");
+            if (given.empty()) given = req.get_param_value("csrf");
+            if (given.empty() && !req.body.empty())
+                if (auto body = json::parse(req.body))
+                    if (const json::Value* f = body->find("csrf")) given = f->asString();
+            if (!auth::constantTimeEquals(given, c.sess->csrf)) {
+                apiDeny(c, 403, "Security token missing or expired. Reload the page and try again.");
+                return false;
+            }
+        }
+        out.user = c.user();
+        out.role = c.role;
+        out.ip = c.ip;
+        return true;
+    }
+
+    // The job-order page: the normal layout, with a body + script that live in jobs_ui.h.
+    void jobsPage(Ctx& c) {
+        std::string body = kJobsBody;
+        auto inject = [](std::string& text, const char* marker, const std::string& with) {
+            const std::string needle = marker;
+            const size_t at = text.find(needle);
+            if (at != std::string::npos) text.replace(at, needle.size(), with);
+        };
+        inject(body, "/*CSRF*/", htmlEscape(c.sess ? c.sess->csrf : std::string()));
+        inject(body, "/*SHOP*/", htmlEscape(cfg.shopName));
+        html(c, layout(c, "Job orders", body));
+    }
+    void jobsJsFile(Ctx& c) {
+        c.res.set_header("Cache-Control", "no-store");   // carries no secret, but keep it fresh
+        c.res.set_content(kJobsScript, "application/javascript; charset=utf-8");
     }
 
     // ------------------------------------------------------------------ response helpers
@@ -305,6 +405,7 @@ struct WebApp::Impl {
             };
             o += "<header class='top'><span class='brand'><img class='brand-logo' src='/static/logo.png' alt=''><span>" + h(cfg.shopName) + "</span></span><nav>" + link("/", "Inventory" + alertBadge());
             if (auth::allowed(c.role, P::Sell)) o += link("/invoice", "New sale") + link("/invoices", "Invoices");
+            if (auth::allowed(c.role, P::Jobs)) o += link("/jobs", "Job orders");
             if (auth::allowed(c.role, P::Customers)) o += link("/customers", "Customers");
             if (auth::allowed(c.role, P::Receivables)) o += link("/receivables", "Receivables / Utang");
             if (auth::allowed(c.role, P::CashReport)) o += link("/cash-report", "Daily cash report");
@@ -320,6 +421,7 @@ struct WebApp::Impl {
         }
         o += "<main>" + flash(c);
         if (!inv.lastWarning().empty()) o += "<div class='flash err'>" + h(inv.lastWarning()) + "</div>";
+        if (!jobbook.warning().empty()) o += "<div class='flash err'>" + h(jobbook.warning()) + "</div>";
         o += body + "</main><script src='/static/app.js'></script></body></html>";
         return o;
     }

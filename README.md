@@ -13,9 +13,13 @@ src/
   inventory.h/.cpp  parts.csv (incl. cost_price, compatible_models), movements.csv, invoices.csv + payments.csv (credit sales), CSV import/export, backups
   reports.h/.cpp    top sellers, daily/weekly/monthly revenue & expenses, dead stock, reorder list, receivables, daily cash report
   crm.h             Phase 3: customers.csv + vehicles.csv, search, vehicle/customer history (header-only)
+  jobs.h/.cpp       Phase 4: jobs.csv + job_lines.csv + services.csv - status machine, lines, stock, totals
+  api.h/.cpp        Phase 4: the JSON REST layer (/api/*) the Job orders page (or your own UI) calls
+  jobs_ui.h         Phase 4: the Job orders page - server-rendered body + /static/jobs.js
   web.h/.cpp        all HTTP routes + HTML views   (web_assets.h = CSS/JS served at /static)
   main.cpp          start-up: backup -> load -> serve
-tests/              smoke_test.cpp (core logic), web_e2e.cpp + stub/ (web layer, no sockets)
+tests/              smoke_test.cpp (core logic), web_e2e.cpp + stub/ (web layer, no sockets),
+                    jobs_test.cpp (Phase 4 core), api_e2e.cpp (Phase 4 endpoints)
 ```
 
 ## Build
@@ -29,7 +33,8 @@ cmake -S . -B build && cmake --build build
 Equivalent manual command (Linux/macOS): `g++ -std=c++17 -O2 -Ithird_party src/*.cpp -o re_parts_tracker -pthread`
 Windows: `g++ -std=c++17 -O2 -Ithird_party -D_WIN32_WINNT=0x0A00 -DNOMINMAX src/*.cpp -o re_parts_tracker.exe -lws2_32`
 
-Tests: `make test` (core logic) and `make e2e` (web layer vs. an in-process stand-in for httplib).
+Tests: `make check` runs all four suites - `test` (core logic), `jobstest` (Phase 4 core), `e2e` (web layer
+vs. an in-process stand-in for httplib) and `apie2e` (Phase 4 endpoints).
 
 ## Run
 ```
@@ -138,6 +143,102 @@ Permissions: Staff can use Receivables and the Daily cash report (new permission
 - New permissions in `auth.cpp::allowed`: `Customers` (view / add / edit - Staff + Admin) and `ArchiveCustomers` (archive / restore / delete - Admin only).
 - Audit events: `CUSTOMER_ADDED/UPDATED/ARCHIVED/RESTORED/DELETED`, `VEHICLE_ADDED/UPDATED/ARCHIVED/RESTORED/DELETED`.
 
+---
+
 ### Tests
 `make test` (core: plate rules, uniqueness, search, archive/delete rules, persistence, history order, balances, upgrade of an 11-column `invoices.csv` with every value unchanged)
 and `make e2e` (web: add/edit/search by plate, linked + free-text sales, history pages, Staff vs Admin, CSRF, escaping, archive/restore, files on disk).
+
+## Phase 4 additions - job orders / repair tickets
+
+```
+src/jobs.h/.cpp    the model + every rule (status machine, lines, stock, totals)   <- no HTTP in here
+src/api.h/.cpp     the JSON REST layer (/api/*)                                    <- no business rules in here
+src/jobs_ui.h      the Job orders page: server-rendered body + /static/jobs.js (fetch -> /api/*)
+tests/jobs_test.cpp   core rules: stock, totals, workflow, concurrency, crash recovery
+tests/api_e2e.cpp     every endpoint, driven through the in-process httplib stand-in
+```
+
+### Files
+- `jobs.csv` - `job_no,opened,customer_id,vehicle_id,odometer,complaint,mechanic,status,closed,notes,invoice_no`
+- `job_lines.csv` - `job_no,line_no,kind,part_id,description,quantity,unit_price,labor_fee,service_id`
+- `services.csv` - `id,name,default_labor_fee,interval_months,interval_km,active`
+
+The two columns beyond the spec (`invoice_no`, `service_id`) are appended at the end and are optional on
+load: they are what Phase 5 (Job <-> Invoice) and Phase 6 (reminders) need, so no migration is required later.
+`services.csv` is created on first start with **Change Oil** (3 months / 3,000 km), **Brake Pad Replacement**
+(12 months / 10,000 km) and **Engine Overhaul** (36 months / 40,000 km); an Admin edits the fees and intervals.
+All three files are covered by the normal start-up / *Backup now* copies (every `*.csv`) and are in `.gitignore`
+(job orders hold customer data - never commit them).
+
+### Status workflow
+```
+Open -> In progress -> Done -> Released        Cancelled (from Open or In progress)
+        In progress -> Open                    Done -> In progress (reopen)
+```
+`Released` and `Cancelled` are final. Lines and job details can only be changed while the job is **Open** or
+**In progress** - once it is **Done** it must be reopened first, and once it is **Released** nothing may change
+again (every endpoint answers `409 conflict`). Every change writes one row to `audit.csv`
+(`JOB_CREATED`, `JOB_UPDATED`, `JOB_MECHANIC`, `JOB_STATUS`, `JOB_LINE_ADDED`, `JOB_LINE_REMOVED`) with the
+job number first in `details`, which is what `GET /api/jobs/<no>/history` returns.
+
+### Stock (the rule that must never break)
+- Adding a **Part** line deducts stock **immediately**: `parts.csv` is rewritten and one `JOB_ISSUE` row is
+  appended to `movements.csv` with `ref = job_no` and the running `resulting_stock`.
+- Removing that line appends a `JOB_RETURN` row (same `ref`) and puts the units back.
+- Cancelling a job returns **every** part line in one batch.
+- `quantity > available stock` is refused (`409`) before anything is written.
+- Labour lines never touch stock. Billing a job (Phase 5) will not deduct again.
+- Both the stock change and the paperwork are written in one all-or-nothing step: if `parts.csv` or
+  `job_lines.csv` cannot be written, nothing changes and the caller gets an error.
+
+Two new movement types are used, `JOB_ISSUE` and `JOB_RETURN`, so "parts fitted on a job" stays out of the
+sales revenue figures (the invoice created in Phase 5 is what counts as revenue).
+
+**Crash recovery.** `job_lines.csv` is the source of truth. At start-up `JobBook` compares what each job
+should have issued with the `JOB_ISSUE` / `JOB_RETURN` rows in `movements.csv` and applies the difference
+(logged as `JOB_STOCK_RECONCILED`). A write that was interrupted by a power cut therefore heals itself
+instead of silently leaking stock - and it is idempotent, so a second start does nothing.
+
+### Concurrency
+The web layer serialises every request on one mutex, and `JobBook` additionally locks its own mutex, so the
+job store is safe to call from several threads directly. `tests/jobs_test.cpp` hammers it with 40 simultaneous
+"requests": every unit on the shelf is issued exactly once, the rest are refused, and the ledger matches.
+Lock order is always *request mutex -> JobBook mutex*, never the reverse.
+
+### REST API (JSON)
+Sessions, roles and CSRF are the same as for the HTML pages: send the session cookie, and for `POST`/`DELETE`
+the CSRF token either in the `X-CSRF-Token` header, as a `csrf` field, or inside the JSON body.
+
+| Method | Path | Permission | What it does |
+|---|---|---|---|
+| GET | `/api/jobs` | Jobs | list; filters `status`, `mechanic`, `date`, `from`/`to`, `plate`, `q`, `customer_id`, `vehicle_id`, `limit`, `order` |
+| POST | `/api/jobs` | Jobs | open a job (`customer_id`, `vehicle_id` **or** `plate`, `odometer`, `complaint`, `mechanic`, `notes`) -> `201` |
+| GET | `/api/jobs/<no>` | Jobs | job + lines + totals |
+| POST | `/api/jobs/<no>` | Jobs | edit complaint / odometer / notes / mechanic |
+| POST | `/api/jobs/<no>/status` | Jobs | `{"status":"Done","note":"..."}` - only allowed transitions |
+| POST | `/api/jobs/<no>/mechanic` | Jobs | assign / clear the mechanic |
+| POST | `/api/jobs/<no>/cancel` | Jobs | cancel with a reason (returns every part) |
+| GET | `/api/jobs/<no>/lines` | Jobs | lines + running totals |
+| POST | `/api/jobs/<no>/lines` | Jobs | add `{"kind":"Part","part_id":101,"quantity":2}` or `{"kind":"Labor","service_id":1}` |
+| DELETE | `/api/jobs/<no>/lines/<n>` | Jobs | remove a line and return the stock (also `POST .../lines/<n>/delete`) |
+| GET | `/api/jobs/<no>/card` | Jobs | everything the printed job card needs |
+| GET | `/api/jobs/<no>/history` | Jobs | the job's audit trail |
+| GET | `/api/services` | Jobs | the catalogue (`?all=1` includes inactive) |
+| POST | `/api/services` | **Admin** | add (`id` omitted) or edit a service |
+| POST | `/api/services/<id>/active` | **Admin** | activate / deactivate |
+| GET | `/api/parts` | ViewInventory | `?q=&limit=&in_stock=1` - picker for part lines |
+| GET | `/api/vehicles` | Customers | `?q=&limit=` - plates for the new-job form |
+
+Failures are `{"ok":false,"error":"...","code":"not_found|conflict|bad_request|forbidden|unauthorized","status":404}`.
+Money is a number with two decimals (`450.00`). New permissions in `auth.cpp::allowed`: `Jobs` (Staff + Admin)
+and `ServiceCatalog` (Admin).
+
+The **Job orders** page in the menu is a working reference client: server-rendered body, and
+`/static/jobs.js` calls the endpoints above with `fetch`. Replace it with your own TypeScript front-end when
+you like - while it is served from another port, start the app with
+`--cors-origin http://localhost:5173` (and `--allow-embedding` only if you also frame it).
+
+### Tests
+`make jobstest` (core rules) and `make apie2e` (endpoints). `make check` runs all four suites:
+`test` (smoke), `jobstest`, `e2e` (HTML layer) and `apie2e`.

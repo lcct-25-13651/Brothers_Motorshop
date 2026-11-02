@@ -30,6 +30,8 @@ int main(int argc, char** argv) {
         else if (a == "--host") cfg.host = next();
         else if (a == "--data") dataDir = next();
         else if (a == "--shop") cfg.shopName = next();
+        else if (a == "--cors-origin") cfg.corsOrigin = next();
+        else if (a == "--allow-embedding") cfg.allowEmbedding = true;
         else if (a == "--no-backup") backup = false;
         else { usage(); return a == "--help" || a == "-h" ? 0 : 2; }
     }

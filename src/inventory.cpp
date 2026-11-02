@@ -114,12 +114,14 @@ const char* moveName(MoveType t) {
         case MoveType::Sale: return "SALE";
         case MoveType::Adjustment: return "ADJUSTMENT";
         case MoveType::Delete: return "DELETE";
+        case MoveType::JobIssue: return "JOB_ISSUE";
+        case MoveType::JobReturn: return "JOB_RETURN";
     }
     return "ADJUSTMENT";
 }
 
 std::optional<MoveType> parseMove(const std::string& s) {
-    for (MoveType t : {MoveType::Restock, MoveType::Sale, MoveType::Adjustment, MoveType::Delete})
+    for (MoveType t : {MoveType::Restock, MoveType::Sale, MoveType::Adjustment, MoveType::Delete, MoveType::JobIssue, MoveType::JobReturn})
         if (util::equalsIgnoreCase(s, moveName(t))) return t;
     return std::nullopt;
 }
@@ -518,6 +520,39 @@ Result Inventory::adjust(int id, long long delta, const std::string& actor, cons
     p->setQuantity(static_cast<int>(n));
     if (!save()) { p->setQuantity(old); return Result::fail(warning_); }
     log(*p, MoveType::Adjustment, static_cast<int>(delta), 0.0, actor, ref);
+    return Result::success("Stock updated.");
+}
+
+// Phase 4: batch stock move used by job orders (see inventory.h). Validate everything, write once, log once.
+Result Inventory::applyStock(const std::vector<StockDelta>& deltas, MoveType type, const std::string& actor, const std::string& ref) {
+    if (deltas.empty()) return Result::fail("Nothing to change.");
+    if (type != MoveType::JobIssue && type != MoveType::JobReturn && type != MoveType::Adjustment && type != MoveType::Sale &&
+        type != MoveType::Restock)
+        return Result::fail("That kind of stock move cannot be batched.");
+    std::map<int, int> total;   // one row per part even if the caller listed it twice
+    for (const StockDelta& d : deltas) {
+        if (d.qty == 0) continue;
+        const Part* p = find(d.partId);
+        if (!p) return Result::fail("Part " + std::to_string(d.partId) + " does not exist.");
+        total[d.partId] += d.qty;
+    }
+    if (total.empty()) return Result::fail("Nothing to change.");
+    for (const auto& t : total) {
+        const Part* p = find(t.first);
+        const long long n = static_cast<long long>(p->quantity()) + t.second;
+        if (n < 0)
+            return Result::fail("Not enough stock for \"" + p->fullName() + "\": " + std::to_string(p->quantity()) + " available, " +
+                                std::to_string(-t.second) + " requested.");
+        if (n > limits::kMaxQty) return Result::fail("Stock cannot exceed " + std::to_string(limits::kMaxQty) + " units.");
+    }
+    warning_.clear();
+    const std::vector<Part> before = parts_;
+    for (const auto& t : total) mut(t.first)->setQuantity(mut(t.first)->quantity() + t.second);
+    if (!save()) { parts_ = before; return Result::fail(warning_); }
+    for (const auto& t : total) {
+        const Part* p = find(t.first);
+        if (t.second != 0) log(*p, type, t.second, p->price(), actor, ref);
+    }
     return Result::success("Stock updated.");
 }
 

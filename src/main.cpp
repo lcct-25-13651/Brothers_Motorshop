@@ -10,6 +10,7 @@
 
 #include "auth.h"
 #include "inventory.h"
+#include "util.h"
 #include "web.h"
 
 namespace {
@@ -23,6 +24,7 @@ int main(int argc, char** argv) {
     web::Config cfg;
     std::string dataDir = ".";
     bool backup = true;
+    bool samesiteGiven = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };
@@ -32,9 +34,22 @@ int main(int argc, char** argv) {
         else if (a == "--shop") cfg.shopName = next();
         else if (a == "--cors-origin") cfg.corsOrigin = next();
         else if (a == "--allow-embedding") cfg.allowEmbedding = true;
+        else if (a == "--cookie-samesite") { cfg.cookieSameSite = next(); samesiteGiven = true; }
+        else if (a == "--secure-cookies") cfg.secureCookies = true;
         else if (a == "--no-backup") backup = false;
         else { usage(); return a == "--help" || a == "-h" ? 0 : 2; }
     }
+
+    // Framing the app means the session cookie is used in a cross-site context, where SameSite=Strict
+    // is dropped. Do the sensible thing unless the operator chose the attributes explicitly.
+    if (cfg.allowEmbedding && !samesiteGiven) {
+        cfg.cookieSameSite = "None";
+        cfg.secureCookies = true;
+    }
+    if (util::equalsIgnoreCase(cfg.cookieSameSite, "strict")) cfg.cookieSameSite = "Strict";
+    else if (util::equalsIgnoreCase(cfg.cookieSameSite, "lax")) cfg.cookieSameSite = "Lax";
+    else if (util::equalsIgnoreCase(cfg.cookieSameSite, "none")) { cfg.cookieSameSite = "None"; cfg.secureCookies = true; }
+    else { std::cerr << "--cookie-samesite must be Strict, Lax or None.\n"; return 2; }
 
     if (backup) {
         const inv::BackupSummary b = inv::Inventory::backupFolder(dataDir);

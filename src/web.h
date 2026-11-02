@@ -18,6 +18,11 @@ struct Config {
     // Set with --allow-embedding when the app is shown inside a frame on another page (a shop intranet
     // portal or a kiosk screen). Off by default: framing is how click-jacking attacks start.
     bool allowEmbedding = false;
+    // Session cookie attributes. "Strict" (the default) is right when the shop opens the app directly
+    // on its own address. A framed app needs "None" - and browsers only keep SameSite=None when the
+    // cookie is also marked Secure, so --allow-embedding turns both on unless you set them yourself.
+    std::string cookieSameSite = "Strict";   // "Strict" | "Lax" | "None"
+    bool secureCookies = false;              // add the Secure attribute (HTTPS / TLS-terminating proxy)
 };
 
 class WebApp {

@@ -40,8 +40,14 @@ vs. an in-process stand-in for httplib) and `apie2e` (Phase 4 endpoints).
 ```
 ./re_parts_tracker [--port 8080] [--host 127.0.0.1] [--data <folder>] [--shop "Shop name"] [--no-backup]
 ```
-Open http://localhost:8080. First start asks you to create the Admin account (an existing v2 `users.csv` is read as-is: its account becomes Admin).
+Open http://localhost:8080. First start asks you to create the Admin account (an existing v2 `users.csv` is read as-is: its account becomes Admin) (an existing v2 `users.csv` is read as-is: its account becomes Admin).
 Use `--host 0.0.0.0` so other PCs on the shop network can connect (the app speaks plain HTTP: keep it on a trusted network).
+
+If the app is shown **inside a frame on another site** (a shop portal, a kiosk screen, a hosted preview), start it with
+`--allow-embedding`. Framing changes two things that would otherwise break the session: the `frame-ancestors` /
+`X-Frame-Options` headers are relaxed, and the session cookie is sent as `SameSite=None; Secure` (a browser drops
+`SameSite=Strict` in a cross-site frame, which looks exactly like "login does not work"). Override the attributes
+yourself with `--cookie-samesite Strict|Lax|None` and `--secure-cookies`.
 
 ## Phase 1 additions
 **Cost price.** `parts.csv` now has a 7th column, `cost_price` (what one unit costs the shop). Older 6-column files load fine (cost = 0) and are

@@ -130,6 +130,14 @@ struct WebApp::Impl {
             it = (util::equalsIgnoreCase(it->second.user, user) && it->first != keep) ? sessions.erase(it) : std::next(it);
     }
 
+    // The session cookie: same attributes everywhere, so login and logout always agree.
+    std::string sessionCookie(const std::string& token, bool clear) const {
+        std::string c = "sid=" + token + "; Path=/; HttpOnly; SameSite=" + cfg.cookieSameSite;
+        if (cfg.secureCookies) c += "; Secure";   // required for SameSite=None, harmless otherwise
+        if (clear) c += "; Max-Age=0";
+        return c;
+    }
+
     // ------------------------------------------------------------------ routing + gatekeeping
     using Fn = void (Impl::*)(Ctx&);
 
@@ -471,7 +479,7 @@ struct WebApp::Impl {
         throttle.ok(key);
         const std::string token = startSession(who->first);
         audit.record(who->first, "LOGIN", std::string("role ") + auth::roleName(who->second), c.ip);
-        c.res.set_header("Set-Cookie", "sid=" + token + "; Path=/; HttpOnly; SameSite=Strict");
+        c.res.set_header("Set-Cookie", sessionCookie(token, false));
         redirect(c, "/");
     }
     void doLogout(Ctx& c) {
@@ -479,7 +487,7 @@ struct WebApp::Impl {
         sessionFor(c.req, &token);
         audit.record(c.user(), "LOGOUT", "", c.ip);
         sessions.erase(token);
-        c.res.set_header("Set-Cookie", "sid=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+        c.res.set_header("Set-Cookie", sessionCookie("", true));
         redirect(c, msgUrl("/login", "You have been signed out.", true));
     }
     void setupPage(Ctx& c) {

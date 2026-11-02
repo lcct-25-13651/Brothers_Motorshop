@@ -23,6 +23,9 @@ struct Config {
     // cookie is also marked Secure, so --allow-embedding turns both on unless you set them yourself.
     std::string cookieSameSite = "Strict";   // "Strict" | "Lax" | "None"
     bool secureCookies = false;              // add the Secure attribute (HTTPS / TLS-terminating proxy)
+    // CHIPS (Cookies Having Independent Partitioned State): keeps the framed app's cookie even in a
+    // browser that blocks third-party cookies. Browsers that do not know the attribute ignore it.
+    bool partitionedCookies = false;
 };
 
 class WebApp {

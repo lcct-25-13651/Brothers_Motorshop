@@ -36,6 +36,7 @@ int main(int argc, char** argv) {
         else if (a == "--allow-embedding") cfg.allowEmbedding = true;
         else if (a == "--cookie-samesite") { cfg.cookieSameSite = next(); samesiteGiven = true; }
         else if (a == "--secure-cookies") cfg.secureCookies = true;
+        else if (a == "--partitioned-cookies") cfg.partitionedCookies = true;
         else if (a == "--no-backup") backup = false;
         else { usage(); return a == "--help" || a == "-h" ? 0 : 2; }
     }
@@ -45,6 +46,7 @@ int main(int argc, char** argv) {
     if (cfg.allowEmbedding && !samesiteGiven) {
         cfg.cookieSameSite = "None";
         cfg.secureCookies = true;
+        cfg.partitionedCookies = true;
     }
     if (util::equalsIgnoreCase(cfg.cookieSameSite, "strict")) cfg.cookieSameSite = "Strict";
     else if (util::equalsIgnoreCase(cfg.cookieSameSite, "lax")) cfg.cookieSameSite = "Lax";

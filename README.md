@@ -45,9 +45,12 @@ Use `--host 0.0.0.0` so other PCs on the shop network can connect (the app speak
 
 If the app is shown **inside a frame on another site** (a shop portal, a kiosk screen, a hosted preview), start it with
 `--allow-embedding`. Framing changes two things that would otherwise break the session: the `frame-ancestors` /
-`X-Frame-Options` headers are relaxed, and the session cookie is sent as `SameSite=None; Secure` (a browser drops
-`SameSite=Strict` in a cross-site frame, which looks exactly like "login does not work"). Override the attributes
-yourself with `--cookie-samesite Strict|Lax|None` and `--secure-cookies`.
+`X-Frame-Options` headers are relaxed, and the session cookie is sent as `SameSite=None; Secure; Partitioned`
+(a browser drops `SameSite=Strict` in a cross-site frame; `Partitioned` - CHIPS - keeps it even when third-party
+cookies are blocked). It looks exactly like "login does not work", but `audit.csv` shows a successful `LOGIN`.
+Override the attributes yourself with `--cookie-samesite Strict|Lax|None`, `--secure-cookies` and
+`--partitioned-cookies`. If a browser blocks third-party cookies *and* does not support CHIPS, open the framed app
+in its own tab - as a top-level page the normal `SameSite=Strict` cookie works.
 
 ## Phase 1 additions
 **Cost price.** `parts.csv` now has a 7th column, `cost_price` (what one unit costs the shop). Older 6-column files load fine (cost = 0) and are

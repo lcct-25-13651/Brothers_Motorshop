@@ -133,7 +133,8 @@ struct WebApp::Impl {
     // The session cookie: same attributes everywhere, so login and logout always agree.
     std::string sessionCookie(const std::string& token, bool clear) const {
         std::string c = "sid=" + token + "; Path=/; HttpOnly; SameSite=" + cfg.cookieSameSite;
-        if (cfg.secureCookies) c += "; Secure";   // required for SameSite=None, harmless otherwise
+        if (cfg.secureCookies) c += "; Secure";             // required for SameSite=None, harmless otherwise
+        if (cfg.partitionedCookies) c += "; Partitioned";   // survives third-party cookie blocking
         if (clear) c += "; Max-Age=0";
         return c;
     }

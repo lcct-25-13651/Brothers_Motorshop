@@ -31,6 +31,7 @@ bool allowed(Role role, Permission p) {
         case Permission::AdjustStock:
         case Permission::Receivables:
         case Permission::CashReport:
+        case Permission::Customers:
             return true;
         default:
             return false;

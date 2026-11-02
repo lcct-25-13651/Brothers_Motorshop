@@ -20,6 +20,7 @@
 #include <sstream>
 
 #include "httplib.h"
+#include "crm.h"
 #include "reports.h"
 #include "util.h"
 #include "login_bg_asset.h"
@@ -84,6 +85,7 @@ struct WebApp::Impl {
     std::mutex mtx;  // httplib is multi-threaded; the stores are not
     sup::SupplierBook suppliers;   // Phase 2
     sup::PurchaseLog purchases;
+    crm::Registry people;          // Phase 3: customers + vehicles
     std::map<std::string, Session> sessions;
     auth::LoginThrottle throttle;
     static constexpr std::chrono::minutes kIdle{30};
@@ -91,6 +93,7 @@ struct WebApp::Impl {
     Impl(inv::Inventory& i, auth::Authenticator& u, auth::AuditLog& a, Config c) : inv(i), users(u), audit(a), cfg(std::move(c)) {
         suppliers.open(inv.dataDir());
         purchases.open(inv.dataDir());
+        people.open(inv.dataDir());
         svr.set_payload_max_length(8 * 1024 * 1024);
         svr.set_exception_handler([](const httplib::Request&, httplib::Response& res, std::exception_ptr) {
             res.status = 500;
@@ -189,6 +192,17 @@ struct WebApp::Impl {
         add("GET", "/payment", &Impl::paymentPage, P::Receivables);
         add("POST", "/payment", &Impl::doPayment, P::Receivables);
         add("GET", "/cash-report", &Impl::cashReportPage, P::CashReport);
+        add("GET", "/customers", &Impl::customersPage, P::Customers);
+        add("GET", "/customer", &Impl::customerPage, P::Customers);
+        add("GET", "/customer/edit", &Impl::customerEditPage, P::Customers);
+        add("POST", "/customer/save", &Impl::doCustomerSave, P::Customers);
+        add("POST", "/customer/archive", &Impl::doCustomerArchive, P::ArchiveCustomers);
+        add("POST", "/customer/delete", &Impl::doCustomerDelete, P::ArchiveCustomers);
+        add("GET", "/vehicle", &Impl::vehiclePage, P::Customers);
+        add("GET", "/vehicle/edit", &Impl::vehicleEditPage, P::Customers);
+        add("POST", "/vehicle/save", &Impl::doVehicleSave, P::Customers);
+        add("POST", "/vehicle/archive", &Impl::doVehicleArchive, P::ArchiveCustomers);
+        add("POST", "/vehicle/delete", &Impl::doVehicleDelete, P::ArchiveCustomers);
         add("GET", "/reports", &Impl::reportsPage, P::ViewReports);
         add("GET", "/analytics.pdf", &Impl::analyticsPdf, P::ViewReports);
         add("GET", "/movements", &Impl::movementsPage, P::ViewReports);
@@ -251,11 +265,27 @@ struct WebApp::Impl {
         for (const std::string& m : inv::paymentMethods()) o += "<option" + std::string(m == pick ? " selected" : "") + ">" + h(m) + "</option>";
         return o + "</select>";
     }
+    // Autocomplete lists for New sale: saved customers (with their id) first, then older free-text names that are not a saved customer.
     std::string customersDatalist() const {
         std::set<std::string> seen;
         std::string o = "<datalist id='custs'>";
+        for (const crm::Customer& k : people.customers()) {
+            if (k.archived) continue;
+            seen.insert(reports::customerKey(k.name));
+            o += "<option value='" + h(customerLabel(k)) + "' data-id='" + num(k.id) + "'>";
+        }
+        size_t legacy = 0;
         for (const inv::Invoice& i : inv.invoices().all())
-            if (i.customer != "Walk-in customer" && seen.insert(reports::customerKey(i.customer)).second && seen.size() <= 500) o += "<option value='" + h(i.customer) + "'>";
+            if (i.customer != "Walk-in customer" && seen.insert(reports::customerKey(i.customer)).second && ++legacy <= 500) o += "<option value='" + h(i.customer) + "'>";
+        return o + "</datalist>";
+    }
+    std::string vehiclesDatalist() const {
+        std::string o = "<datalist id='vehs'>";
+        for (const crm::Vehicle& v : people.vehicles()) {
+            const crm::Customer* k = people.findCustomer(v.customerId);
+            if (v.archived || !k || k->archived) continue;
+            o += "<option value='" + h(vehicleLabel(v)) + "' data-id='" + num(v.id) + "' data-cid='" + num(v.customerId) + "'>";
+        }
         return o + "</datalist>";
     }
 
@@ -275,6 +305,7 @@ struct WebApp::Impl {
             };
             o += "<header class='top'><span class='brand'><img class='brand-logo' src='/static/logo.png' alt=''><span>" + h(cfg.shopName) + "</span></span><nav>" + link("/", "Inventory" + alertBadge());
             if (auth::allowed(c.role, P::Sell)) o += link("/invoice", "New sale") + link("/invoices", "Invoices");
+            if (auth::allowed(c.role, P::Customers)) o += link("/customers", "Customers");
             if (auth::allowed(c.role, P::Receivables)) o += link("/receivables", "Receivables / Utang");
             if (auth::allowed(c.role, P::CashReport)) o += link("/cash-report", "Daily cash report");
             if (auth::allowed(c.role, P::AddPart)) o += link("/add", "Add part");
@@ -976,6 +1007,304 @@ struct WebApp::Impl {
         redirect(c, msgUrl("/", r.ok ? "Part deleted." : r.message, r.ok));
     }
 
+    // ------------------------------------------------------------------ Phase 3: customers & vehicles
+    static std::string customerLabel(const crm::Customer& k) { return k.phone.empty() ? k.name : k.name + " - " + k.phone; }
+    std::string vehicleLabel(const crm::Vehicle& v) const {
+        const crm::Customer* o = people.findCustomer(v.customerId);
+        return v.plate + (v.model.empty() ? "" : " - " + v.model) + (o ? " (" + o->name + ")" : "");
+    }
+    static std::string archivedTag(bool a) { return a ? " <span class='tag out'>Archived</span>" : ""; }
+    static std::string val(Ctx& c, const char* name, const std::string& dflt) { return c.req.has_param(name) ? c.param(name) : dflt; }
+    static std::string idLink(const char* path, int id, const std::string& text) { return "<a href='" + std::string(path) + "?id=" + num(id) + "'>" + text + "</a>"; }
+    const crm::Customer* customerParam(Ctx& c, const char* name = "id") const {
+        long long id = 0;
+        return util::parseInt(c.param(name), 1, 999999, id) ? people.findCustomer(static_cast<int>(id)) : nullptr;
+    }
+    const crm::Vehicle* vehicleParam(Ctx& c, const char* name = "id") const {
+        long long id = 0;
+        return util::parseInt(c.param(name), 1, 999999, id) ? people.findVehicle(static_cast<int>(id)) : nullptr;
+    }
+    // Link to the customer record when exactly one record has this name (used on the Receivables page, which groups by name).
+    std::string customerNameLink(const std::string& name) const {
+        const auto m = people.findByName(name);
+        return m.size() == 1 ? idLink("/customer", m[0]->id, h(name)) : h(name);
+    }
+    static std::string historyTable(const std::vector<crm::HistoryRow>& rows, const crm::Registry& reg, bool showVehicle, bool canPay) {
+        std::string b = "<div class='card'><table><thead><tr><th>Date</th><th>Invoice</th>" + std::string(showVehicle ? "<th>Vehicle</th>" : "") +
+                        "<th>Items</th><th class='n'>Total</th><th class='n'>Balance</th><th>Status</th><th></th></tr></thead><tbody>";
+        for (const crm::HistoryRow& r : rows) {
+            const crm::Vehicle* v = r.vehicleId ? reg.findVehicle(r.vehicleId) : nullptr;
+            b += "<tr><td>" + h(r.timestamp) + "</td><td>" + h(r.ref) + (r.linked ? "" : " <span class='mut' title='Old invoice typed as free text; matched to this customer by name'>(by name)</span>") + "</td>" +
+                 (showVehicle ? "<td>" + (v ? idLink("/vehicle", v->id, h(v->plate)) : std::string("<span class='mut'>-</span>")) + "</td>" : std::string()) +
+                 "<td>" + h(r.summary) + "</td><td class='n'>" + php(r.total) + "</td><td class='n'>" + (r.balance > 0 ? "<b class='minus'>" + php(r.balance) + "</b>" : php(0)) + "</td><td>" + statusTag(r.status) +
+                 "</td><td class='right'>" + (canPay && r.balance > 0 ? "<a class='btn sm' href='/payment?no=" + util::urlEncode(r.ref) + "'>Record payment</a> " : std::string()) +
+                 "<a class='btn sm sec' href='/invoice?no=" + util::urlEncode(r.ref) + "'>View</a></td></tr>";
+        }
+        if (rows.empty()) b += "<tr><td colspan='" + std::string(showVehicle ? "8" : "7") + "' class='mut'>No invoices yet.</td></tr>";
+        return b + "</tbody></table></div>";
+    }
+
+    // Turns what the cashier typed / picked on the New sale form into (name, customer id, vehicle id). "" = ok, otherwise the reason.
+    // Typed free text that matches no customer record stays free text exactly as before (id 0). Hidden ids only disambiguate the text.
+    std::string resolveParty(Ctx& c, std::string& name, int& cid, int& vid) const {
+        name.clear(); cid = vid = 0;
+        const std::string ctext = util::trim(c.param("customer")), vtext = util::trim(c.param("vehicle"));
+        const crm::Customer* k = nullptr;
+        const crm::Vehicle* v = nullptr;
+        long long idv = 0;
+        if (!ctext.empty()) {
+            if (util::parseInt(c.param("customer_id"), 1, 999999, idv))
+                if (const crm::Customer* x = people.findCustomer(static_cast<int>(idv)))
+                    if (util::equalsIgnoreCase(ctext, customerLabel(*x)) || util::equalsIgnoreCase(ctext, x->name)) k = x;
+            if (!k) {
+                std::vector<const crm::Customer*> hits;
+                for (const crm::Customer& x : people.customers()) if (util::equalsIgnoreCase(ctext, customerLabel(x))) hits.push_back(&x);
+                if (hits.empty()) hits = people.findByName(ctext);
+                if (hits.size() > 1) return "More than one customer is called \"" + ctext + "\" - pick one from the suggestions (they show the phone number).";
+                if (hits.size() == 1) k = hits[0];
+            }
+        }
+        if (!vtext.empty()) {
+            if (util::parseInt(c.param("vehicle_id"), 1, 999999, idv))
+                if (const crm::Vehicle* x = people.findVehicle(static_cast<int>(idv)))
+                    if (util::equalsIgnoreCase(vtext, vehicleLabel(*x)) || crm::normalizePlate(vtext) == x->plate) v = x;
+            if (!v) v = people.findByPlate(vtext);
+            if (!v) {   // "PLATE - Model (Owner)" as offered by the suggestion list
+                size_t cut = vtext.find(" - ");
+                if (cut == std::string::npos) cut = vtext.find(" (");
+                if (cut != std::string::npos) v = people.findByPlate(vtext.substr(0, cut));
+            }
+            if (!v) return "Vehicle \"" + vtext + "\" is not in the customer records. Add it first (Customers > open the customer > Add vehicle) or clear the Vehicle box.";
+            const crm::Customer* owner = people.findCustomer(v->customerId);
+            if (!owner) return "Vehicle " + v->plate + " has no owner record.";
+            if (v->archived) return "Vehicle " + v->plate + " is archived. Restore it first.";
+            if (k && k->id != owner->id) return "Vehicle " + v->plate + " belongs to " + owner->name + ", not " + k->name + ".";
+            if (!k) {
+                if (!ctext.empty()) return "Vehicle " + v->plate + " belongs to the saved customer " + owner->name + ". Pick that customer or clear the Customer box.";
+                k = owner;   // only a plate was given: the owner is the customer
+            }
+        }
+        if (k && k->archived) return "Customer " + k->name + " is archived. Restore the customer first (Customers page) or sell without a customer record.";
+        if (k) { name = k->name; cid = k->id; } else name = ctext;
+        if (v) vid = v->id;
+        return "";
+    }
+
+    void customersPage(Ctx& c) {
+        const std::string q = util::trim(c.param("q"));
+        const bool showArchived = c.param("archived") == "1";
+        const auto& all = inv.invoices().all();
+        const auto balances = crm::balancesByCustomer(all, people);
+        std::vector<crm::SearchHit> hits;
+        size_t hiddenArchived = 0;
+        for (crm::SearchHit& hit : people.search(q)) {
+            if (hit.customer->archived && !showArchived) { ++hiddenArchived; continue; }
+            hits.push_back(std::move(hit));
+        }
+        std::string b = "<h1>Customers</h1><div class='card'><form class='bar' method='get' action='/customers'><input id='cq' name='q' type='search' autocomplete='off' autofocus placeholder='Search by name, phone or plate number' value='" + h(q) +
+                        "'><label class='inline'><input type='checkbox' name='archived' value='1'" + std::string(showArchived ? " checked" : "") + "> Show archived</label><button type='submit'>Search</button>"
+                        "<a class='btn sec' href='/customers'>Clear</a><span class='grow'></span><a class='btn' href='/customer/edit'>+ Add customer</a></form>"
+                        "<table><thead><tr><th>Customer</th><th>Phone</th><th>Vehicles</th><th class='n'>Utang balance</th><th></th></tr></thead><tbody>";
+        for (const crm::SearchHit& hit : hits) {
+            const crm::Customer& k = *hit.customer;
+            std::string plates;
+            for (const crm::Vehicle* v : people.vehiclesOf(k.id)) {
+                const bool matched = std::find(hit.plateMatches.begin(), hit.plateMatches.end(), v) != hit.plateMatches.end();
+                plates += std::string(plates.empty() ? "" : ", ") + "<a href='/vehicle?id=" + num(v->id) + "'>" + (matched ? "<b>" + h(v->plate) + "</b>" : h(v->plate)) + "</a>" + (v->archived ? " <span class='mut'>(archived)</span>" : "");
+            }
+            auto bi = balances.find(k.id);
+            const double owed = bi == balances.end() ? 0.0 : bi->second.balance;
+            b += "<tr><td>" + idLink("/customer", k.id, "<b>" + h(k.name) + "</b>") + archivedTag(k.archived) + (!hit.plateMatches.empty() ? " <span class='mut'>plate match</span>" : "") + "</td><td>" + h(k.phone) + "</td><td>" +
+                 (plates.empty() ? "<span class='mut'>none</span>" : plates) + "</td><td class='n'>" + (owed > 0 ? "<b class='minus'>" + php(owed) + "</b>" : php(0)) +
+                 "</td><td class='right'><a class='btn sm sec' href='/customer?id=" + num(k.id) + "'>Open</a></td></tr>";
+        }
+        if (hits.empty()) b += "<tr><td colspan='5' class='mut'>" + std::string(q.empty() ? "No customers yet - add the first one." : "Nobody matches \"" + h(q) + "\".") + "</td></tr>";
+        b += "</tbody></table>";
+        if (hiddenArchived) b += "<p class='mut'>" + num(static_cast<long long>(hiddenArchived)) + " archived customer(s) also match - tick <i>Show archived</i> to see them.</p>";
+        html(c, layout(c, "Customers", b + "</div>"));
+    }
+
+    void customerPage(Ctx& c) {
+        const crm::Customer* k = customerParam(c);
+        if (!k) return redirect(c, msgUrl("/customers", "Customer not found.", false));
+        const auto& all = inv.invoices().all();
+        const auto hist = crm::customerHistory(all, people, *k);
+        const crm::Balance bal = crm::customerBalance(all, people, *k);
+        const auto cars = people.vehiclesOf(k->id);
+        const bool admin = auth::allowed(c.role, auth::Permission::ArchiveCustomers);
+        const bool canPay = auth::allowed(c.role, auth::Permission::Receivables);
+        const bool hasHist = crm::customerHasHistory(all, k->id);
+        std::string b = "<p><a href='/customers'>&larr; All customers</a></p><h1>" + h(k->name) + archivedTag(k->archived) + "</h1>"
+                        "<div class='stats'><div class='stat" + std::string(bal.balance > 0 ? " warn" : "") + "'><span>Utang balance</span><b>" + php(bal.balance) + "</b></div>"
+                        "<div class='stat'><span>Open invoices</span><b>" + num(bal.openInvoices) + "</b></div><div class='stat'><span>Invoices</span><b>" + num(static_cast<long long>(hist.size())) + "</b></div>"
+                        "<div class='stat'><span>Vehicles</span><b>" + num(static_cast<long long>(cars.size())) + "</b></div></div>"
+                        "<div class='card'><h2>Customer info</h2><table class='kv'><tr><td>Phone</td><td>" + h(k->phone) + "</td></tr><tr><td>Address</td><td>" + h(k->address) + "</td></tr><tr><td>Notes</td><td>" + h(k->notes) + "</td></tr></table><p>";
+        b += "<a class='btn' href='/customer/edit?id=" + num(k->id) + "'>Edit customer</a> ";
+        if (!k->archived) b += "<a class='btn' href='/invoice?customer=" + util::urlEncode(customerLabel(*k)) + "'>New sale</a> <a class='btn sec' href='/vehicle/edit?customer=" + num(k->id) + "'>+ Add vehicle</a> ";
+        if (admin) {
+            b += "<form class='inline' method='post' action='/customer/archive' data-confirm='" + h(k->archived ? "Restore this customer?" : "Archive this customer? They stay in all history but disappear from the sale form.") + "'>" + tokenField(c) +
+                 "<input type='hidden' name='id' value='" + num(k->id) + "'><input type='hidden' name='on' value='" + (k->archived ? "0" : "1") + "'><button class='sec' type='submit'>" + (k->archived ? "Restore" : "Archive") + "</button></form> ";
+            if (!hasHist && cars.empty())
+                b += "<form class='inline' method='post' action='/customer/delete' data-confirm='Delete this customer permanently? (They have no history.)'>" + tokenField(c) + "<input type='hidden' name='id' value='" + num(k->id) + "'><button class='danger' type='submit'>Delete</button></form>";
+        }
+        b += "</p></div><h2>Vehicles</h2><div class='card'><table><thead><tr><th>Plate</th><th>Model</th><th>Year</th><th>Color</th><th>Notes</th><th class='n'>Invoices</th><th></th></tr></thead><tbody>";
+        for (const crm::Vehicle* v : cars) {
+            int n = 0;
+            for (const inv::Invoice& i : all) if (i.vehicleId == v->id) ++n;
+            b += "<tr><td><b>" + h(v->plate) + "</b>" + archivedTag(v->archived) + "</td><td>" + h(v->model) + "</td><td>" + (v->year ? num(v->year) : std::string()) + "</td><td>" + h(v->color) + "</td><td>" + h(v->notes) +
+                 "</td><td class='n'>" + num(n) + "</td><td class='right'><a class='btn sm' href='/vehicle?id=" + num(v->id) + "'>History</a> <a class='btn sm sec' href='/vehicle/edit?id=" + num(v->id) + "'>Edit</a></td></tr>";
+        }
+        if (cars.empty()) b += "<tr><td colspan='7' class='mut'>No vehicles recorded.</td></tr>";
+        b += "</tbody></table></div><h2>Invoice history</h2>" + historyTable(hist, people, true, canPay);
+        html(c, layout(c, k->name, b));
+    }
+
+    void customerEditPage(Ctx& c) {
+        const crm::Customer* k = nullptr;
+        if (!c.param("id").empty() && !(k = customerParam(c))) return redirect(c, msgUrl("/customers", "Customer not found.", false));
+        std::string b = "<h1>" + std::string(k ? "Edit customer" : "Add customer") + "</h1><div class='card'><form method='post' action='/customer/save'>" + tokenField(c) +
+                        "<input type='hidden' name='id' value='" + (k ? num(k->id) : "0") + "'><input type='hidden' name='from' value='" + h(c.param("from")) + "'>"
+                        "<label>Name (required)</label><input name='name' maxlength='60' required autofocus value='" + h(val(c, "name", k ? k->name : "")) + "'>"
+                        "<label>Phone</label><input name='phone' maxlength='30' inputmode='tel' value='" + h(val(c, "phone", k ? k->phone : "")) + "'>"
+                        "<label>Address</label><input name='address' maxlength='120' value='" + h(val(c, "address", k ? k->address : "")) + "'>"
+                        "<label>Notes</label><input name='notes' maxlength='200' value='" + h(val(c, "notes", k ? k->notes : "")) + "'>"
+                        "<p><button type='submit'>Save customer</button> <a class='btn sec' href='" + (k ? "/customer?id=" + num(k->id) : std::string("/customers")) + "'>Cancel</a></p></form></div>";
+        html(c, layout(c, k ? "Edit customer" : "Add customer", b));
+    }
+
+    void doCustomerSave(Ctx& c) {
+        const crm::Customer* old = nullptr;
+        long long idv = 0;
+        const bool adding = !util::parseInt(c.param("id"), 1, 999999, idv);
+        if (!adding && !(old = people.findCustomer(static_cast<int>(idv)))) return redirect(c, msgUrl("/customers", "Customer not found.", false));
+        crm::Customer in;
+        in.name = c.param("name"); in.phone = c.param("phone"); in.address = c.param("address"); in.notes = c.param("notes");
+        int newId = 0;
+        const std::string err = people.saveCustomer(adding ? 0 : static_cast<int>(idv), in, newId);
+        if (!err.empty()) {
+            const std::string back = "/customer/edit?id=" + (adding ? std::string() : num(idv)) + "&from=" + util::urlEncode(c.param("from")) + "&name=" + util::urlEncode(c.param("name")) + "&phone=" + util::urlEncode(c.param("phone")) +
+                                     "&address=" + util::urlEncode(c.param("address")) + "&notes=" + util::urlEncode(c.param("notes"));
+            return redirect(c, msgUrl(back, err, false));
+        }
+        const crm::Customer* k = people.findCustomer(newId);
+        audit.record(c.user(), adding ? "CUSTOMER_ADDED" : "CUSTOMER_UPDATED", "#" + num(newId) + " " + (k ? k->name : std::string()) + (k && !k->phone.empty() ? " " + k->phone : std::string()), c.ip);
+        if (c.param("from") == "sale" && k) return redirect(c, "/invoice?customer=" + util::urlEncode(customerLabel(*k)));
+        redirect(c, msgUrl("/customer?id=" + num(newId), adding ? "Customer added." : "Customer saved.", true));
+    }
+
+    void doCustomerArchive(Ctx& c) {
+        const crm::Customer* k = customerParam(c);
+        if (!k) return redirect(c, msgUrl("/customers", "Customer not found.", false));
+        const bool on = c.param("on") == "1";
+        const std::string name = k->name, err = people.setCustomerArchived(k->id, on);
+        if (err.empty()) audit.record(c.user(), on ? "CUSTOMER_ARCHIVED" : "CUSTOMER_RESTORED", "#" + c.param("id") + " " + name, c.ip);
+        redirect(c, msgUrl("/customer?id=" + c.param("id"), err.empty() ? (on ? "Customer archived." : "Customer restored.") : err, err.empty()));
+    }
+
+    void doCustomerDelete(Ctx& c) {
+        const crm::Customer* k = customerParam(c);
+        if (!k) return redirect(c, msgUrl("/customers", "Customer not found.", false));
+        const std::string name = k->name, id = c.param("id");
+        const std::string err = people.removeCustomer(k->id, crm::customerHasHistory(inv.invoices().all(), k->id));
+        if (!err.empty()) return redirect(c, msgUrl("/customer?id=" + id, err, false));
+        audit.record(c.user(), "CUSTOMER_DELETED", "#" + id + " " + name, c.ip);
+        redirect(c, msgUrl("/customers", "Customer deleted.", true));
+    }
+
+    void vehiclePage(Ctx& c) {
+        const crm::Vehicle* v = vehicleParam(c);
+        if (!v && c.param("id").empty() && !c.param("plate").empty()) {   // /vehicle?plate=abc 123
+            if (const crm::Vehicle* p = people.findByPlate(c.param("plate"))) return redirect(c, "/vehicle?id=" + num(p->id));
+            return redirect(c, msgUrl("/customers?q=" + util::urlEncode(c.param("plate")), "No vehicle with that plate.", false));
+        }
+        if (!v) return redirect(c, msgUrl("/customers", "Vehicle not found.", false));
+        const crm::Customer* owner = people.findCustomer(v->customerId);
+        const auto& all = inv.invoices().all();
+        const auto hist = crm::vehicleHistory(all, v->id);   // Phase 4: job orders get merged into this list
+        double spent = 0, owed = 0;
+        for (const crm::HistoryRow& r : hist) { spent = util::round2(spent + r.total); owed = util::round2(owed + r.balance); }
+        const bool admin = auth::allowed(c.role, auth::Permission::ArchiveCustomers);
+        std::string b = "<p>" + std::string(owner ? idLink("/customer", owner->id, "&larr; " + h(owner->name)) : std::string("<a href='/customers'>&larr; Customers</a>")) + "</p><h1>" + h(v->plate) + archivedTag(v->archived) + "</h1>"
+                        "<div class='stats'><div class='stat'><span>Invoices</span><b>" + num(static_cast<long long>(hist.size())) + "</b></div><div class='stat'><span>Total billed</span><b>" + php(spent) + "</b></div>"
+                        "<div class='stat" + std::string(owed > 0 ? " warn" : "") + "'><span>Unpaid</span><b>" + php(owed) + "</b></div></div>"
+                        "<div class='card'><h2>Vehicle info</h2><table class='kv'><tr><td>Owner</td><td>" + (owner ? idLink("/customer", owner->id, h(owner->name)) : std::string()) + "</td></tr><tr><td>Model</td><td>" + h(v->model) + "</td></tr>"
+                        "<tr><td>Year</td><td>" + (v->year ? num(v->year) : std::string()) + "</td></tr><tr><td>Color</td><td>" + h(v->color) + "</td></tr><tr><td>Notes</td><td>" + h(v->notes) + "</td></tr></table><p>"
+                        "<a class='btn' href='/vehicle/edit?id=" + num(v->id) + "'>Edit vehicle</a> ";
+        if (!v->archived && owner && !owner->archived) b += "<a class='btn' href='/invoice?customer=" + util::urlEncode(customerLabel(*owner)) + "&vehicle=" + util::urlEncode(v->plate) + "'>New sale</a> ";
+        if (admin) {
+            b += "<form class='inline' method='post' action='/vehicle/archive' data-confirm='" + h(v->archived ? "Restore this vehicle?" : "Archive this vehicle? Its history stays.") + "'>" + tokenField(c) +
+                 "<input type='hidden' name='id' value='" + num(v->id) + "'><input type='hidden' name='on' value='" + (v->archived ? "0" : "1") + "'><button class='sec' type='submit'>" + (v->archived ? "Restore" : "Archive") + "</button></form> ";
+            if (hist.empty())
+                b += "<form class='inline' method='post' action='/vehicle/delete' data-confirm='Delete this vehicle permanently? (It has no history.)'>" + tokenField(c) + "<input type='hidden' name='id' value='" + num(v->id) + "'><button class='danger' type='submit'>Delete</button></form>";
+        }
+        b += "</p></div><h2>History (newest first)</h2>" + historyTable(hist, people, false, auth::allowed(c.role, auth::Permission::Receivables));
+        html(c, layout(c, v->plate, b));
+    }
+
+    void vehicleEditPage(Ctx& c) {
+        const crm::Vehicle* v = nullptr;
+        if (!c.param("id").empty() && !(v = vehicleParam(c))) return redirect(c, msgUrl("/customers", "Vehicle not found.", false));
+        const crm::Customer* owner = v ? people.findCustomer(v->customerId) : customerParam(c, "customer");
+        if (!owner) return redirect(c, msgUrl("/customers", "Open a customer first, then use Add vehicle.", false));
+        std::string b = "<h1>" + std::string(v ? "Edit vehicle" : "Add vehicle") + " - " + h(owner->name) + "</h1><div class='card'><form method='post' action='/vehicle/save'>" + tokenField(c) +
+                        "<input type='hidden' name='id' value='" + (v ? num(v->id) : "0") + "'><input type='hidden' name='customer_id' value='" + num(owner->id) + "'><input type='hidden' name='from' value='" + h(c.param("from")) + "'>"
+                        "<label>Plate number (required) <span class='mut'>- saved in capitals without spaces; each plate can only be registered once</span></label><input name='plate' maxlength='16' required autofocus value='" + h(val(c, "plate", v ? v->plate : "")) + "'>"
+                        "<div class='grid'><div><label>Model</label><input name='model' maxlength='60' value='" + h(val(c, "model", v ? v->model : "")) + "'></div>"
+                        "<div><label>Year</label><input name='year' type='number' min='1900' max='2200' value='" + h(val(c, "year", v && v->year ? num(v->year) : "")) + "'></div>"
+                        "<div><label>Color</label><input name='color' maxlength='30' value='" + h(val(c, "color", v ? v->color : "")) + "'></div></div>"
+                        "<label>Notes</label><input name='notes' maxlength='200' value='" + h(val(c, "notes", v ? v->notes : "")) + "'>"
+                        "<p><button type='submit'>Save vehicle</button> <a class='btn sec' href='/customer?id=" + num(owner->id) + "'>Cancel</a></p></form></div>";
+        html(c, layout(c, v ? "Edit vehicle" : "Add vehicle", b));
+    }
+
+    void doVehicleSave(Ctx& c) {
+        const crm::Vehicle* old = nullptr;
+        long long idv = 0;
+        const bool adding = !util::parseInt(c.param("id"), 1, 999999, idv);
+        if (!adding && !(old = people.findVehicle(static_cast<int>(idv)))) return redirect(c, msgUrl("/customers", "Vehicle not found.", false));
+        crm::Vehicle in;
+        long long owner = 0, year = 0;
+        util::parseInt(c.param("customer_id"), 1, 999999, owner);
+        in.customerId = static_cast<int>(owner);
+        in.plate = c.param("plate"); in.model = c.param("model"); in.color = c.param("color"); in.notes = c.param("notes");
+        const std::string yt = util::trim(c.param("year"));
+        std::string err;
+        if (!yt.empty()) { if (util::parseInt(yt, 1, 9999, year)) in.year = static_cast<int>(year); else err = "Year must be a number (or blank)."; }
+        int newId = 0;
+        if (err.empty()) err = people.saveVehicle(adding ? 0 : static_cast<int>(idv), in, newId);
+        if (!err.empty()) {
+            const std::string back = "/vehicle/edit?" + std::string(adding ? "customer=" + c.param("customer_id") : "id=" + num(idv)) + "&from=" + util::urlEncode(c.param("from")) + "&plate=" + util::urlEncode(c.param("plate")) +
+                                     "&model=" + util::urlEncode(c.param("model")) + "&year=" + util::urlEncode(c.param("year")) + "&color=" + util::urlEncode(c.param("color")) + "&notes=" + util::urlEncode(c.param("notes"));
+            return redirect(c, msgUrl(back, err, false));
+        }
+        const crm::Vehicle* v = people.findVehicle(newId);
+        audit.record(c.user(), adding ? "VEHICLE_ADDED" : "VEHICLE_UPDATED", "#" + num(newId) + " " + (v ? v->plate : std::string()) + " customer #" + (v ? num(v->customerId) : std::string()), c.ip);
+        if (c.param("from") == "sale" && v) {
+            const crm::Customer* k = people.findCustomer(v->customerId);
+            return redirect(c, "/invoice?customer=" + util::urlEncode(k ? customerLabel(*k) : std::string()) + "&vehicle=" + util::urlEncode(v->plate));
+        }
+        redirect(c, msgUrl("/vehicle?id=" + num(newId), adding ? "Vehicle added." : "Vehicle saved.", true));
+    }
+
+    void doVehicleArchive(Ctx& c) {
+        const crm::Vehicle* v = vehicleParam(c);
+        if (!v) return redirect(c, msgUrl("/customers", "Vehicle not found.", false));
+        const bool on = c.param("on") == "1";
+        const std::string plate = v->plate, err = people.setVehicleArchived(v->id, on);
+        if (err.empty()) audit.record(c.user(), on ? "VEHICLE_ARCHIVED" : "VEHICLE_RESTORED", "#" + c.param("id") + " " + plate, c.ip);
+        redirect(c, msgUrl("/vehicle?id=" + c.param("id"), err.empty() ? (on ? "Vehicle archived." : "Vehicle restored.") : err, err.empty()));
+    }
+
+    void doVehicleDelete(Ctx& c) {
+        const crm::Vehicle* v = vehicleParam(c);
+        if (!v) return redirect(c, msgUrl("/customers", "Vehicle not found.", false));
+        const std::string plate = v->plate, id = c.param("id"), back = "/customer?id=" + num(v->customerId);
+        const std::string err = people.removeVehicle(v->id, crm::vehicleHasHistory(inv.invoices().all(), v->id));
+        if (!err.empty()) return redirect(c, msgUrl("/vehicle?id=" + id, err, false));
+        audit.record(c.user(), "VEHICLE_DELETED", "#" + id + " " + plate, c.ip);
+        redirect(c, msgUrl(back, "Vehicle deleted.", true));
+    }
+
     // ------------------------------------------------------------------ invoices / receipts
     static constexpr int kPartRows = 8, kSvcRows = 4;
 
@@ -983,7 +1312,11 @@ struct WebApp::Impl {
         const std::string no = c.param("no");
         if (!no.empty()) return receipt(c, no);
         std::string b = "<h1>New sale / invoice</h1><div class='card'><form method='post' action='/invoice'>" + tokenField(c) +
-                        "<label>Customer name <span class='mut'>(required for credit / utang)</span></label><input name='customer' list='custs' maxlength='80' placeholder='Walk-in customer' value='" + h(c.param("customer")) + "'>" + customersDatalist() +
+                        "<label>Customer <span class='mut'>(pick a saved customer or just type a name - a name is required for credit / utang)</span></label><input id='cust-in' name='customer' list='custs' maxlength='120' autocomplete='off' placeholder='Walk-in customer' value='" + h(c.param("customer")) + "'>"
+                        "<input type='hidden' id='cust-id' name='customer_id' value=''>" + customersDatalist() +
+                        "<label>Vehicle plate <span class='mut'>(optional - pick one of the customer's saved vehicles)</span></label><input id='veh-in' name='vehicle' list='vehs' maxlength='120' autocomplete='off' placeholder='e.g. ABC 1234' value='" + h(c.param("vehicle")) + "'>"
+                        "<input type='hidden' id='veh-id' name='vehicle_id' value=''>" + vehiclesDatalist() +
+                        "<p class='mut'><a href='/customer/edit?from=sale'>+ New customer</a> &middot; <a href='/customers'>Find a customer / plate</a></p>" +
                         "<h2>Parts <span class='mut'>(type or pick a part ID - the catalogue price is applied)</span></h2><table><thead><tr><th>Part number</th><th>Quantity</th></tr></thead><tbody>";
         const std::string pre = c.param("part");
         for (int i = 1; i <= kPartRows; ++i) {
@@ -1009,7 +1342,7 @@ struct WebApp::Impl {
     void doInvoice(Ctx& c) {
         auto back = [&](const std::string& msg) {  // keep what was typed
             std::string q = "/invoice?customer=" + util::urlEncode(c.param("customer")) + "&amount_paid=" + util::urlEncode(c.param("amount_paid")) +
-                            "&method=" + util::urlEncode(c.param("method"));
+                            "&method=" + util::urlEncode(c.param("method")) + "&vehicle=" + util::urlEncode(c.param("vehicle"));
             for (int i = 1; i <= kPartRows; ++i) q += "&p_id_" + num(i) + "=" + util::urlEncode(c.param("p_id_" + num(i))) + "&p_qty_" + num(i) + "=" + util::urlEncode(c.param("p_qty_" + num(i)));
             for (int i = 1; i <= kSvcRows; ++i)
                 q += "&s_desc_" + num(i) + "=" + util::urlEncode(c.param("s_desc_" + num(i))) + "&s_qty_" + num(i) + "=" + util::urlEncode(c.param("s_qty_" + num(i))) +
@@ -1042,7 +1375,11 @@ struct WebApp::Impl {
         }
         double paid = -1.0;   // blank = paid in full
         if (!util::trim(c.param("amount_paid")).empty() && !parseMoneyText(c.param("amount_paid"), paid)) return back("Amount paid must be a valid amount (or leave it blank).");
-        const inv::CheckoutResult r = inv.checkout(c.param("customer"), lines, c.user(), paid, c.param("method").empty() ? "Cash" : c.param("method"));
+        std::string partyName;
+        int partyCustomer = 0, partyVehicle = 0;
+        const std::string partyErr = resolveParty(c, partyName, partyCustomer, partyVehicle);
+        if (!partyErr.empty()) return back(partyErr);
+        const inv::CheckoutResult r = inv.checkout(partyName, lines, c.user(), paid, c.param("method").empty() ? "Cash" : c.param("method"), partyCustomer, partyVehicle);
         if (!r.ok) return back(r.message);
         if (r.balance > 0) {
             const inv::Invoice* v = inv.invoices().find(r.invoiceNumber);
@@ -1055,10 +1392,15 @@ struct WebApp::Impl {
     void receipt(Ctx& c, const std::string& no) {
         const inv::Invoice* v = inv.invoices().find(no);
         if (!v) return redirect(c, msgUrl("/invoices", "Invoice not found.", false));
+        const crm::Customer* rk = v->customerId ? people.findCustomer(v->customerId) : nullptr;
+        const crm::Vehicle* rv = v->vehicleId ? people.findVehicle(v->vehicleId) : nullptr;
+        std::string vehicleLine;
+        if (rv) vehicleLine = "<br><b>Vehicle:</b> " + h(rv->plate) + (rv->model.empty() ? "" : " - " + h(rv->model)) + (rv->year ? " (" + num(rv->year) + ")" : "");
         std::string b = "<p class='noprint'><button data-print>&#128424; Print receipt</button> <a class='btn sec' href='/invoice'>New sale</a> <a class='btn sec' href='/invoices'>All invoices</a>" +
+                        (rk ? " <a class='btn sec' href='/customer?id=" + num(rk->id) + "'>Customer record</a>" : std::string()) + (rv ? " <a class='btn sec' href='/vehicle?id=" + num(rv->id) + "'>Vehicle history</a>" : std::string()) +
                         (v->balance() > 0 && auth::allowed(c.role, auth::Permission::Receivables) ? " <a class='btn' href='/payment?no=" + util::urlEncode(v->number) + "'>Record payment</a>" : std::string()) + "</p>"
                         "<div class='receipt'><img class='doc-logo' src='/static/logo.png' alt=''><h1>" + h(cfg.shopName) + "</h1><div class='sub'>Official receipt</div><div class='meta'><div><b>Invoice:</b> " + h(v->number) +
-                        "<br><b>Customer:</b> " + h(v->customer) + "</div><div class='right'><b>Date:</b> " + h(v->timestamp.substr(0, 10)) + "<br><b>Time:</b> " + h(v->timestamp.size() > 11 ? v->timestamp.substr(11) : "") +
+                        "<br><b>Customer:</b> " + h(v->customer) + vehicleLine + "</div><div class='right'><b>Date:</b> " + h(v->timestamp.substr(0, 10)) + "<br><b>Time:</b> " + h(v->timestamp.size() > 11 ? v->timestamp.substr(11) : "") +
                         "<br><b>Served by:</b> " + h(v->user) + "</div></div><table><thead><tr><th>Item</th><th>Type</th><th class='n'>Qty</th><th class='n'>Unit price</th><th class='n'>Amount</th></tr></thead><tbody>";
         for (const inv::InvoiceLine& l : v->lines)
             b += "<tr><td>" + h(l.description) + (l.kind == inv::InvoiceLine::Kind::Part && !carriesLabel(l.description, l.partId) ? " <span class='mut'>#" + h(partLabelById(l.partId)) + "</span>" : "") + "</td><td>" +
@@ -1085,19 +1427,20 @@ struct WebApp::Impl {
             return "<a class='btn sm" + std::string(want == key ? "" : " sec") + "' href='/invoices" + (key.empty() ? "" : "?status=" + key) + "'>" + text + "</a> ";
         };
         std::string b = "<h1>Invoices</h1><p>" + tab("", "All") + tab("unpaid", "Unpaid") + tab("partial", "Partial") + tab("paid", "Paid") + "</p>"
-                        "<div class='card'><table><thead><tr><th>Invoice</th><th>Date</th><th>Customer</th><th>Served by</th><th class='n'>Total</th><th class='n'>Paid</th><th class='n'>Balance</th><th>Status</th><th></th></tr></thead><tbody>";
+                        "<div class='card'><table><thead><tr><th>Invoice</th><th>Date</th><th>Customer</th><th>Vehicle</th><th>Served by</th><th class='n'>Total</th><th class='n'>Paid</th><th class='n'>Balance</th><th>Status</th><th></th></tr></thead><tbody>";
         const auto& all = inv.invoices().all();
         int shown = 0;
         for (size_t i = all.size(); i-- > 0 && shown < 300;) {
             const inv::Invoice& v = all[i];
             if (!want.empty() && util::toLower(inv::payStatusName(v.status())) != want) continue;
             ++shown;
-            b += "<tr><td>" + h(v.number) + "</td><td>" + h(v.timestamp) + "</td><td>" + h(v.customer) + "</td><td>" + h(v.user) + "</td><td class='n'>" + php(v.total()) +
+            b += "<tr><td>" + h(v.number) + "</td><td>" + h(v.timestamp) + "</td><td>" + (v.customerId && people.findCustomer(v.customerId) ? idLink("/customer", v.customerId, h(v.customer)) : h(v.customer)) + "</td><td>" +
+                 (v.vehicleId && people.findVehicle(v.vehicleId) ? idLink("/vehicle", v.vehicleId, h(people.findVehicle(v.vehicleId)->plate)) : std::string()) + "</td><td>" + h(v.user) + "</td><td class='n'>" + php(v.total()) +
                  "</td><td class='n'>" + php(v.amountPaid) + "</td><td class='n'>" + (v.balance() > 0 ? "<b class='minus'>" + php(v.balance()) + "</b>" : php(0)) + "</td><td>" + statusTag(v.status()) +
                  "</td><td class='right'>" + (v.balance() > 0 ? "<a class='btn sm' href='/payment?no=" + util::urlEncode(v.number) + "'>Record payment</a> " : std::string()) +
                  "<a class='btn sm sec' href='/invoice?no=" + util::urlEncode(v.number) + "'>View / print</a></td></tr>";
         }
-        if (!shown) b += "<tr><td colspan='9' class='mut'>" + std::string(all.empty() ? "No invoices yet." : "No invoices with that status.") + "</td></tr>";
+        if (!shown) b += "<tr><td colspan='10' class='mut'>" + std::string(all.empty() ? "No invoices yet." : "No invoices with that status.") + "</td></tr>";
         html(c, layout(c, "Invoices", b + "</tbody></table></div>"));
     }
 
@@ -1116,7 +1459,7 @@ struct WebApp::Impl {
 
         b += "<h2>Customer balances</h2><div class='card'><table><thead><tr><th>Customer</th><th class='n'>Open invoices</th><th class='n'>Billed</th><th class='n'>Paid</th><th class='n'>Balance</th><th>Oldest unpaid</th><th></th></tr></thead><tbody>";
         for (const auto& d : debtors)
-            b += "<tr><td><b>" + h(d.customer) + "</b></td><td class='n'>" + num(d.openInvoices) + "</td><td class='n'>" + php(d.billed) + "</td><td class='n'>" + php(d.paid) +
+            b += "<tr><td><b>" + customerNameLink(d.customer) + "</b></td><td class='n'>" + num(d.openInvoices) + "</td><td class='n'>" + php(d.billed) + "</td><td class='n'>" + php(d.paid) +
                  "</td><td class='n'><b class='minus'>" + php(d.balance) + "</b></td><td>" + h(d.oldestDate) + " <span class='mut'>(" + num(d.oldestDays) + " day" + (d.oldestDays == 1 ? "" : "s") + ")</span></td>"
                  "<td class='right'><a class='btn sm sec' href='/receivables?customer=" + util::urlEncode(d.customer) + "'>View invoices</a></td></tr>";
         if (debtors.empty()) b += "<tr><td colspan='7' class='mut'>Nobody owes the shop anything right now.</td></tr>";

@@ -22,6 +22,8 @@ enum class Permission {
     AdjustStock,    // restock + stock adjustments
     Receivables,    // see customer balances + record payments (utang) -> Staff + Admin
     CashReport,     // end-of-day register close-out report -> Staff + Admin
+    Customers,      // Phase 3: look up / add / edit customers and vehicles -> Staff + Admin
+    ArchiveCustomers, // Phase 3: archive / restore / delete customer + vehicle records -> Admin
     AddPart,        // sets a price  -> Admin
     EditPart,       // price/name/min stock -> Admin
     DeletePart,     // Admin

@@ -16,7 +16,7 @@ namespace inv {
 namespace {
 const char* kBom = "\xEF\xBB\xBF";
 const char* kPartsHeader = "PartID,Name,Category,Price,Quantity,MinStock,CostPrice,CompatibleModels,PartNumber";
-const char* kInvoiceHeader = "invoice_no,timestamp,customer,username,line_type,part_id,description,qty,unit_price,amount_paid,payment_status";
+const char* kInvoiceHeader = "invoice_no,timestamp,customer,username,line_type,part_id,description,qty,unit_price,amount_paid,payment_status,customer_id,vehicle_id";
 const char* kPaymentHeader = "timestamp,invoice_no,username,amount,method,balance_after,note";
 
 std::string key(std::string s) {  // header-name normaliser: "Min Stock" -> "minstock"
@@ -241,7 +241,8 @@ namespace {
 std::string invoiceRow(const Invoice& inv, const InvoiceLine& l) {
     return util::csvEscape(inv.number) + ',' + util::csvEscape(inv.timestamp) + ',' + util::csvEscape(inv.customer) + ',' + util::csvEscape(inv.user) + ',' +
            (l.kind == InvoiceLine::Kind::Service ? "SERVICE" : "PART") + ',' + std::to_string(l.partId) + ',' + util::csvEscape(l.description) + ',' +
-           std::to_string(l.qty) + ',' + util::money(l.unitPrice) + ',' + util::money(inv.amountPaid) + ',' + payStatusName(inv.status());
+           std::to_string(l.qty) + ',' + util::money(l.unitPrice) + ',' + util::money(inv.amountPaid) + ',' + payStatusName(inv.status()) + ',' +
+           (inv.customerId > 0 ? std::to_string(inv.customerId) : std::string()) + ',' + (inv.vehicleId > 0 ? std::to_string(inv.vehicleId) : std::string());
 }
 }  // namespace
 
@@ -251,7 +252,7 @@ InvoiceBook::InvoiceBook(std::string file) : file_(std::move(file)) {
     bool legacy = false;
     for (const auto& f : util::readCsvFile(file_)) {
         if (f.empty()) continue;
-        if (f[0] == "invoice_no") { legacy = f.size() < 11; continue; }
+        if (f[0] == "invoice_no") { legacy = f.size() < 13; continue; }
         long long pid = 0, qty = 0;
         double price = 0;
         if (f.size() < 9 || !util::parseInt(f[7], 1, limits::kMaxQty, qty) || !util::parseDouble(f[8], 0, 1e12, price)) { ++skipped; continue; }
@@ -262,6 +263,9 @@ InvoiceBook::InvoiceBook(std::string file) : file_(std::move(file)) {
             inv.number = f[0]; inv.timestamp = f[1]; inv.customer = f[2]; inv.user = f[3];
             inv.amountPaid = -1.0;  // resolved below once every line is known
             if (f.size() > 9) { double paid = 0; inv.amountPaid = util::parseDouble(f[9], 0, 1e12, paid) ? util::round2(paid) : 0.0; }
+            long long cid = 0, vid = 0;   // Phase 3 columns: blank / missing on older rows
+            if (f.size() > 11 && util::parseInt(f[11], 1, 999999, cid)) inv.customerId = static_cast<int>(cid);
+            if (f.size() > 12 && util::parseInt(f[12], 1, 999999, vid)) inv.vehicleId = static_cast<int>(vid);
             invoices_.push_back(std::move(inv));
             it = index.emplace(f[0], invoices_.size() - 1).first;
         }
@@ -281,7 +285,7 @@ InvoiceBook::InvoiceBook(std::string file) : file_(std::move(file)) {
         fs::copy_file(file_, file_ + ".bak", fs::copy_options::overwrite_existing, ec);
         warning_ = std::to_string(skipped) + " malformed row(s) in invoices.csv were skipped (original kept as invoices.csv.bak).";
     }
-    if (legacy && !invoices_.empty()) save();  // upgrade the file to the 11-column layout (the start-up backup holds the original)
+    if (legacy && !invoices_.empty()) save();  // upgrade the file to the 13-column layout (the start-up backup holds the original)
 }
 
 bool InvoiceBook::save() {
@@ -518,7 +522,7 @@ Result Inventory::adjust(int id, long long delta, const std::string& actor, cons
 }
 
 CheckoutResult Inventory::checkout(const std::string& customerIn, const std::vector<InvoiceLine>& in, const std::string& actor, double amountPaid,
-                                   const std::string& methodIn) {
+                                   const std::string& methodIn, int customerId, int vehicleId) {
     auto fail = [](const std::string& m) { return CheckoutResult{false, m, "", 0, 0}; };
     const bool anonymous = util::trim(customerIn).empty() || util::equalsIgnoreCase(util::trim(customerIn), "Walk-in customer");
     const std::string customer = util::oneLine(anonymous ? std::string("Walk-in customer") : util::trim(customerIn));
@@ -569,6 +573,8 @@ CheckoutResult Inventory::checkout(const std::string& customerIn, const std::vec
     invoice.customer = customer;
     invoice.user = actor;
     invoice.amountPaid = paidNow;
+    invoice.customerId = customerId > 0 ? customerId : 0;
+    invoice.vehicleId = vehicleId > 0 ? vehicleId : 0;
     // One SALE movement per part line; resulting_stock is the running level after that line.
     std::map<int, int> running;
     for (const auto& n : need) running[n.first] = mut(n.first)->quantity() + static_cast<int>(n.second);

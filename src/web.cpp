@@ -92,6 +92,7 @@ struct WebApp::Impl {
     crm::Registry people;          // Phase 3: customers + vehicles
     jobs::JobBook jobbook;         // Phase 4: job orders / repair tickets
     std::map<std::string, Session> sessions;
+    std::string kioskToken_;   // the shared session used by --auto-login (kiosk / demo mode)
     auth::LoginThrottle throttle;
     static constexpr std::chrono::minutes kIdle{30};
 
@@ -100,6 +101,8 @@ struct WebApp::Impl {
         purchases.open(inv.dataDir());
         people.open(inv.dataDir());
         jobbook.open(inv.dataDir(), inv, &audit, &people);
+        if (!cfg.autoLogin.empty())
+            audit.record(cfg.autoLogin, "AUTO_LOGIN", "kiosk/demo mode: every request is signed in without a session cookie", "");
         svr.set_payload_max_length(8 * 1024 * 1024);
         svr.set_exception_handler([](const httplib::Request&, httplib::Response& res, std::exception_ptr) {
             res.status = 500;
@@ -118,6 +121,25 @@ struct WebApp::Impl {
         if (tokenOut) *tokenOut = t;
         return &it->second;
     }
+    // Session for a request, honouring kiosk mode (see Config::autoLogin): when it is on there is no
+    // cookie to read, so the request is signed in as the configured account.
+    Session* sessionForRequest(const httplib::Request& req, std::string* tokenOut = nullptr) {
+        if (Session* s = sessionFor(req, tokenOut)) return s;
+        if (cfg.autoLogin.empty()) return nullptr;
+        const std::string who = users.canonicalName(cfg.autoLogin);
+        if (who.empty()) return nullptr;
+        // ONE shared session for every cookie-less request: a kiosk is one workstation, and handing
+        // out a new session per request would also hand out a new CSRF token and break every form.
+        auto it = kioskToken_.empty() ? sessions.end() : sessions.find(kioskToken_);
+        if (it == sessions.end()) {
+            kioskToken_ = startSession(who);
+            it = sessions.find(kioskToken_);
+        }
+        it->second.expires = std::chrono::steady_clock::now() + kIdle;
+        if (tokenOut) *tokenOut = kioskToken_;
+        return &it->second;
+    }
+
     std::string startSession(const std::string& user) {
         const auto now = std::chrono::steady_clock::now();
         for (auto it = sessions.begin(); it != sessions.end();) it = now > it->second.expires ? sessions.erase(it) : std::next(it);
@@ -164,10 +186,13 @@ struct WebApp::Impl {
                 if (path != "/setup" && path.rfind("/static/", 0) != 0) return redirect(c, "/setup");
             } else if (!pub) {
                 std::string token;
-                c.sess = sessionFor(req, &token);
+                c.sess = sessionForRequest(req, &token);
                 const auto role = c.sess ? users.roleOf(c.sess->user) : std::nullopt;
                 if (!c.sess || !role) {
                     if (c.sess) sessions.erase(token);  // account was deleted meanwhile
+                    // Just logged in (?welcome=1) and already anonymous again: say why instead of
+                    // silently bouncing back to a bare login form.
+                    if (req.has_param("welcome")) return redirect(c, "/login?nocookie=1");
                     return redirect(c, "/login");
                 }
                 c.role = *role;
@@ -281,7 +306,7 @@ struct WebApp::Impl {
             return false;
         }
         std::string token;
-        c.sess = sessionFor(req, &token);
+        c.sess = sessionForRequest(req, &token);
         if (!c.sess) {
             apiDeny(c, 401, "Not signed in (open the app in a browser and log in).");
             return false;
@@ -460,8 +485,30 @@ struct WebApp::Impl {
 
     // ------------------------------------------------------------------ login / setup / recovery
     void loginPage(Ctx& c) {
-        if (sessionFor(c.req)) return redirect(c, "/");
+        if (sessionFor(c.req) || !cfg.autoLogin.empty()) return redirect(c, "/");   // kiosk mode needs no login
+        // ?nocookie=1 is set when somebody logs in and lands back here: the browser threw the session
+        // cookie away (the app is inside a frame on another site and third-party cookies are blocked).
+        // Say so and offer the address to open in its own tab, where cookies are first-party.
+        std::string banner;
+        if (c.param("nocookie") == "1") {
+            const std::string host = c.req.get_header_value("Host");
+            std::string url;
+            if (!host.empty()) {
+                std::string scheme = c.req.get_header_value("X-Forwarded-Proto");
+                if (scheme.empty()) scheme = "http";
+                url = scheme + "://" + host + "/";
+            }
+            banner = "<div class='flash err' role='alert'><span>Your browser did not keep the session cookie, "
+                     "so the app cannot keep you signed in. That happens when the app is shown inside a frame "
+                     "on another site and the browser blocks third-party cookies. ";
+            if (!url.empty())
+                banner += "Open it in its own tab instead: <a href='" + h(url) + "'>" + h(url) + "</a> - ";
+            banner += "or allow third-party cookies for this site and log in again. (Some framed previews cannot "
+                      "store cookies at all - starting the app with --auto-login USER bypasses the session for a "
+                      "kiosk or demo screen.)</span></div>";
+        }
         html(c, bare(c, "Sign in",
+                     banner +
                      "<h2>Sign in</h2><p class='mut'>Enter your account details to continue.</p>"
                      "<form method='post' action='/login'><label for='username'>Username</label><input id='username' name='username' autofocus required autocomplete='username' autocapitalize='off' spellcheck='false' placeholder='Your username'>"
                      "<label for='password'>Password</label><input id='password' name='password' type='password' required autocomplete='current-password' placeholder='Your password'><p><button type='submit'>Log In</button></p>"
@@ -481,7 +528,7 @@ struct WebApp::Impl {
         const std::string token = startSession(who->first);
         audit.record(who->first, "LOGIN", std::string("role ") + auth::roleName(who->second), c.ip);
         c.res.set_header("Set-Cookie", sessionCookie(token, false));
-        redirect(c, "/");
+        redirect(c, "/?welcome=1");
     }
     void doLogout(Ctx& c) {
         std::string token;

@@ -26,6 +26,12 @@ struct Config {
     // CHIPS (Cookies Having Independent Partitioned State): keeps the framed app's cookie even in a
     // browser that blocks third-party cookies. Browsers that do not know the attribute ignore it.
     bool partitionedCookies = false;
+    // Kiosk / demo mode: every request is signed in as this user, no cookie and no login needed.
+    // Use it for a wall screen that only shows the job board, or for a preview frame that cannot
+    // store cookies. SECURITY: anyone who can reach the app is that user - never enable it on a
+    // machine that is reachable by people who should not have the account. Only accounts that
+    // already exist are accepted, and the flag is off unless you pass it.
+    std::string autoLogin;
 };
 
 class WebApp {

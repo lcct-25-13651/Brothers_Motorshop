@@ -49,8 +49,17 @@ If the app is shown **inside a frame on another site** (a shop portal, a kiosk s
 (a browser drops `SameSite=Strict` in a cross-site frame; `Partitioned` - CHIPS - keeps it even when third-party
 cookies are blocked). It looks exactly like "login does not work", but `audit.csv` shows a successful `LOGIN`.
 Override the attributes yourself with `--cookie-samesite Strict|Lax|None`, `--secure-cookies` and
-`--partitioned-cookies`. If a browser blocks third-party cookies *and* does not support CHIPS, open the framed app
-in its own tab - as a top-level page the normal `SameSite=Strict` cookie works.
+`--partitioned-cookies`. When a login succeeds you land back on `/login?nocookie=1`, the app says so on screen
+instead of bouncing silently.
+
+**Kiosk / demo mode.** Some framed previews and locked-down browsers cannot store cookies at all. For those
+(and for a wall screen that only shows the job board) start the app with `--auto-login boss`: every request is
+signed in as that account, no cookie and no login screen, with one shared server-side session so CSRF tokens
+keep working.
+
+> Security: `--auto-login` means *anyone who can reach the app is that user* - Admin in the example. Use it only
+> on a machine that only the right people can reach, never for the shop's day-to-day till. It prints a warning at
+> start-up and writes an `AUTO_LOGIN` row to `audit.csv`.
 
 ## Phase 1 additions
 **Cost price.** `parts.csv` now has a 7th column, `cost_price` (what one unit costs the shop). Older 6-column files load fine (cost = 0) and are

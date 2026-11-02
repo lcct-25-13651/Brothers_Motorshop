@@ -37,6 +37,7 @@ int main(int argc, char** argv) {
         else if (a == "--cookie-samesite") { cfg.cookieSameSite = next(); samesiteGiven = true; }
         else if (a == "--secure-cookies") cfg.secureCookies = true;
         else if (a == "--partitioned-cookies") cfg.partitionedCookies = true;
+        else if (a == "--auto-login") cfg.autoLogin = next();
         else if (a == "--no-backup") backup = false;
         else { usage(); return a == "--help" || a == "-h" ? 0 : 2; }
     }
@@ -60,6 +61,10 @@ int main(int argc, char** argv) {
         std::cout << '\n';
         for (const std::string& p : b.problems) std::cerr << "  backup warning: " << p << '\n';
     }
+
+    if (!cfg.autoLogin.empty())
+        std::cout << "WARNING: --auto-login " << cfg.autoLogin
+                  << " is on: every visitor is signed in as that account. Kiosk/demo use only.\n";
 
     inv::Inventory inventory(dataDir);
     auth::Authenticator users(dataDir + "/users.csv");

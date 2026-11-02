@@ -5,6 +5,7 @@
 #include <iostream>
 
 #include "../src/auth.h"
+#include "../src/crm.h"
 #include "../src/inventory.h"
 #include "../src/reports.h"
 #include "../src/util.h"
@@ -227,7 +228,7 @@ int main() {
         CHECK(fs::exists(ld / "invoices.csv.bak"));                           // damaged row kept before the rewrite
         CHECK(old.lastWarning().find("invoices.csv") != std::string::npos);
         const auto rows = util::readCsvFile((ld / "invoices.csv").string());
-        CHECK(rows.size() == 3 && rows[0].size() == 11 && rows[1][9] == "1000.00" && rows[1][10] == "Paid");
+        CHECK(rows.size() == 3 && rows[0].size() == 13 && rows[1][9] == "1000.00" && rows[1][10] == "Paid" && rows[1][11].empty() && rows[1][12].empty());
         CHECK(old.invoices().nextNumber() == "INV-000008");
         inv::Inventory old2(ld.string());
         CHECK(old2.payments().all().size() == 1);                              // idempotent
@@ -260,6 +261,211 @@ int main() {
         CHECK(im.updated == 1 && in.find(2002)->fitsModel("Bajaj RE 4S"));
         inv::Inventory persisted(d);
         CHECK(persisted.find(2002) && persisted.find(2002)->fitsModel("Bajaj RE 4S"));
+    }
+
+    // ================= Phase 3: customer & vehicle records =================
+    {
+        // plate normalisation
+        CHECK(crm::normalizePlate(" abc  1234 ") == "ABC1234" && crm::normalizePlate("ab-12\t3") == "AB-123" && crm::normalizePlate("   ").empty());
+        CHECK(crm::validPlate("ABC1234") && crm::validPlate("AB-123") && !crm::validPlate("A") && !crm::validPlate("AB#12") && !crm::validPlate(std::string(13, 'A')));
+
+        const fs::path cd = fs::temp_directory_path() / "re_parts_smoke_crm";
+        fs::remove_all(cd);
+        fs::create_directories(cd);
+        crm::Registry reg;
+        reg.open(cd.string());
+        CHECK(reg.customers().empty() && reg.vehicles().empty() && reg.warning().empty());
+        int id = 0, vid = 0;
+
+        // ---- customers ----
+        crm::Customer juan; juan.name = "  Juan   dela Cruz "; juan.phone = "0917 555 1234"; juan.address = "Dasma, Cavite"; juan.notes = "Tricycle operator";
+        CHECK(reg.saveCustomer(0, juan, id).empty() && id == 1);
+        CHECK(reg.findCustomer(1)->phone == "0917 555 1234" && reg.findCustomer(1)->name.rfind("Juan", 0) == 0);
+        crm::Customer maria; maria.name = "Maria Santos"; maria.phone = "0928-111-2222";
+        CHECK(reg.saveCustomer(0, maria, id).empty() && id == 2);
+        crm::Customer dup = juan; dup.phone = "09175551234";
+        CHECK(!reg.saveCustomer(0, dup, id).empty());                        // same name + same phone digits = same person entered twice
+        crm::Customer pedro; pedro.name = "Pedro Reyes"; pedro.phone = "0999 000 0000";
+        CHECK(reg.saveCustomer(0, pedro, id).empty() && id == 3);
+        crm::Customer bad; bad.name = "   ";
+        CHECK(!reg.saveCustomer(0, bad, id).empty());                        // name required
+        bad.name = "walk-in CUSTOMER";
+        CHECK(!reg.saveCustomer(0, bad, id).empty());                        // reserved word
+        bad.name = std::string(61, 'x');
+        CHECK(!reg.saveCustomer(0, bad, id).empty());
+        CHECK(reg.customers().size() == 3);
+
+        // ---- vehicles: plate stored UPPERCASE with no spaces, unique across everyone ----
+        crm::Vehicle v1; v1.customerId = 1; v1.plate = " abc  1234 "; v1.model = "Bajaj RE Maxima"; v1.year = 2019; v1.color = "Green";
+        CHECK(reg.saveVehicle(0, v1, vid).empty() && vid == 1 && reg.findVehicle(1)->plate == "ABC1234");
+        crm::Vehicle v2 = v1; v2.customerId = 2; v2.plate = "abc1234";
+        CHECK(!reg.saveVehicle(0, v2, vid).empty());                         // duplicate plate, other owner
+        v2.plate = "A B C 1 2 3 4";
+        CHECK(!reg.saveVehicle(0, v2, vid).empty());                         // duplicate once spaces are removed
+        v2.plate = "XYZ 987"; v2.year = 1800;
+        CHECK(!reg.saveVehicle(0, v2, vid).empty());                         // year out of range
+        v2.year = 0;
+        CHECK(reg.saveVehicle(0, v2, vid).empty() && vid == 2 && reg.findVehicle(2)->year == 0 && reg.findVehicle(2)->plate == "XYZ987");
+        crm::Vehicle v3 = v1; v3.customerId = 99; v3.plate = "NOPE1";
+        CHECK(!reg.saveVehicle(0, v3, vid).empty());                         // unknown owner
+        v3.customerId = 1; v3.plate = "bad#plate";
+        CHECK(!reg.saveVehicle(0, v3, vid).empty());                         // illegal characters
+        CHECK(reg.findByPlate("abc 1234") && reg.findByPlate("abc 1234")->id == 1 && reg.findByPlate("xyz987")->id == 2 && !reg.findByPlate("zzz") && !reg.findByPlate("  "));
+        CHECK(reg.saveVehicle(1, [&] { crm::Vehicle e = v1; e.customerId = 2; e.plate = "abc 1234"; e.color = "Yellow"; return e; }(), vid).empty());   // edit keeps its own plate
+        CHECK(reg.findVehicle(1)->color == "Yellow" && reg.findVehicle(1)->customerId == 1);                          // owner cannot be changed through an edit
+        crm::Vehicle v4; v4.customerId = 3; v4.plate = "DEF 555"; v4.model = "Bajaj RE Compact";
+        CHECK(reg.saveVehicle(0, v4, vid).empty() && vid == 3);
+
+        // ---- search: name / phone / plate ----
+        auto names = [](const std::vector<crm::SearchHit>& h) { std::string o; for (const auto& x : h) o += std::to_string(x.customer->id) + ","; return o; };
+        CHECK(names(reg.search("")) == "1,2,3,");                                   // everybody, by name
+        CHECK(names(reg.search("maria")) == "2," && names(reg.search("JUAN CRUZ")) == "1,");     // every word must appear, any order / case
+        CHECK(names(reg.search("cruz juan")) == "1,");
+        CHECK(names(reg.search("0928")) == "2," && names(reg.search("(0917) 555-1234")) == "1,");   // phone: digits only
+        CHECK(names(reg.search("abc 1234")) == "1," && names(reg.search("abc1234")) == "1," && names(reg.search("ABC")) == "1,");  // plate, any spelling
+        { auto h = reg.search("xyz98"); CHECK(h.size() == 1 && h[0].customer->id == 2 && h[0].plateMatches.size() == 1 && h[0].plateMatches[0]->plate == "XYZ987"); }
+        CHECK(reg.search("nobody at all").empty() && reg.search("zq").empty());
+        CHECK(reg.search("91").empty());                                             // 2 digits is not a phone match (needs 3) and no plate contains it
+        CHECK(names(reg.search("12")) == "1,");                                      // ...but 2 characters are enough for a plate fragment (ABC1234)
+        CHECK(reg.search("maria")[0].plateMatches.empty());                          // matched by name, not plate
+
+        // ---- archive / delete rules ----
+        CHECK(reg.setCustomerArchived(2, true).empty() && reg.findCustomer(2)->archived);
+        CHECK(names(reg.search("maria")) == "2," && reg.search("")[reg.search("").size() - 1].customer->id == 2);   // archived are still returned (caller hides them), sorted last
+        CHECK(!reg.saveVehicle(0, [&] { crm::Vehicle e; e.customerId = 2; e.plate = "NEW 111"; return e; }(), vid).empty());   // no new vehicle for an archived customer
+        CHECK(reg.setCustomerArchived(2, false).empty());
+        CHECK(!reg.removeCustomer(1, false).empty());                                // still owns a vehicle
+        crm::Customer temp; temp.name = "Temp Person";
+        int tid = 0, tvid = 0;
+        CHECK(reg.saveCustomer(0, temp, tid).empty() && tid == 4);
+        crm::Vehicle tv; tv.customerId = tid; tv.plate = "TMP 1";
+        CHECK(reg.saveVehicle(0, tv, tvid).empty() && tvid == 4);
+        CHECK(!reg.removeCustomer(tid, false).empty() && reg.findCustomer(tid));     // owns a vehicle -> refused
+        CHECK(!reg.removeVehicle(tvid, true).empty() && reg.findVehicle(tvid));      // vehicle has history -> refused
+        CHECK(reg.removeVehicle(tvid, false).empty() && !reg.findVehicle(tvid));
+        CHECK(!reg.removeCustomer(tid, true).empty() && reg.findCustomer(tid));      // customer has history -> refused
+        CHECK(reg.removeCustomer(tid, false).empty() && !reg.findCustomer(tid));     // no history, no vehicle -> gone
+        CHECK(reg.setVehicleArchived(3, true).empty() && names(reg.search("def")) == "3,");   // archived vehicle still finds its owner
+        CHECK(reg.findByPlate("DEF555") && reg.findByPlate("DEF555")->archived);
+
+        // ---- persistence + hand-edited / short files ----
+        crm::Registry again;
+        again.open(cd.string());
+        CHECK(again.customers().size() == 3 && again.vehicles().size() == 3 && again.findVehicle(1)->plate == "ABC1234" && again.findVehicle(3)->archived && again.findCustomer(1)->notes == "Tricycle operator");
+        CHECK(again.findVehicle(2)->year == 0 && again.findVehicle(1)->year == 2019);
+        {
+            const fs::path od = fs::temp_directory_path() / "re_parts_smoke_crm_old";
+            fs::remove_all(od);
+            fs::create_directories(od);
+            { std::ofstream f(od / "customers.csv"); f << "id,name,phone,address,notes\n7,\"Lolo, Jose\",0917,Manila,ok\n"; }          // 5-column file (as in the spec)
+            { std::ofstream f(od / "vehicles.csv"); f << "id,customer_id,plate,model,year,color,notes\n4,7,\"ab 12\",RE,2015,Red,\n"; }  // 7-column file
+            crm::Registry r5;
+            r5.open(od.string());
+            CHECK(r5.customers().size() == 1 && r5.customers()[0].name == "Lolo, Jose" && !r5.customers()[0].archived && r5.warning().empty());
+            CHECK(r5.vehicles().size() == 1 && r5.vehicles()[0].plate == "AB12" && r5.vehicles()[0].year == 2015);
+            { std::ofstream f(od / "customers.csv", std::ios::app); f << "oops,not a number\n"; }
+            crm::Registry r6;
+            r6.open(od.string());
+            CHECK(!r6.warning().empty() && fs::exists(od / "customers.csv.bak") && r6.customers().size() == 1);   // damaged row: original kept before any rewrite
+            fs::remove_all(od);
+        }
+
+        // ---- invoices carry customer_id / vehicle_id; old invoices keep working ----
+        inv::InvoiceLine pl; pl.kind = inv::InvoiceLine::Kind::Part; pl.partId = 103; pl.qty = 1;
+        const size_t invoicesBefore = in.invoices().all().size();
+        auto linked = in.checkout("Juan dela Cruz", {pl}, "juan", -1.0, "Cash", 1, 1);
+        CHECK(linked.ok && in.invoices().find(linked.invoiceNumber)->customerId == 1 && in.invoices().find(linked.invoiceNumber)->vehicleId == 1);
+        auto walkin = in.checkout("", {pl}, "juan");
+        CHECK(walkin.ok && in.invoices().find(walkin.invoiceNumber)->customerId == 0 && in.invoices().find(walkin.invoiceNumber)->vehicleId == 0);
+        auto linkedCredit = in.checkout("Juan dela Cruz", {pl}, "juan", 0.0, "Cash", 1, 1);
+        auto otherVeh = in.checkout("Juan dela Cruz", {pl}, "juan", -1.0, "Cash", 1, 3);   // (the web layer validates ownership; core just stores)
+        CHECK(linkedCredit.ok && otherVeh.ok && in.invoices().all().size() == invoicesBefore + 4);
+        {   // reload from disk: ids survive; blanks stay blank
+            inv::Inventory reloaded(d);
+            const inv::Invoice* a = reloaded.invoices().find(linked.invoiceNumber);
+            const inv::Invoice* w = reloaded.invoices().find(walkin.invoiceNumber);
+            CHECK(a && a->customerId == 1 && a->vehicleId == 1 && w && w->customerId == 0 && w->vehicleId == 0);
+            const auto rows = util::readCsvFile((fs::path(d) / "invoices.csv").string());
+            bool sawBlank = false, sawIds = false;
+            for (const auto& r : rows) if (r.size() == 13 && r[0] == linked.invoiceNumber) sawIds = r[11] == "1" && r[12] == "1";
+            for (const auto& r : rows) if (r.size() == 13 && r[0] == walkin.invoiceNumber) sawBlank = r[11].empty() && r[12].empty();
+            CHECK(sawIds && sawBlank);
+        }
+        // a later payment rewrites invoices.csv: the ids must survive that too
+        CHECK(in.recordPayment(linkedCredit.invoiceNumber, 50.0, "Cash", "", "juan").ok);
+        { inv::Inventory r2(d); CHECK(r2.invoices().find(linkedCredit.invoiceNumber)->customerId == 1 && r2.invoices().find(linkedCredit.invoiceNumber)->vehicleId == 1 && r2.invoices().find(linkedCredit.invoiceNumber)->amountPaid == 50.0); }
+
+        // ---- history: newest first, per vehicle and per customer; balance matches the receivables report ----
+        const auto& invs = in.invoices().all();
+        auto vh = crm::vehicleHistory(invs, 1);
+        CHECK(vh.size() == 2 && vh[0].ref == linkedCredit.invoiceNumber && vh[1].ref == linked.invoiceNumber && vh[0].balance > 0 && vh[1].balance == 0);   // same second -> later number first
+        CHECK(crm::vehicleHistory(invs, 3).size() == 1 && crm::vehicleHistory(invs, 99).empty() && crm::vehicleHistory(invs, 0).empty());
+        CHECK(crm::vehicleHasHistory(invs, 1) && !crm::vehicleHasHistory(invs, 2) && crm::customerHasHistory(invs, 1) && !crm::customerHasHistory(invs, 3));
+
+        // old free-text invoices of the same name: part of the customer's history/balance (flagged "by name"), but only while the name is unique
+        auto oldCredit = in.checkout("  juan DELA cruz ", {pl}, "juan", 0.0, "Cash");   // typed free text, no link (the situation before Phase 3)
+        CHECK(oldCredit.ok);
+        auto ch = crm::customerHistory(in.invoices().all(), again, *again.findCustomer(1));
+        CHECK(ch.size() >= 4);
+        bool oldFlagged = false, allSorted = true;
+        for (size_t i = 0; i < ch.size(); ++i) {
+            if (ch[i].ref == oldCredit.invoiceNumber) oldFlagged = !ch[i].linked;
+            if (i > 0 && ch[i - 1].timestamp < ch[i].timestamp) allSorted = false;
+        }
+        CHECK(oldFlagged && allSorted);
+        const crm::Balance jb = crm::customerBalance(in.invoices().all(), again, *again.findCustomer(1));
+        double receivableForJuan = 0;
+        for (const auto& d2 : reports::receivablesByCustomer(in.invoices().all(), now))
+            if (reports::customerKey(d2.customer) == reports::customerKey("Juan dela Cruz")) receivableForJuan = d2.balance;
+        CHECK(jb.balance == receivableForJuan && jb.balance > 0 && jb.openInvoices == 2);   // identical to what the Receivables page shows
+        CHECK(crm::balancesByCustomer(in.invoices().all(), again).at(1).balance == jb.balance);
+        {   // a namesake record makes the by-name match ambiguous: nobody is charged for it
+            crm::Registry two;
+            two.open(cd.string());
+            crm::Customer ns; ns.name = "JUAN dela cruz"; ns.phone = "0999";
+            int nid = 0;
+            CHECK(two.saveCustomer(0, ns, nid).empty());                    // a namesake with another phone number is allowed
+            ns.phone = "0999";
+            CHECK(!two.saveCustomer(0, ns, nid).empty());                   // ...the same phone again is not
+            const crm::Balance linkedOnly = crm::customerBalance(in.invoices().all(), two, *two.findCustomer(1));
+            CHECK(linkedOnly.openInvoices == 1 && linkedOnly.balance < jb.balance);
+            CHECK(crm::balancesByCustomer(in.invoices().all(), two).count(nid) == 0);
+        }
+
+        // ---- a Phase 2 (11-column) invoices.csv is upgraded without changing a single value ----
+        {
+            const fs::path pd = fs::temp_directory_path() / "re_parts_smoke_p2";
+            fs::remove_all(pd);
+            fs::create_directories(pd);
+            const std::string p2 =
+                "invoice_no,timestamp,customer,username,line_type,part_id,description,qty,unit_price,amount_paid,payment_status\n"
+                "INV-000001,2026-02-01 09:00:00,Mang Tonyo,juan,PART,101,Engine Oil 1L,2,450.00,300.00,Partial\n"
+                "INV-000001,2026-02-01 09:00:00,Mang Tonyo,juan,SERVICE,0,Labor,1,100.00,300.00,Partial\n"
+                "INV-000002,2026-02-02 10:00:00,Aling Nena,juan,SERVICE,0,Tune up,1,500.00,500.00,Paid\n"
+                "INV-000003,2026-02-03 11:00:00,Walk-in customer,juan,SERVICE,0,Wash,1,50.00,0.00,Unpaid\n";
+            { std::ofstream f(pd / "invoices.csv"); f << p2; }
+            inv::Inventory p2inv(pd.string());
+            const auto& oi = p2inv.invoices().all();
+            CHECK(oi.size() == 3 && oi[0].customerId == 0 && oi[0].vehicleId == 0 && oi[0].customer == "Mang Tonyo" && oi[0].lines.size() == 2);
+            CHECK(oi[0].total() == 1000.0 && oi[0].amountPaid == 300.0 && oi[0].balance() == 700.0 && oi[0].status() == inv::PayStatus::Partial);
+            CHECK(oi[1].status() == inv::PayStatus::Paid && oi[2].status() == inv::PayStatus::Unpaid && oi[2].balance() == 50.0);
+            const auto owing = reports::receivablesByCustomer(oi, now);
+            CHECK(owing.size() == 2 && owing[0].customer == "Mang Tonyo" && owing[0].balance == 700.0 && owing[1].customer == "Walk-in customer" && reports::totalReceivable(oi) == 750.0);
+            const auto after = util::readCsvFile((pd / "invoices.csv").string());
+            const auto before = util::parseCsvText(p2);
+            CHECK(after.size() == before.size() && after[0].size() == 13 && after[0][11] == "customer_id" && after[0][12] == "vehicle_id");
+            bool same = after.size() == before.size();
+            for (size_t i = 1; same && i < after.size(); ++i) {
+                same = after[i].size() == 13 && after[i][11].empty() && after[i][12].empty();
+                for (size_t j = 0; same && j < 11; ++j) same = after[i][j] == before[i][j];   // every original field identical
+            }
+            CHECK(same);
+            // the next sale on the upgraded file is linked, the old ones stay blank
+            inv::Inventory p2again(pd.string());
+            CHECK(p2again.invoices().all().size() == 3 && p2again.invoices().nextNumber() == "INV-000004");
+            fs::remove_all(pd);
+        }
+        fs::remove_all(cd);
     }
 
     CHECK(in.removePart(106, "owner").ok);

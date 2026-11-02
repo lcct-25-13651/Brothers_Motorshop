@@ -127,13 +127,16 @@ const std::vector<std::string>& paymentMethods();
 std::string canonicalMethod(const std::string& s);
 
 // invoices.csv columns (one row per line, invoice-level fields repeated on every row):
-//   invoice_no,timestamp,customer,username,line_type,part_id,description,qty,unit_price,amount_paid,payment_status
+//   invoice_no,timestamp,customer,username,line_type,part_id,description,qty,unit_price,amount_paid,payment_status,customer_id,vehicle_id
 // amount_paid is the running total received; payment_status (Paid/Partial/Unpaid) is derived from it and
 // rewritten on every change. Older 9-column files are read as fully paid.
+// Phase 3: customer_id / vehicle_id point into customers.csv / vehicles.csv. They are BLANK on older invoices and on sales to a
+// walk-in / free-text customer (0 in memory); `customer` stays the name as it was printed on the invoice.
 struct Invoice {
     std::string number, timestamp, customer, user;
     std::vector<InvoiceLine> lines;
     double amountPaid = 0.0;
+    int customerId = 0, vehicleId = 0;
     double total() const;
     double balance() const;     // what the customer still owes (never negative)
     PayStatus status() const;   // Paid (incl. zero-total), Partial, Unpaid
@@ -242,8 +245,9 @@ public:
     // A sale = invoice. Part lines use the catalogue price (callers cannot override it).
     // amountPaid < 0 means "paid in full". Less than the total makes it a credit sale (utang): a named customer is
     // then required. Whatever is paid now is logged in payments.csv with `method`.
+    // Phase 3: customerId / vehicleId (0 = none) are stored on the invoice as given; the caller has already checked they exist.
     CheckoutResult checkout(const std::string& customer, const std::vector<InvoiceLine>& lines, const std::string& actor,
-                            double amountPaid = -1.0, const std::string& method = "Cash");
+                            double amountPaid = -1.0, const std::string& method = "Cash", int customerId = 0, int vehicleId = 0);
 
     // Logs a payment against an open invoice: updates invoices.csv (amount_paid / payment_status) and payments.csv.
     // expectedBalance (>= 0) is the balance the cashier was looking at; if it has changed meanwhile (double click,

@@ -12,6 +12,7 @@ src/
   auth.h/.cpp       accounts, salted SHA-256 (20,000 rounds), roles + permissions, login throttle, audit.csv
   inventory.h/.cpp  parts.csv (incl. cost_price, compatible_models), movements.csv, invoices.csv + payments.csv (credit sales), CSV import/export, backups
   reports.h/.cpp    top sellers, daily/weekly/monthly revenue & expenses, dead stock, reorder list, receivables, daily cash report
+  crm.h             Phase 3: customers.csv + vehicles.csv, search, vehicle/customer history (header-only)
   web.h/.cpp        all HTTP routes + HTML views   (web_assets.h = CSS/JS served at /static)
   main.cpp          start-up: backup -> load -> serve
 tests/              smoke_test.cpp (core logic), web_e2e.cpp + stub/ (web layer, no sockets)
@@ -100,3 +101,43 @@ Reports for past dates show invoice statuses as they stood at the end of that da
 - Note: `tools/seed_data.cpp` tags all 75 receipt parts with the generic `Bajaj RE`; fill in the specific models for the drop-down to be useful.
 
 Permissions: Staff can use Receivables and the Daily cash report (new permissions `Receivables`, `CashReport` in `auth.cpp::allowed`; remove them from the Staff list there to make them Admin-only).
+
+## Phase 3 additions - customer & vehicle records
+
+### Files
+- `customers.csv` - `id,name,phone,address,notes,archived`
+- `vehicles.csv` - `id,customer_id,plate,model,year,color,notes,archived`
+- `invoices.csv` gets two more columns at the end: `customer_id,vehicle_id` (13 columns now). **Blank on every old invoice** and on sales to
+  walk-in / free-text customers. The first start on an 11-column file upgrades it in place (all original values unchanged; the start-up backup keeps the
+  original file). The `customer` text on an invoice is still the name as printed, so receipts and the Receivables page work as before.
+- `archived` (0/1) is the only column added to the spec: it is how a customer / vehicle is archived. Files with the 5 / 7 columns of the spec load fine.
+- **Plates** are stored UPPERCASE with all spaces removed (`" abc  1234 "` -> `ABC1234`; letters, digits and `-`, 2-12 characters) and are **unique** - archived vehicles count too.
+- All three files are covered by the normal start-up / *Backup now* copies (every `*.csv`). They hold personal data: they are in `.gitignore` - never commit them.
+
+### Pages (menu: *Customers*, Staff + Admin)
+- **Customers** (`/customers`): one search box for **name** (every word must match), **phone** (digits, at least 3) or **plate** (any spelling, at least 2 characters).
+  Results show the plate that matched, the vehicles and the utang balance. *Show archived* reveals archived customers.
+- **Customer detail** (`/customer?id=`): info, vehicles, **utang balance**, **invoice history** (newest first, with *Record payment* on open ones), Edit / Add vehicle / New sale.
+- **Vehicle history** (`/vehicle?id=` or `/vehicle?plate=ABC 1234`): owner, totals, and **every invoice of that plate, newest first**.
+  (Phase 4: job orders are to be merged into the same list - see `crm::HistoryRow` / `crm::vehicleHistory`.)
+- **Add / Edit customer** and **Add / Edit vehicle** forms. A vehicle's owner cannot be changed by an edit.
+
+### New sale
+- *Customer* box: pick a saved customer from the suggestions (shows the phone) **or just type a name** - exactly as before. Free text that matches no record stays free text.
+  A typed name that equals exactly one saved customer is linked to it; if two customers share the name you are asked to pick one.
+- *Vehicle plate* box: only saved vehicles (the list narrows to the chosen customer; picking a plate fills in its owner). A plate that belongs to somebody else, an unknown plate, or an archived customer / vehicle is refused with a message and nothing is deducted from stock.
+- Works without JavaScript too (the server resolves what was typed); `/static/app.js` only adds the narrowing / auto-fill.
+- Receipts show the vehicle; the invoice list has a *Vehicle* column; names link to the customer record.
+
+### Old invoices, utang and archive rules
+- Old free-text invoices are never rewritten or linked behind your back. On a customer's page they appear marked **(by name)** and **count in the utang balance**
+  when the customer's name matches (ignoring case / extra spaces) *and* only one customer record has that name - so the figure equals the Receivables page.
+- Receivables / Utang is unchanged (still grouped by the name on the invoice); the customer name there links to the record when there is exactly one match.
+- A customer or vehicle **with invoices cannot be deleted - only archived** (Admin). Archived records disappear from the sale form but stay in every history and can still be found
+  (a plate of an archived vehicle still finds its owner); their old utang stays collectable. Only a record with no history (and a customer with no vehicles) can be deleted, by an Admin.
+- New permissions in `auth.cpp::allowed`: `Customers` (view / add / edit - Staff + Admin) and `ArchiveCustomers` (archive / restore / delete - Admin only).
+- Audit events: `CUSTOMER_ADDED/UPDATED/ARCHIVED/RESTORED/DELETED`, `VEHICLE_ADDED/UPDATED/ARCHIVED/RESTORED/DELETED`.
+
+### Tests
+`make test` (core: plate rules, uniqueness, search, archive/delete rules, persistence, history order, balances, upgrade of an 11-column `invoices.csv` with every value unchanged)
+and `make e2e` (web: add/edit/search by plate, linked + free-text sales, history pages, Staff vs Admin, CSRF, escaping, archive/restore, files on disk).

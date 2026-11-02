@@ -36,3 +36,12 @@ audit.csv
 parts_*.csv
 parts.csv.*
 backups/
+
+# Phase 2/3 runtime data (customer records are personal data - never commit)
+customers.csv
+vehicles.csv
+payments.csv
+suppliers.csv
+purchases.csv
+customers.csv.bak
+vehicles.csv.bak

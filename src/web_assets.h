@@ -466,6 +466,45 @@ inline constexpr const char* kJs = R"JS(
   if (f && t) f.addEventListener('change', function () {
     if (f.files[0]) f.files[0].text().then(function (s) { t.value = s; if (window.confirm('Import ' + f.files[0].name + ' now?')) t.form.submit(); });
   });
+  // ---- New sale: customer / vehicle autocomplete (the server also resolves the typed text, so this is only a convenience) ----
+  var cin = document.getElementById('cust-in'), cid = document.getElementById('cust-id'),
+      vin = document.getElementById('veh-in'), vid = document.getElementById('veh-id'),
+      cl = document.getElementById('custs'), vl = document.getElementById('vehs');
+  if (cin && cid && vin && vid && cl && vl) {
+    var allVeh = Array.prototype.map.call(vl.options, function (o) { return { value: o.value, id: o.getAttribute('data-id'), cid: o.getAttribute('data-cid') }; });
+    var findCust = function (val) {
+      for (var i = 0; i < cl.options.length; i++) if (cl.options[i].value.toLowerCase() === val.toLowerCase() && cl.options[i].getAttribute('data-id')) return cl.options[i];
+      return null;
+    };
+    var fillVehicles = function (customerId) {   // only the chosen customer's vehicles are suggested
+      while (vl.firstChild) vl.removeChild(vl.firstChild);
+      allVeh.forEach(function (v) {
+        if (customerId && v.cid !== customerId) return;
+        var o = document.createElement('option');
+        o.value = v.value; o.setAttribute('data-id', v.id); o.setAttribute('data-cid', v.cid);
+        vl.appendChild(o);
+      });
+    };
+    var onCustomer = function () {
+      var o = findCust(cin.value);
+      cid.value = o ? o.getAttribute('data-id') : '';
+      fillVehicles(cid.value);
+      if (vid.value && cid.value) {   // a vehicle of someone else is not valid any more
+        var cur = allVeh.filter(function (v) { return v.id === vid.value; })[0];
+        if (!cur || cur.cid !== cid.value) { vin.value = ''; vid.value = ''; }
+      }
+    };
+    var onVehicle = function () {
+      var v = allVeh.filter(function (x) { return x.value.toLowerCase() === vin.value.toLowerCase(); })[0];
+      vid.value = v ? v.id : '';
+      if (v && !cid.value) {   // picking a plate fills in its owner
+        for (var i = 0; i < cl.options.length; i++) if (cl.options[i].getAttribute('data-id') === v.cid) { cin.value = cl.options[i].value; cid.value = v.cid; fillVehicles(v.cid); break; }
+      }
+    };
+    cin.addEventListener('input', onCustomer);
+    vin.addEventListener('input', onVehicle);
+    onCustomer(); onVehicle();
+  }
   // ---- print buttons and confirm dialogs (no inline handlers: the CSP forbids them) ----
   Array.prototype.forEach.call(document.querySelectorAll('[data-print]'), function (b) {
     b.addEventListener('click', function () { window.print(); });

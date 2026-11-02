@@ -130,12 +130,60 @@ body.auth .auth-wrap{position:relative;z-index:1}
 /* ---- login: shop artwork as the background on the left, sign-in box on the right ---- */
 body.auth{background:#3f8fd2 url(/static/login-bg.jpg) left center/cover no-repeat fixed;justify-content:flex-end;
 padding:1.5rem clamp(1.2rem,6vw,7rem)}
-body.auth::before,body.auth .bg-orb,body.auth .bg-gear{display:none}
+body.auth::before,body.auth .bg-orb{display:none}
 body.auth .auth-card{background:rgba(255,255,255,.94);border:1px solid rgba(255,255,255,.9);border-radius:20px;
 box-shadow:0 28px 56px -14px rgba(5,30,80,.65),0 8px 18px -6px rgba(5,30,80,.4);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
 body.auth .auth-logo{box-shadow:0 8px 18px -4px rgba(23,64,127,.45)}
 body.auth .auth-foot{color:#eaf3ff;text-shadow:0 1px 3px rgba(5,30,80,.7)}
 @media (max-width:899px){body.auth{justify-content:center;background:linear-gradient(rgba(10,40,90,.2),rgba(10,40,90,.2)),#3f8fd2 url(/static/login-bg.jpg) 36% center/cover no-repeat fixed}}
+/* ---- login: 3D effects (tilted slab card, swinging logo, tumbling gears, raised buttons) ---- */
+body.auth .auth-wrap{perspective:1500px}
+body.auth .auth-card{transform:rotateY(-6deg) rotateX(2deg);transition:transform .6s cubic-bezier(.2,.8,.2,1);
+box-shadow:1px 1px 0 #dbe8f8,2px 2px 0 #cfe0f5,3px 3px 0 #c2d7f2,4px 4px 0 #b5cdee,5px 5px 0 #a8c3ea,6px 6px 0 #9bb9e5,0 32px 52px -16px rgba(5,30,80,.7),0 10px 22px -8px rgba(5,30,80,.5);
+animation:auth-in3d .9s cubic-bezier(.2,.8,.2,1) backwards}
+body.auth .auth-wrap:hover .auth-card,body.auth .auth-card:focus-within{transform:rotateY(0) rotateX(0)}
+body.auth .auth-brand{perspective:700px}
+body.auth .auth-logo{animation:logo-swing 5s ease-in-out infinite;box-shadow:0 14px 22px -6px rgba(5,30,80,.6),0 0 0 3px #fff,0 0 0 4px #bcd2f5}
+body.auth input{box-shadow:inset 0 2px 5px rgba(15,23,42,.1)}
+body.auth button:not(.sec),body.auth .btn:not(.sec){background:linear-gradient(180deg,#4b94fb,#1d4ed8);border:0;box-shadow:0 4px 0 #1e3a8a,0 12px 18px -4px rgba(29,78,216,.55),inset 0 1px 0 rgba(255,255,255,.4);transition:transform .08s,box-shadow .08s}
+body.auth button:not(.sec):hover,body.auth .btn:not(.sec):hover{background:linear-gradient(180deg,#5aa0ff,#2158e0);transform:translateY(-1px);box-shadow:0 5px 0 #1e3a8a,0 16px 22px -4px rgba(29,78,216,.6),inset 0 1px 0 rgba(255,255,255,.45)}
+body.auth button:not(.sec):active,body.auth .btn:not(.sec):active{transform:translateY(4px);box-shadow:0 0 0 #1e3a8a,0 3px 6px -2px rgba(29,78,216,.6),inset 0 1px 0 rgba(255,255,255,.3)}
+body.auth .bg-gear{display:block;color:rgba(255,255,255,.24);animation:gear-turn 38s linear infinite}
+body.auth .bg-gear.g1{width:380px;height:380px;left:auto;right:1%;bottom:-130px}
+body.auth .bg-gear.g2{width:210px;height:210px;left:auto;right:3%;top:-40px;animation-duration:30s;animation-direction:reverse}
+@keyframes gear-turn{from{transform:perspective(900px) rotateX(58deg) rotateZ(0)}to{transform:perspective(900px) rotateX(58deg) rotateZ(360deg)}}
+@keyframes logo-swing{0%,100%{transform:translateY(0) rotateY(-16deg)}50%{transform:translateY(-6px) rotateY(16deg)}}
+@keyframes auth-in3d{from{opacity:0;transform:translateX(70px) rotateY(-38deg) rotateX(8deg)}}
+@media (max-width:899px){body.auth .auth-card{transform:none}body.auth .bg-gear.g1{right:-120px}}
+/* ---- splash screen: spinning 3D logo over a perspective grid floor; fades away by itself (no JavaScript) ---- */
+.splash{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;overflow:hidden;
+background:radial-gradient(ellipse at 50% 38%,#1d4ed8 0%,#0b2a66 40%,#040d1f 100%);animation:splash-out .7s ease 2.7s forwards}
+.splash::before{content:"";position:absolute;left:-50%;right:-50%;bottom:-8%;height:56%;
+background:linear-gradient(rgba(96,165,250,.38) 1px,transparent 1px) 0 0/64px 64px,linear-gradient(90deg,rgba(96,165,250,.38) 1px,transparent 1px) 0 0/64px 64px;
+transform:perspective(520px) rotateX(64deg);transform-origin:center top;-webkit-mask-image:linear-gradient(#000,transparent 88%);mask-image:linear-gradient(#000,transparent 88%);animation:grid-run 1.1s linear infinite}
+.splash-stage{position:relative;perspective:1000px;text-align:center;padding:1rem;font-family:Bahnschrift,"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif}
+.splash-glow{position:absolute;left:50%;top:44px;width:330px;height:330px;margin-left:-165px;border-radius:50%;background:radial-gradient(circle,rgba(96,165,250,.55),transparent 66%);animation:glow-pulse 2.2s ease-in-out infinite}
+.coin{position:relative;width:176px;height:176px;margin:0 auto 1.4rem;transform-style:preserve-3d;animation:coin-in 2s cubic-bezier(.16,.84,.3,1) both,coin-idle 4.2s ease-in-out 2s infinite}
+.coin img{position:absolute;left:0;top:0;width:100%;height:100%;border-radius:28px;object-fit:cover;display:block;filter:brightness(.5) saturate(1.3)}
+.coin img:nth-child(1){transform:translateZ(0);filter:none;box-shadow:0 0 44px rgba(96,165,250,.75),0 0 0 3px rgba(255,255,255,.85)}
+.coin img:nth-child(2){transform:translateZ(-3px)}.coin img:nth-child(3){transform:translateZ(-6px)}.coin img:nth-child(4){transform:translateZ(-9px)}
+.coin img:nth-child(5){transform:translateZ(-12px)}.coin img:nth-child(6){transform:translateZ(-15px)}.coin img:nth-child(7){transform:translateZ(-18px)}
+.coin img:nth-child(8){transform:translateZ(-21px)}.coin img:nth-child(9){transform:translateZ(-24px)}
+.splash-floor{width:190px;height:26px;margin:-.4rem auto 1.1rem;border-radius:50%;background:radial-gradient(ellipse,rgba(0,0,0,.6),transparent 70%);animation:floor-pulse 4.2s ease-in-out 2s infinite}
+.splash-name{font-size:2.2rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#fff;text-shadow:0 4px 0 #1e3a8a,0 10px 22px rgba(0,0,0,.5);animation:rise .8s ease 1.1s both}
+.splash-sub{margin-top:.35rem;font-size:1rem;letter-spacing:.2em;text-transform:uppercase;color:#a9c8f5;animation:rise .8s ease 1.4s both}
+.splash-bar{width:240px;height:5px;margin:1.6rem auto 0;border-radius:99px;background:rgba(255,255,255,.18);overflow:hidden;animation:rise .6s ease 1.5s both}
+.splash-bar i{display:block;height:100%;width:0;border-radius:99px;background:linear-gradient(90deg,#60a5fa,#fff);animation:bar-fill 1.3s linear 1.5s forwards}
+@keyframes coin-in{0%{transform:translateY(70px) rotateY(-720deg) scale(.25);opacity:0}30%{opacity:1}100%{transform:translateY(0) rotateY(0) scale(1);opacity:1}}
+@keyframes coin-idle{0%,100%{transform:rotateY(0) translateY(0)}25%{transform:rotateY(16deg) rotateX(3deg) translateY(-6px)}75%{transform:rotateY(-16deg) rotateX(-3deg) translateY(-6px)}}
+@keyframes floor-pulse{0%,100%{transform:scale(1);opacity:.9}50%{transform:scale(.8);opacity:.6}}
+@keyframes glow-pulse{0%,100%{opacity:.7;transform:scale(1)}50%{opacity:1;transform:scale(1.12)}}
+@keyframes grid-run{to{background-position:0 64px,64px 0}}
+@keyframes rise{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+@keyframes bar-fill{to{width:100%}}
+@keyframes splash-out{to{opacity:0;visibility:hidden;transform:scale(1.08)}}
+@media (max-width:480px){.splash-name{font-size:1.5rem}.coin{width:140px;height:140px}.splash-glow{width:260px;height:260px;margin-left:-130px}}
+@media (prefers-reduced-motion:reduce){.splash{display:none}body.auth .auth-card{transform:none;animation:none}body.auth .auth-logo,body.auth .bg-gear{animation:none}}
 /* ---- left sidebar navigation (wide screens); narrow screens keep the top bar ---- */
 @media(min-width:900px){
 header.top{position:fixed;top:0;left:0;bottom:0;width:230px;flex-direction:column;flex-wrap:nowrap;align-items:stretch;gap:.6rem;padding:1rem .8rem;overflow-y:auto;z-index:20}

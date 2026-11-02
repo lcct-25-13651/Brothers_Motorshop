@@ -280,8 +280,21 @@ struct WebApp::Impl {
         return o;
     }
     // Pages shown before login (no nav bar).
+    // Splash screen with the spinning 3D logo: shown once per browser session (a session cookie remembers it), or any time with ?splash=1.
+    static std::string splashHtml() {
+        std::string layers;
+        for (int i = 0; i < 9; ++i) layers += "<img src='/static/logo.png' alt=''>";
+        return "<div class='splash' aria-hidden='true'><div class='splash-stage'><div class='splash-glow'></div><div class='coin'>" + layers +
+               "</div><div class='splash-floor'></div><div class='splash-name'>Brothers Motorshop</div>"
+               "<div class='splash-sub'>RE Parts &amp; Inventory System</div><div class='splash-bar'><i></i></div></div></div>";
+    }
     std::string bare(Ctx& c, const std::string& title, const std::string& body) {
-        return head(title, "auth") +
+        std::string splash;
+        if (c.param("splash") == "1" || (c.req.method == "GET" && c.param("msg").empty())) {
+            splash = splashHtml();
+            c.res.set_header("Set-Cookie", "splash=1; Path=/; SameSite=Lax");
+        }
+        return head(title, "auth") + splash +
                "<div class='bg-orb o1'></div><div class='bg-orb o2'></div><div class='bg-orb o3'></div>"
                "<div class='bg-gear g1' aria-hidden='true'><svg viewBox='0 0 48 48'><circle cx='24' cy='24' r='15' fill='none' stroke='currentColor' stroke-width='6' stroke-dasharray='3.93 3.93'/><circle cx='24' cy='24' r='13' fill='currentColor'/><circle cx='24' cy='24' r='5.5' fill='#0f172a'/></svg></div><div class='bg-gear g2' aria-hidden='true'><svg viewBox='0 0 48 48'><circle cx='24' cy='24' r='15' fill='none' stroke='currentColor' stroke-width='6' stroke-dasharray='3.93 3.93'/><circle cx='24' cy='24' r='13' fill='currentColor'/><circle cx='24' cy='24' r='5.5' fill='#0f172a'/></svg></div>"
                "<main class='auth-wrap'><section class='auth-card'>"

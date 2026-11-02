@@ -209,7 +209,7 @@ struct WebApp::Impl {
     static std::string flash(Ctx& c) {
         const std::string m = c.param("msg");
         if (m.empty()) return "";
-        return std::string("<div class='flash ") + (c.param("kind") == "ok" ? "ok" : "err") + "'>" + h(m) + "</div>";
+        return std::string("<div class='flash ") + (c.param("kind") == "ok" ? "ok" : "err") + "' role='" + (c.param("kind") == "ok" ? "status" : "alert") + "'><span>" + h(m) + "</span></div>";
     }
     int intParam(Ctx& c, const char* name, int lo, int hi, int dflt) {
         long long v;
@@ -241,9 +241,10 @@ struct WebApp::Impl {
     }
 
     // ------------------------------------------------------------------ layout
-    std::string head(const std::string& title) const {
+    std::string head(const std::string& title, const char* bodyClass = "") const {
+        std::string cls = *bodyClass ? std::string(" class='") + bodyClass + "'" : "";
         return "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-               "<title>" + h(title) + " - " + h(cfg.shopName) + "</title><link rel='stylesheet' href='/static/app.css'></head><body>";
+               "<title>" + h(title) + " - " + h(cfg.shopName) + "</title><link rel='stylesheet' href='/static/app.css'></head><body" + cls + ">";
     }
     std::string layout(Ctx& c, const std::string& title, const std::string& body) {
         std::string o = head(title);
@@ -262,7 +263,8 @@ struct WebApp::Impl {
             if (auth::allowed(c.role, P::ExportData)) o += link("/data", "Data &amp; backups");
             if (auth::allowed(c.role, P::ViewAudit)) o += link("/audit", "Audit");
             if (auth::allowed(c.role, P::ManageUsers)) o += link("/users", "Users");
-            o += "</nav><form method='post' action='/logout'>" + tokenField(c) + "<a href='/account'><span class='chip'>" + h(c.user()) + " &middot; " +
+            o += "</nav><span class='chip' id='clock' title='Current date and time'>&#128197; " + h(util::formatTime(std::time(nullptr), "%a, %b %d, %Y  %I:%M %p")) + "</span>"
+                 "<form method='post' action='/logout'>" + tokenField(c) + "<a href='/account'><span class='chip'>" + h(c.user()) + " &middot; " +
                  auth::roleName(c.role) + "</span></a><button class='sm sec' type='submit'>Log out</button></form></header>";
         }
         o += "<main>" + flash(c);
@@ -272,15 +274,22 @@ struct WebApp::Impl {
     }
     // Pages shown before login (no nav bar).
     std::string bare(Ctx& c, const std::string& title, const std::string& body) {
-        return head(title) + "<div class='login'><h1>&#9881; " + h(cfg.shopName) + "</h1>" + flash(c) + "<div class='card'>" + body + "</div></div></body></html>";
+        return head(title, "auth") +
+               "<div class='bg-orb o1'></div><div class='bg-orb o2'></div><div class='bg-orb o3'></div>"
+               "<div class='bg-gear g1' aria-hidden='true'><svg viewBox='0 0 48 48'><circle cx='24' cy='24' r='15' fill='none' stroke='currentColor' stroke-width='6' stroke-dasharray='3.93 3.93'/><circle cx='24' cy='24' r='13' fill='currentColor'/><circle cx='24' cy='24' r='5.5' fill='#0f172a'/></svg></div><div class='bg-gear g2' aria-hidden='true'><svg viewBox='0 0 48 48'><circle cx='24' cy='24' r='15' fill='none' stroke='currentColor' stroke-width='6' stroke-dasharray='3.93 3.93'/><circle cx='24' cy='24' r='13' fill='currentColor'/><circle cx='24' cy='24' r='5.5' fill='#0f172a'/></svg></div>"
+               "<main class='auth-wrap'><section class='auth-card'>"
+               "<div class='auth-brand'><div class='auth-logo' aria-hidden='true'><svg viewBox='0 0 48 48'><g class='gear'><circle cx='24' cy='24' r='15' fill='none' stroke='#fff' stroke-width='6' stroke-dasharray='3.93 3.93'/><circle cx='24' cy='24' r='13' fill='#fff'/><circle cx='24' cy='24' r='5.5' fill='#2563eb'/></g></svg></div><h1>" + h(cfg.shopName) + "</h1>"
+               "<p class='auth-sub'>RE Parts &amp; Inventory System</p></div>" + flash(c) + body +
+               "</section><p class='auth-foot'>Authorized staff only</p></main></body></html>";
     }
 
     // ------------------------------------------------------------------ login / setup / recovery
     void loginPage(Ctx& c) {
         if (sessionFor(c.req)) return redirect(c, "/");
         html(c, bare(c, "Sign in",
-                     "<h2>Sign in</h2><form method='post' action='/login'><label>Username</label><input name='username' autofocus required autocomplete='username'>"
-                     "<label>Password</label><input name='password' type='password' required autocomplete='current-password'><p><button type='submit'>Sign in</button></p>"
+                     "<h2>Sign in</h2><p class='mut'>Enter your account details to continue.</p>"
+                     "<form method='post' action='/login'><label for='username'>Username</label><input id='username' name='username' autofocus required autocomplete='username' autocapitalize='off' spellcheck='false' placeholder='Your username'>"
+                     "<label for='password'>Password</label><input id='password' name='password' type='password' required autocomplete='current-password' placeholder='Your password'><p><button type='submit'>Log In</button></p>"
                      "<p class='mut'><a href='/forgot'>Forgot password?</a></p></form>"));
     }
     void doLogin(Ctx& c) {
@@ -372,6 +381,95 @@ struct WebApp::Impl {
         return o;
     }
 
+    // What the shop sees as "Part ID": the real part number, or the internal number for old parts that have none.
+    static std::string partLabel(const inv::Part& p) { return p.partNumber().empty() ? num(p.id()) : p.partNumber(); }
+    // True when a stored description already carries this part's number: old "NAME [PN]" or new "PN - NAME".
+    bool carriesLabel(const std::string& d, int id) const {
+        const std::string label = partLabelById(id);
+        return d.find("[" + label + "]") != std::string::npos || d.rfind(label + " - ", 0) == 0;
+    }
+    std::string partLabelById(int id) const { const inv::Part* p = inv.find(id); return p ? partLabel(*p) : num(id); }
+    // Accepts a part number (Part ID) or, as a fallback, the internal numeric id.
+    const inv::Part* resolvePart(const std::string& text) const {
+        const std::string t = util::trim(text);
+        if (t.empty()) return nullptr;
+        if (const inv::Part* p = inv.findByNumber(t)) return p;
+        long long id;
+        if (util::parseInt(t, 1, inv::limits::kMaxId, id)) return inv.find(static_cast<int>(id));
+        return nullptr;
+    }
+
+    // ------------------------------------------------------------------ dashboard analytics (Admin: same permission as Reports)
+    static std::string barRow(const std::string& label, const std::string& value, double pct) {
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        return "<tr><td>" + label + "</td><td style='width:38%'><div class='meter'><i style='width:" + util::money(pct) + "%'></i></div></td><td class='n'>" + value + "</td></tr>";
+    }
+    std::string analyticsPanel() {
+        const std::time_t now = std::time(nullptr);
+        const auto& moves = inv.movements().all();
+        const auto& invoices = inv.invoices().all();
+        const auto day = reports::revenueByPeriod(moves, invoices, reports::Period::Daily, 7, now);
+        const auto wk = reports::revenueByPeriod(moves, invoices, reports::Period::Weekly, 1, now);
+        const auto mo = reports::revenueByPeriod(moves, invoices, reports::Period::Monthly, 1, now);
+        const double today = day.empty() ? 0 : day.back().revenue();
+        const double week = wk.empty() ? 0 : wk.back().revenue();
+        const double month = mo.empty() ? 0 : mo.back().revenue();
+        const double monthNet = mo.empty() ? 0 : mo.back().net();
+        const auto dead = reports::deadStock(inv.parts(), moves, 30, now);
+        double deadValue = 0;
+        for (const auto& d : dead) deadValue += d.stockValue;
+
+        std::string b = "<div class='an-head'><h2>Analytics</h2><span class='mut'>As of " + h(util::formatTime(now, "%A, %B %d, %Y, %I:%M %p")) +
+                        " &middot; <a href='/reports'>Full reports</a> &middot; <button class='sm sec noprint' data-print>Print</button></span></div><div class='stats'>"
+                        "<div class='stat'><span>Sales today</span><b>" + php(today) + "</b></div>"
+                        "<div class='stat'><span>This week</span><b>" + php(week) + "</b></div>"
+                        "<div class='stat'><span>This month</span><b>" + php(month) + "</b></div>"
+                        "<div class='stat'><span>Net this month</span><b class='" + (monthNet < 0 ? "minus" : "plus") + "'>" + php(monthNet) + "</b></div>"
+                        "<div class='stat" + std::string(reports::totalReceivable(invoices) > 0 ? " warn" : "") + "'><span>Utang outstanding</span><b>" + php(reports::totalReceivable(invoices)) + "</b></div>"
+                        "<div class='stat'><span>Idle 30+ days</span><b>" + num(static_cast<long long>(dead.size())) + " <small class='mut'>(" + php(deadValue) + ")</small></b></div></div>";
+
+        b += "<div class='an-grid'>";
+        // Revenue, last 7 days (newest first)
+        double mx = 1;
+        for (const auto& r : day) mx = std::max(mx, r.revenue());
+        b += "<div class='card'><h3>Revenue - last 7 days</h3><table><tbody>";
+        for (size_t i = day.size(); i-- > 0;) b += barRow(h(day[i].label), php(day[i].revenue()), day[i].revenue() / mx * 100);
+        b += "</tbody></table></div>";
+
+        // Top 5 sellers, last 30 days
+        const auto top = reports::topSelling(moves, 30, 5, now);
+        double topMax = 1;
+        for (const auto& t : top) topMax = std::max<double>(topMax, static_cast<double>(t.unitsSold));
+        b += "<div class='card'><h3>Top 5 sellers - last 30 days</h3><table><tbody>";
+        for (const auto& t : top) b += barRow(h(t.name), num(t.unitsSold) + " pcs", static_cast<double>(t.unitsSold) / topMax * 100);
+        if (top.empty()) b += "<tr><td class='mut'>No sales recorded yet.</td></tr>";
+        b += "</tbody></table></div>";
+
+        // Stock value by vehicle system
+        std::map<std::string, std::pair<long long, double>> bySys;
+        for (const inv::Part& p : inv.parts()) { auto& e = bySys[p.category()]; e.first += p.quantity(); e.second += p.stockValue(); }
+        double sysMax = 1;
+        for (const auto& kv : bySys) sysMax = std::max(sysMax, kv.second.second);
+        b += "<div class='card'><h3>Stock value by system</h3><table><tbody>";
+        for (const auto& kv : bySys) b += barRow(h(kv.first) + " <span class='mut'>(" + num(kv.second.first) + " pcs)</span>", php(kv.second.second), kv.second.second / sysMax * 100);
+        if (bySys.empty()) b += "<tr><td class='mut'>No parts yet.</td></tr>";
+        b += "</tbody></table></div>";
+
+        // Reorder alerts (most short first)
+        const auto re = reports::reorderList(inv.parts());
+        b += "<div class='card'><h3>Reorder soon <span class='mut'>(" + num(static_cast<long long>(re.size())) + " below minimum)</span></h3><table><tbody>";
+        size_t shown = 0;
+        for (const auto& r : re) {
+            if (++shown > 5) break;
+            b += "<tr><td>" + h(r.part->name()) + "</td><td class='n'>" + num(r.part->quantity()) + " / " + num(r.part->minStock()) +
+                 "</td><td class='n'><b>+" + num(r.suggestedQty) + "</b></td></tr>";
+        }
+        if (re.empty()) b += "<tr><td class='mut'>Every part is at or above its minimum.</td></tr>";
+        b += "</tbody></table></div></div>";
+        return b;
+    }
+
     void dashboard(Ctx& c) {
         using P = auth::Permission;
         const auto& parts = inv.parts();
@@ -387,25 +485,33 @@ struct WebApp::Impl {
                         "<div class='stat'><span>Units in stock</span><b>" + num(units) + "</b></div>";
         if (auth::allowed(c.role, P::ViewReports)) b += "<div class='stat'><span>Stock value</span><b>" + php(value) + "</b></div>";
         b += std::string("<div class='stat") + (low ? " warn" : "") + "'><span>Below minimum</span><b>" + num(low) + "</b></div></div>";
+        if (auth::allowed(c.role, P::ViewReports)) b += analyticsPanel();
 
-        b += "<div class='card'><div class='bar'><input id='q' type='search' placeholder='Search by ID, name, system or vehicle model...' autocomplete='off'>"
+        b += "<div class='card'><div class='bar'><input id='q' type='search' placeholder='Search by part number, description, system or vehicle model...' autocomplete='off'>"
              "<select id='sys'><option value=''>All vehicle systems</option>";
         for (const std::string& s : systems) b += "<option>" + h(s) + "</option>";
         b += "</select><select id='model' title='Show only parts that fit this vehicle'><option value=''>All vehicle models</option>";
         for (const std::string& m : models) b += "<option" + std::string(util::equalsIgnoreCase(m, wantModel) ? " selected" : "") + ">" + h(m) + "</option>";
-        b += "</select><label class='inline mut'><input id='lowonly' type='checkbox'> Low stock only</label><span id='count' class='mut grow'></span>";
+        b += "</select><select id='sortsel' title='Sort the list'><option value=''>Sort: default</option>"
+             "<option value='pn:1'>Part Number: A to Z</option><option value='pn:-1'>Part Number: Z to A</option>"
+             "<option value='name:1'>Part Description: A to Z</option><option value='name:-1'>Part Description: Z to A</option>"
+             "<option value='qty:-1'>Stock: most first</option><option value='qty:1'>Stock: least first</option>"
+             "<option value='gap:1'>Most below minimum first</option>"
+             "<option value='price:-1'>Price: high to low</option><option value='price:1'>Price: low to high</option>"
+             "<option value='cat:1'>System: A to Z</option></select>"
+             "<label class='inline mut'><input id='lowonly' type='checkbox'> Low stock only</label><span id='count' class='mut grow'></span>";
         if (auth::allowed(c.role, P::AddPart)) b += "<a class='btn' href='/add'>+ Add part</a>";
-        b += "</div><table id='inv'><thead><tr><th data-sort='id' data-type='num'>ID</th><th data-sort='name'>Part</th><th data-sort='cat'>System</th><th>Fits (vehicle models)</th>"
-             "<th class='n' data-sort='price' data-type='num'>Price</th><th class='n' data-sort='qty' data-type='num'>Stock</th><th class='n'>Min</th><th>Status</th><th></th></tr></thead><tbody>";
+        b += "</div><table id='inv'><thead><tr><th data-sort='pn'>Part Number</th><th data-sort='name'>Part Description</th><th data-sort='cat'>System</th><th>Fits (vehicle models)</th>"
+             "<th class='n' data-sort='price' data-type='num'>Price</th><th class='n' data-sort='qty' data-type='num'>Stock</th><th class='n' data-sort='min' data-type='num'>Min</th><th>Status</th><th></th></tr></thead><tbody>";
         for (const inv::Part& p : parts) {
-            b += "<tr" + std::string(p.isLowStock() ? " class='low'" : "") + " data-id='" + num(p.id()) + "' data-name='" + h(util::toLower(p.name())) +
+            b += "<tr" + std::string(p.isLowStock() ? " class='low'" : "") + " data-id='" + num(p.id()) + "' data-pn='" + h(util::toLower(partLabel(p))) + "' data-min='" + num(p.minStock()) + "' data-gap='" + num(p.quantity() - p.minStock()) + "' data-name='" + h(util::toLower(p.name())) +
                  "' data-cat='" + h(util::toLower(p.category())) + "' data-models='" + h(util::toLower(modelsKey(p))) + "' data-price='" + util::money(p.price()) + "' data-qty='" + num(p.quantity()) +
-                 "' data-low='" + (p.isLowStock() ? "1" : "0") + "'><td>" + num(p.id()) + "</td><td>" + h(p.name()) + "</td><td>" + h(p.category()) +
+                 "' data-low='" + (p.isLowStock() ? "1" : "0") + "'><td>" + h(partLabel(p)) + "</td><td>" + h(p.name()) + "</td><td>" + h(p.category()) +
                  "</td><td class='fits'>" + (p.modelList().empty() ? std::string("<span class='mut'>-</span>") : h(modelsText(p))) +
                  "</td><td class='n'>" + php(p.price()) + "</td><td class='n'>" + num(p.quantity()) + "</td><td class='n'>" + num(p.minStock()) + "</td><td>" +
                  statusTag(p) + "</td><td class='right'>";
             const std::string id = "?id=" + num(p.id());
-            if (auth::allowed(c.role, P::Sell)) b += "<a class='btn sm' href='/invoice?part=" + num(p.id()) + "'>Sell</a> ";
+            if (auth::allowed(c.role, P::Sell)) b += "<a class='btn sm' href='/invoice?part=" + util::urlEncode(partLabel(p)) + "'>Sell</a> ";
             if (auth::allowed(c.role, P::AdjustStock)) b += "<a class='btn sm sec' href='/stock" + id + "'>Stock</a> ";
             if (auth::allowed(c.role, P::EditPart)) b += "<a class='btn sm sec' href='/edit" + id + "'>Edit</a> ";
             if (auth::allowed(c.role, P::DeletePart)) b += "<a class='btn sm danger' href='/delete" + id + "'>Delete</a>";
@@ -420,7 +526,7 @@ struct WebApp::Impl {
         const inv::Part* p = inv.find(intParam(c, "id", 1, inv::limits::kMaxId, 0));
         if (!p) return redirect(c, msgUrl("/", "Part not found.", false));
         const std::string id = num(p->id());
-        std::string b = "<h1>Stock: " + h(p->name()) + "</h1><p class='mut'>Part " + id + " &middot; " + h(p->category()) + " &middot; currently <b>" + num(p->quantity()) +
+        std::string b = "<h1>Stock: " + h(p->fullName()) + "</h1><p class='mut'>Part " + id + " &middot; " + h(p->category()) + " &middot; currently <b>" + num(p->quantity()) +
                         "</b> in stock (minimum " + num(p->minStock()) + ")</p><div class='grid'><div class='card'><h2>Restock (stock arrives)</h2>"
                         "<form method='post' action='/stock'>" + tokenField(c) + "<input type='hidden' name='id' value='" + id + "'><input type='hidden' name='action' value='restock'>"
                         "<label>Quantity received</label><input name='qty' type='number' min='1' required>"
@@ -465,8 +571,8 @@ struct WebApp::Impl {
     }
     void addPage(Ctx& c) {
         std::string b = "<h1>Add part</h1><div class='card'><form method='post' action='/add'>" + tokenField(c) + "<div class='grid'>"
-                        "<div><label>Part ID</label><input name='id' type='number' min='1' value='" + num(nextFreeId()) + "' required></div>"
-                        "<div><label>Name</label><input name='name' maxlength='80' required></div>"
+                        "<div><label>Part Number</label><input name='pn' maxlength='40' required placeholder='e.g. 22170434'><input type='hidden' name='id' value='" + num(nextFreeId()) + "'></div>"
+                        "<div><label>Part Description</label><input name='name' maxlength='80' required></div>"
                         "<div><label>Vehicle system</label><input name='category' list='systems' required></div>"
                         "<div><label>Price (&#8369;)</label><input name='price' type='number' step='0.01' min='0' required></div>"
                         "<div><label>Opening stock</label><input name='qty' type='number' min='0' value='0' required></div>"
@@ -490,11 +596,13 @@ struct WebApp::Impl {
         double price = 0;
         std::string name, cat;
         std::string err = readPart(c, id, name, cat, price, qty, mn, true);
+        if (err.empty() && c.req.has_param("pn") && util::trim(c.param("pn")).empty()) err = "Part number is required.";   // an old form without the field still works
         if (err.empty()) {
             inv::Part part(static_cast<int>(id), name, cat, price, static_cast<int>(qty), static_cast<int>(mn));
             part.setCompatibleModels(util::oneLine(util::trim(c.param("models"))));
+            part.setPartNumber(util::oneLine(util::trim(c.param("pn"))));
             const inv::Result r = inv.addPart(part, c.user());
-            if (r.ok) return redirect(c, msgUrl("/", "Part " + num(id) + " added.", true));
+            if (r.ok) return redirect(c, msgUrl("/", "Part " + part.partNumber() + " added.", true));
             err = r.message;
         }
         redirect(c, msgUrl("/add", err, false));
@@ -502,8 +610,8 @@ struct WebApp::Impl {
     void editPage(Ctx& c) {
         const inv::Part* p = inv.find(intParam(c, "id", 1, inv::limits::kMaxId, 0));
         if (!p) return redirect(c, msgUrl("/", "Part not found.", false));
-        std::string b = "<h1>Edit part " + num(p->id()) + "</h1><div class='card'><form method='post' action='/edit'>" + tokenField(c) +
-                        "<input type='hidden' name='id' value='" + num(p->id()) + "'><div class='grid'><div><label>Name</label><input name='name' maxlength='80' value='" + h(p->name()) + "' required></div>"
+        std::string b = "<h1>Edit part " + h(partLabel(*p)) + "</h1><div class='card'><form method='post' action='/edit'>" + tokenField(c) +
+                        "<input type='hidden' name='id' value='" + num(p->id()) + "'><div class='grid'><div><label>Part Number</label><input name='pn' maxlength='40' value='" + h(p->partNumber()) + "' required></div><div><label>Part Description</label><input name='name' maxlength='80' value='" + h(p->name()) + "' required></div>"
                         "<div><label>Vehicle system</label><input name='category' list='systems' value='" + h(p->category()) + "' required></div>"
                         "<div><label>Price (&#8369;)</label><input name='price' type='number' step='0.01' min='0' value='" + util::money(p->price()) + "' required></div>"
                         "<div><label>Minimum stock</label><input name='min' type='number' min='0' value='" + num(p->minStock()) + "' required></div></div>"
@@ -518,7 +626,7 @@ struct WebApp::Impl {
         const inv::Part* cur = inv.find(id);
         if (!cur) return redirect(c, msgUrl("/", "Part not found.", false));
         const double oldPrice = cur->price();
-        const std::string oldName = cur->name(), oldModels = cur->compatibleModels();
+        const std::string oldName = cur->fullName(), oldModels = cur->compatibleModels();
         long long dummy = 0, mn = 0;
         double price = 0;
         std::string name, cat;
@@ -526,13 +634,15 @@ struct WebApp::Impl {
         if (err.empty()) {
             std::optional<std::string> models;   // a request without the field (old form) leaves the models alone
             if (c.req.has_param("models")) models = c.param("models");
-            const inv::Result r = inv.updatePart(id, name, cat, price, static_cast<int>(mn), c.user(), models);
+            std::optional<std::string> pnew;
+            if (c.req.has_param("pn")) pnew = c.param("pn");
+            const inv::Result r = inv.updatePart(id, name, cat, price, static_cast<int>(mn), c.user(), models, pnew);
             if (r.ok) {
                 if (models && inv.find(id) && inv.find(id)->compatibleModels() != oldModels)
                     audit.record(c.user(), "PART_MODELS_CHANGED", "Part " + num(id) + " " + oldName + ": [" + oldModels + "] -> [" + inv.find(id)->compatibleModels() + "]", c.ip);
                 if (price != oldPrice)
                     audit.record(c.user(), "PRICE_CHANGE", "Part " + num(id) + " " + oldName + ": " + util::money(oldPrice) + " -> " + util::money(price), c.ip);
-                return redirect(c, msgUrl("/", "Part " + num(id) + " updated.", true));
+                return redirect(c, msgUrl("/", "Part " + partLabelById(id) + " updated.", true));
             }
             err = r.message;
         }
@@ -541,7 +651,7 @@ struct WebApp::Impl {
     void deletePage(Ctx& c) {
         const inv::Part* p = inv.find(intParam(c, "id", 1, inv::limits::kMaxId, 0));
         if (!p) return redirect(c, msgUrl("/", "Part not found.", false));
-        std::string b = "<h1>Delete part?</h1><div class='card'><p>You are about to delete <b>" + h(p->name()) + "</b> (ID " + num(p->id()) + ") with <b>" + num(p->quantity()) +
+        std::string b = "<h1>Delete part?</h1><div class='card'><p>You are about to delete <b>" + h(p->fullName()) + "</b> with <b>" + num(p->quantity()) +
                         "</b> units in stock. The removal is recorded in the movement log and audit trail.</p><form method='post' action='/delete'>" + tokenField(c) +
                         "<input type='hidden' name='id' value='" + num(p->id()) + "'><button class='danger' type='submit'>Yes, delete</button> <a class='btn sec' href='/'>Cancel</a></form></div>";
         html(c, layout(c, "Delete part", b));
@@ -550,7 +660,7 @@ struct WebApp::Impl {
         const int id = intParam(c, "id", 1, inv::limits::kMaxId, 0);
         const inv::Part* p = inv.find(id);
         if (!p) return redirect(c, msgUrl("/", "Part not found.", false));
-        const std::string desc = "Part " + num(id) + " " + p->name() + " (stock " + num(p->quantity()) + ")";
+        const std::string desc = "Part " + num(id) + " " + p->fullName() + " (stock " + num(p->quantity()) + ")";
         const inv::Result r = inv.removePart(id, c.user());
         if (r.ok) audit.record(c.user(), "RECORD_DELETED", desc, c.ip);
         redirect(c, msgUrl("/", r.ok ? "Part deleted." : r.message, r.ok));
@@ -564,16 +674,16 @@ struct WebApp::Impl {
         if (!no.empty()) return receipt(c, no);
         std::string b = "<h1>New sale / invoice</h1><div class='card'><form method='post' action='/invoice'>" + tokenField(c) +
                         "<label>Customer name <span class='mut'>(required for credit / utang)</span></label><input name='customer' list='custs' maxlength='80' placeholder='Walk-in customer' value='" + h(c.param("customer")) + "'>" + customersDatalist() +
-                        "<h2>Parts <span class='mut'>(type or pick a part ID - the catalogue price is applied)</span></h2><table><thead><tr><th>Part ID</th><th>Quantity</th></tr></thead><tbody>";
+                        "<h2>Parts <span class='mut'>(type or pick a part ID - the catalogue price is applied)</span></h2><table><thead><tr><th>Part number</th><th>Quantity</th></tr></thead><tbody>";
         const std::string pre = c.param("part");
         for (int i = 1; i <= kPartRows; ++i) {
             std::string id = c.param("p_id_" + num(i)), qty = c.param("p_qty_" + num(i));
-            if (i == 1 && id.empty() && !pre.empty()) { id = pre; qty = "1"; }
-            b += "<tr><td><input name='p_id_" + num(i) + "' list='plist' inputmode='numeric' value='" + h(id) + "'></td><td><input name='p_qty_" + num(i) + "' type='number' min='1' value='" + h(qty) + "'></td></tr>";
+            if (i == 1 && id.empty() && !pre.empty()) { id = pre; if (const inv::Part* pp = resolvePart(pre)) id = partLabel(*pp); qty = "1"; }
+            b += "<tr><td><input name='p_id_" + num(i) + "' list='plist' value='" + h(id) + "'></td><td><input name='p_qty_" + num(i) + "' type='number' min='1' value='" + h(qty) + "'></td></tr>";
         }
         b += "</tbody></table><datalist id='plist'>";
         for (const inv::Part& p : inv.parts())
-            b += "<option value='" + num(p.id()) + "'>" + h(p.name()) + " - &#8369;" + util::moneyFmt(p.price()) + " (" + num(p.quantity()) + " in stock)</option>";
+            b += "<option value='" + h(partLabel(p)) + "'>" + h(p.fullName()) + " - &#8369;" + util::moneyFmt(p.price()) + " (" + num(p.quantity()) + " in stock)</option>";
         b += "</datalist><h2>Services <span class='mut'>(labour, repairs - optional)</span></h2><table><thead><tr><th>Description</th><th>Qty</th><th>Price (&#8369;)</th></tr></thead><tbody>";
         for (int i = 1; i <= kSvcRows; ++i)
             b += "<tr><td><input name='s_desc_" + num(i) + "' maxlength='100' value='" + h(c.param("s_desc_" + num(i))) + "'></td><td><input name='s_qty_" + num(i) +
@@ -600,11 +710,12 @@ struct WebApp::Impl {
         for (int i = 1; i <= kPartRows; ++i) {
             const std::string ids = util::trim(c.param("p_id_" + num(i)));
             if (ids.empty()) continue;
-            long long id, qty;
-            if (!util::parseInt(ids, 1, inv::limits::kMaxId, id) || !util::parseInt(c.param("p_qty_" + num(i)), 1, inv::limits::kMaxQty, qty))
-                return back("Part row " + num(i) + ": enter a valid part ID and a quantity of at least 1.");
+            long long qty;
+            const inv::Part* rp = resolvePart(ids);
+            if (!rp || !util::parseInt(c.param("p_qty_" + num(i)), 1, inv::limits::kMaxQty, qty))
+                return back("Part row " + num(i) + ": enter a valid Part ID (that exists) and a quantity of at least 1.");
             inv::InvoiceLine l;
-            l.kind = inv::InvoiceLine::Kind::Part; l.partId = static_cast<int>(id); l.qty = static_cast<int>(qty);
+            l.kind = inv::InvoiceLine::Kind::Part; l.partId = rp->id(); l.qty = static_cast<int>(qty);
             lines.push_back(l);
         }
         for (int i = 1; i <= kSvcRows; ++i) {
@@ -640,7 +751,7 @@ struct WebApp::Impl {
                         "<br><b>Customer:</b> " + h(v->customer) + "</div><div class='right'><b>Date:</b> " + h(v->timestamp.substr(0, 10)) + "<br><b>Time:</b> " + h(v->timestamp.size() > 11 ? v->timestamp.substr(11) : "") +
                         "<br><b>Served by:</b> " + h(v->user) + "</div></div><table><thead><tr><th>Item</th><th>Type</th><th class='n'>Qty</th><th class='n'>Unit price</th><th class='n'>Amount</th></tr></thead><tbody>";
         for (const inv::InvoiceLine& l : v->lines)
-            b += "<tr><td>" + h(l.description) + (l.kind == inv::InvoiceLine::Kind::Part ? " <span class='mut'>#" + num(l.partId) + "</span>" : "") + "</td><td>" +
+            b += "<tr><td>" + h(l.description) + (l.kind == inv::InvoiceLine::Kind::Part && !carriesLabel(l.description, l.partId) ? " <span class='mut'>#" + h(partLabelById(l.partId)) + "</span>" : "") + "</td><td>" +
                  (l.kind == inv::InvoiceLine::Kind::Part ? "Part" : "Service") + "</td><td class='n'>" + num(l.qty) + "</td><td class='n'>" + php(l.unitPrice) + "</td><td class='n'>" + php(l.total()) + "</td></tr>";
         b += "</tbody><tfoot><tr><td colspan='4' class='n'>TOTAL</td><td class='n'>" + php(v->total()) + "</td></tr>";
         if (v->status() != inv::PayStatus::Paid)
@@ -827,7 +938,7 @@ struct WebApp::Impl {
         const std::time_t now = std::time(nullptr);
         const int days = intParam(c, "days", 0, 3650, 30), idle = intParam(c, "idle", 1, 3650, 30);
         const auto& moves = inv.movements().all();
-        std::string b = "<h1>Business reports</h1><p class='mut'>Revenue = SALE movements at the selling price + service lines. Expenses = RESTOCK movements at the unit cost entered when stock arrived"
+        std::string b = "<h1>Business reports</h1><p class='mut'>Generated " + h(util::formatTime(now, "%A, %B %d, %Y, %I:%M %p")) + "</p><p class='mut'>Revenue = SALE movements at the selling price + service lines. Expenses = RESTOCK movements at the unit cost entered when stock arrived"
                         " (restocks with no cost entered count as 0: " + num(reports::restocksWithoutCost(moves)) + " so far).</p>";
         b += periodTable("Daily (last 14 days)", reports::revenueByPeriod(moves, inv.invoices().all(), reports::Period::Daily, 14, now));
         b += periodTable("Weekly (last 8 weeks, Monday start)", reports::revenueByPeriod(moves, inv.invoices().all(), reports::Period::Weekly, 8, now));
@@ -835,31 +946,31 @@ struct WebApp::Impl {
 
         b += "<h2>Top-selling / fast-moving parts</h2><div class='card'><form method='get' action='/reports' class='bar'><input type='hidden' name='idle' value='" + num(idle) + "'><label class='inline'>Window</label><select name='days'>";
         for (int d : {7, 30, 90, 365, 0}) b += "<option value='" + num(d) + "'" + (d == days ? " selected" : "") + ">" + (d ? "Last " + num(d) + " days" : std::string("All time")) + "</option>";
-        b += "</select><button class='sm sec' type='submit'>Update</button></form><table><thead><tr><th>#</th><th>ID</th><th>Part</th><th class='n'>Units sold</th><th class='n'>Units/day</th><th class='n'>Sales</th><th class='n'>Revenue</th></tr></thead><tbody>";
+        b += "</select><button class='sm sec' type='submit'>Update</button></form><table><thead><tr><th>#</th><th>Part number</th><th>Part</th><th class='n'>Units sold</th><th class='n'>Units/day</th><th class='n'>Sales</th><th class='n'>Revenue</th></tr></thead><tbody>";
         int rank = 0;
         for (const auto& t : reports::topSelling(moves, days, 15, now))
-            b += "<tr><td>" + num(++rank) + "</td><td>" + num(t.partId) + "</td><td>" + h(t.name) + "</td><td class='n'>" + num(t.unitsSold) + "</td><td class='n'>" + (days ? util::money(t.unitsPerDay) : "-") +
+            b += "<tr><td>" + num(++rank) + "</td><td>" + h(partLabelById(t.partId)) + "</td><td>" + h(t.name) + "</td><td class='n'>" + num(t.unitsSold) + "</td><td class='n'>" + (days ? util::money(t.unitsPerDay) : "-") +
                  "</td><td class='n'>" + num(t.saleCount) + "</td><td class='n'>" + php(t.revenue) + "</td></tr>";
         if (!rank) b += "<tr><td colspan='7' class='mut'>No sales recorded in this window.</td></tr>";
         b += "</tbody></table></div>";
 
         b += "<h2>Dead stock</h2><div class='card'><form method='get' action='/reports' class='bar'><input type='hidden' name='days' value='" + num(days) + "'><label class='inline'>No movement for at least</label>"
-             "<input name='idle' type='number' min='1' value='" + num(idle) + "' style='width:90px'> days <button class='sm sec' type='submit'>Update</button></form><table><thead><tr><th>ID</th><th>Part</th><th>System</th><th class='n'>In stock</th><th class='n'>Value tied up</th><th>Last movement</th><th class='n'>Days idle</th></tr></thead><tbody>";
+             "<input name='idle' type='number' min='1' value='" + num(idle) + "' style='width:90px'> days <button class='sm sec' type='submit'>Update</button></form><table><thead><tr><th>Part number</th><th>Part</th><th>System</th><th class='n'>In stock</th><th class='n'>Value tied up</th><th>Last movement</th><th class='n'>Days idle</th></tr></thead><tbody>";
         double tied = 0;
         const auto dead = reports::deadStock(inv.parts(), moves, idle, now);
         for (const auto& d : dead) {
             tied += d.stockValue;
-            b += "<tr><td>" + num(d.part->id()) + "</td><td>" + h(d.part->name()) + "</td><td>" + h(d.part->category()) + "</td><td class='n'>" + num(d.part->quantity()) + "</td><td class='n'>" + php(d.stockValue) +
+            b += "<tr><td>" + h(partLabel(*d.part)) + "</td><td>" + h(d.part->fullName()) + "</td><td>" + h(d.part->category()) + "</td><td class='n'>" + num(d.part->quantity()) + "</td><td class='n'>" + php(d.stockValue) +
                  "</td><td>" + h(d.lastMovement) + "</td><td class='n'>" + num(d.daysIdle) + "</td></tr>";
         }
         if (dead.empty()) b += "<tr><td colspan='7' class='mut'>Nothing has been idle that long. (Idle time is counted from each part's last logged movement.)</td></tr>";
         else b += "<tr><td colspan='4'><b>Total tied up</b></td><td class='n'><b>" + php(tied) + "</b></td><td colspan='2'></td></tr>";
         b += "</tbody></table></div>";
 
-        b += "<h2>Reorder list</h2><div class='card'><p class='noprint'><button class='sm' data-print>&#128424; Print</button></p><table><thead><tr><th>ID</th><th>Part</th><th>System</th><th class='n'>In stock</th><th class='n'>Minimum</th><th class='n'>Suggested order</th></tr></thead><tbody>";
+        b += "<h2>Reorder list</h2><div class='card'><p class='noprint'><button class='sm' data-print>&#128424; Print</button></p><table><thead><tr><th>Part number</th><th>Part</th><th>System</th><th class='n'>In stock</th><th class='n'>Minimum</th><th class='n'>Suggested order</th></tr></thead><tbody>";
         const auto re = reports::reorderList(inv.parts());
         for (const auto& r : re)
-            b += "<tr><td>" + num(r.part->id()) + "</td><td>" + h(r.part->name()) + "</td><td>" + h(r.part->category()) + "</td><td class='n'>" + num(r.part->quantity()) + "</td><td class='n'>" +
+            b += "<tr><td>" + h(partLabel(*r.part)) + "</td><td>" + h(r.part->fullName()) + "</td><td>" + h(r.part->category()) + "</td><td class='n'>" + num(r.part->quantity()) + "</td><td class='n'>" +
                  num(r.part->minStock()) + "</td><td class='n'><b>" + num(r.suggestedQty) + "</b></td></tr>";
         if (re.empty()) b += "<tr><td colspan='6' class='mut'>Every part is at or above its minimum.</td></tr>";
         b += "</tbody></table><p class='mut'>Suggested order = minimum stock &minus; current stock (brings the part back up to its minimum).</p></div>";
@@ -870,7 +981,7 @@ struct WebApp::Impl {
         std::string b = "<h1>Stock movement log</h1><p><a class='btn sec' href='/export/movements.csv'>Download CSV</a> <span class='mut'>Newest 500 shown.</span></p><div class='card'><table><thead><tr><th>Time</th><th>User</th><th>Part</th><th>Action</th>"
                         "<th class='n'>Change</th><th class='n'>Stock after</th><th class='n'>Unit price/cost</th><th>Ref</th></tr></thead><tbody>";
         for (const inv::Movement* m : inv.movements().recent(500))
-            b += "<tr><td>" + h(m->timestamp) + "</td><td>" + h(m->user) + "</td><td>" + num(m->partId) + " " + h(m->partName) + "</td><td>" + inv::moveName(m->type) + "</td><td class='n " +
+            b += "<tr><td>" + h(m->timestamp) + "</td><td>" + h(m->user) + "</td><td>" + (carriesLabel(m->partName, m->partId) ? std::string() : h(partLabelById(m->partId)) + " ") + h(m->partName) + "</td><td>" + inv::moveName(m->type) + "</td><td class='n " +
                  (m->qtyChanged < 0 ? "minus'>" : "plus'>+") + num(m->qtyChanged) + "</td><td class='n'>" + num(m->resultingStock) + "</td><td class='n'>" + util::money(m->unitPrice) + "</td><td>" + h(m->ref) + "</td></tr>";
         html(c, layout(c, "Movements", b + "</tbody></table></div>"));
     }

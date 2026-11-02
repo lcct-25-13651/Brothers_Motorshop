@@ -17,3 +17,12 @@ backups/
 *.tmp
 *.bak
 third_party/httplib.h
+
+*.before
+*.before_analytics
+*.bak
+*.exe
+users*.csv
+audit.csv
+parts_*.csv
+parts.csv.*

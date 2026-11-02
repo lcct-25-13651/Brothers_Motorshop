@@ -15,7 +15,7 @@ namespace inv {
 
 namespace {
 const char* kBom = "\xEF\xBB\xBF";
-const char* kPartsHeader = "PartID,Name,Category,Price,Quantity,MinStock,CostPrice,CompatibleModels";
+const char* kPartsHeader = "PartID,Name,Category,Price,Quantity,MinStock,CostPrice,CompatibleModels,PartNumber";
 const char* kInvoiceHeader = "invoice_no,timestamp,customer,username,line_type,part_id,description,qty,unit_price,amount_paid,payment_status";
 const char* kPaymentHeader = "timestamp,invoice_no,username,amount,method,balance_after,note";
 
@@ -30,7 +30,7 @@ std::string key(std::string s) {  // header-name normaliser: "Min Stock" -> "min
 std::string Part::toCsv() const {
     return std::to_string(id_) + ',' + util::csvEscape(name_) + ',' + util::csvEscape(category_) + ',' + util::money(price_) + ',' +
            std::to_string(quantity_) + ',' + std::to_string(minStock_) + ',' + util::money(costPrice_) + ',' +
-           util::csvEscape(compatibleModels_);
+           util::csvEscape(compatibleModels_) + ',' + util::csvEscape(partNumber_);
 }
 
 std::string Part::validate(int id, const std::string& name, const std::string& category, double price, int qty, int minStock) {
@@ -64,6 +64,7 @@ std::optional<Part> Part::fromCsv(const std::vector<std::string>& f) {
     double cost = 0;
     if (f.size() > 6 && util::parseDouble(f[6], 0, limits::kMaxPrice, cost)) part.setCostPrice(cost);  // optional columns
     if (f.size() > 7) part.setCompatibleModels(util::oneLine(util::trim(f[7])));
+    if (f.size() > 8) part.setPartNumber(util::oneLine(util::trim(f[8])));
     return part;
 }
 
@@ -341,6 +342,12 @@ const Part* Inventory::find(int id) const {
     for (const Part& p : parts_) if (p.id() == id) return &p;
     return nullptr;
 }
+const Part* Inventory::findByNumber(const std::string& number) const {
+    const std::string want = util::trim(number);
+    if (want.empty()) return nullptr;
+    for (const Part& p : parts_) if (util::equalsIgnoreCase(p.partNumber(), want)) return &p;
+    return nullptr;
+}
 Part* Inventory::mut(int id) {
     for (Part& p : parts_) if (p.id() == id) return &p;
     return nullptr;
@@ -364,10 +371,24 @@ void Inventory::load() {
             if (!find(p->id())) parts_.push_back(*p); else ++skipped;
         } else if (!util::equalsIgnoreCase(util::trim(f[0]), "PartID") && !util::equalsIgnoreCase(util::trim(f[0]), "ID")) ++skipped;
     }
+    int migrated = 0;
+    for (Part& p : parts_) {   // older data keeps the part number inside the name: "NAME [PN]" -> separate Part ID
+        if (!p.partNumber().empty()) continue;
+        const std::string n = p.name();
+        const size_t open = n.rfind(" ["), close = n.rfind(']');
+        if (open == std::string::npos || close == std::string::npos || close != n.size() - 1 || close < open + 3) continue;
+        const std::string pn = util::trim(n.substr(open + 2, close - open - 2)), rest = util::trim(n.substr(0, open));
+        if (pn.empty() || pn.size() > 40 || rest.empty() || findByNumber(pn)) continue;
+        p.setPartNumber(pn);
+        p.setName(rest);
+        ++migrated;
+    }
+    if (migrated > 0) fs::copy_file(file, file + ".before_partid", fs::copy_options::skip_existing, ec);
     if (skipped > 0) {  // keep an untouched copy before the next save rewrites the file
         fs::copy_file(file, file + ".bak", fs::copy_options::overwrite_existing, ec);
         warning_ = std::to_string(skipped) + " malformed row(s) in parts.csv were skipped (original kept as parts.csv.bak).";
     }
+    if (migrated > 0) save();   // writes the new PartNumber column
 }
 
 bool Inventory::save() {
@@ -379,7 +400,7 @@ bool Inventory::save() {
 
 void Inventory::log(const Part& p, MoveType t, int delta, double unitPrice, const std::string& actor, const std::string& ref) {
     Movement m;
-    m.timestamp = util::nowStamp(); m.user = actor; m.partId = p.id(); m.partName = p.name(); m.type = t;
+    m.timestamp = util::nowStamp(); m.user = actor; m.partId = p.id(); m.partName = p.fullName(); m.type = t;
     m.qtyChanged = delta; m.resultingStock = p.quantity(); m.unitPrice = unitPrice; m.ref = ref;
     if (!moves_.record(m)) warning_ = "movements.csv could not be written.";
 }
@@ -404,6 +425,8 @@ Result Inventory::addPart(const Part& p, const std::string& actor) {
     const std::string err = Part::validate(p.id(), p.name(), p.category(), p.price(), p.quantity(), p.minStock());
     if (!err.empty()) return Result::fail(err);
     if (find(p.id())) return Result::fail("A part with ID " + std::to_string(p.id()) + " already exists.");
+    if (p.partNumber().size() > 40) return Result::fail("Part ID is too long (max 40 characters).");
+    if (const Part* dup = findByNumber(p.partNumber())) return Result::fail("Part ID " + p.partNumber() + " is already used by " + dup->fullName() + ".");
     if (p.compatibleModels().size() > kMaxModelsText) return Result::fail("Compatible models text is too long (max " + std::to_string(kMaxModelsText) + " characters).");
     warning_.clear();
     parts_.push_back(p);
@@ -413,15 +436,23 @@ Result Inventory::addPart(const Part& p, const std::string& actor) {
 }
 
 Result Inventory::updatePart(int id, const std::string& name, const std::string& category, double price, int minStock, const std::string& actor,
-                             const std::optional<std::string>& models) {
+                             const std::optional<std::string>& models, const std::optional<std::string>& partNumber) {
     (void)actor;
     Part* cur = mut(id);
     if (!cur) return Result::fail("Part not found.");
     const std::string err = Part::validate(id, name, category, price, cur->quantity(), minStock);
     if (!err.empty()) return Result::fail(err);
     if (models && models->size() > kMaxModelsText) return Result::fail("Compatible models text is too long (max " + std::to_string(kMaxModelsText) + " characters).");
+    std::string pn;
+    if (partNumber) {
+        pn = util::oneLine(util::trim(*partNumber));
+        if (pn.size() > 40) return Result::fail("Part ID is too long (max 40 characters).");
+        const Part* dup = findByNumber(pn);
+        if (dup && dup->id() != id) return Result::fail("Part ID " + pn + " is already used by " + dup->fullName() + ".");
+    }
     const Part old = *cur;
     warning_.clear();
+    if (partNumber) cur->setPartNumber(pn);
     cur->setName(name); cur->setCategory(category); cur->setPrice(price); cur->setMinStock(minStock);
     if (models) cur->setCompatibleModels(util::oneLine(util::trim(*models)));
     if (!save()) { *cur = old; return Result::fail(warning_); }
@@ -488,7 +519,7 @@ CheckoutResult Inventory::checkout(const std::string& customerIn, const std::vec
             const Part* p = find(l.partId);
             if (!p) return fail("Part " + std::to_string(l.partId) + " does not exist.");
             need[l.partId] += l.qty;
-            line.description = p->name();
+            line.description = p->fullName();
             line.unitPrice = p->price();  // catalogue price - never taken from the request
         } else {
             line.description = util::oneLine(util::trim(l.description));
@@ -501,7 +532,7 @@ CheckoutResult Inventory::checkout(const std::string& customerIn, const std::vec
     for (const auto& n : need) {
         const Part* p = find(n.first);
         if (n.second > p->quantity())
-            return fail("Not enough stock for \"" + p->name() + "\": " + std::to_string(p->quantity()) + " available, " + std::to_string(n.second) + " requested.");
+            return fail("Not enough stock for \"" + p->fullName() + "\": " + std::to_string(p->quantity()) + " available, " + std::to_string(n.second) + " requested.");
     }
 
     // Payment at the till: negative = in full. Less than the bill = credit sale, which needs a named customer.
@@ -606,7 +637,7 @@ ImportSummary Inventory::importCsv(const std::string& text, const std::string& a
     if (rows.empty()) { sum.problems.push_back("The file is empty."); return sum; }
 
     // Column positions: by header name when a header row is present, otherwise parts.csv order.
-    int cId = 0, cName = 1, cCat = 2, cPrice = 3, cQty = 4, cMin = 5, cCost = -1, cModels = -1;
+    int cId = 0, cName = 1, cCat = 2, cPrice = 3, cQty = 4, cMin = 5, cCost = -1, cModels = -1, cPN = -1;
     size_t first = 0;
     long long dummy;
     if (!util::parseInt(rows[0][0], 0, limits::kMaxId, dummy)) {
@@ -621,6 +652,7 @@ ImportSummary Inventory::importCsv(const std::string& text, const std::string& a
             else if (k == "quantity" || k == "qty" || k == "stock" || k == "stocklevel") cQty = c;
             else if (k == "minstock" || k == "min" || k == "minimum" || k == "reorderlevel") cMin = c;
             else if (k == "unitcost" || k == "cost") cCost = c;
+            else if (k == "partnumber" || k == "partno" || k == "partcode") cPN = c;
             else if (k == "compatiblemodels" || k == "models" || k == "compatible" || k == "vehiclemodels") cModels = c;
         }
         first = 1;
@@ -661,6 +693,11 @@ ImportSummary Inventory::importCsv(const std::string& text, const std::string& a
             if (models.size() > kMaxModelsText) { sum.problems.push_back(where + "compatible models text is too long."); ++sum.skipped; continue; }
             p.setCompatibleModels(models);
         }
+        if (!cell(r, cPN).empty()) {
+            const std::string pn = util::oneLine(cell(r, cPN));
+            if (pn.size() > 40) { sum.problems.push_back(where + "part number is too long."); ++sum.skipped; continue; }
+            p.setPartNumber(pn);
+        }
         const int delta = static_cast<int>(qty) - (cur ? cur->quantity() : 0);
         p.setQuantity(static_cast<int>(qty));
         const std::string err = Part::validate(p.id(), p.name(), p.category(), p.price(), p.quantity(), p.minStock());
@@ -675,8 +712,8 @@ ImportSummary Inventory::importCsv(const std::string& text, const std::string& a
         } else {
             Part* c = mut(o.part.id());
             const bool changed = c->name() != o.part.name() || c->category() != o.part.category() || c->price() != o.part.price() ||
-                                 c->minStock() != o.part.minStock() || c->compatibleModels() != o.part.compatibleModels() || o.delta != 0;
-            if (c->price() != o.part.price()) sum.priceChanges.push_back({c->id(), c->name(), c->price(), o.part.price()});
+                                 c->minStock() != o.part.minStock() || c->compatibleModels() != o.part.compatibleModels() || c->partNumber() != o.part.partNumber() || o.delta != 0;
+            if (c->price() != o.part.price()) sum.priceChanges.push_back({c->id(), c->fullName(), c->price(), o.part.price()});
             *c = o.part;
             if (changed) ++sum.updated; else ++sum.unchanged;
         }
@@ -702,7 +739,7 @@ std::string Inventory::partsCsv() const {
     for (const Part& p : parts_)
         out += std::to_string(p.id()) + ',' + util::csvSafe(p.name()) + ',' + util::csvSafe(p.category()) + ',' + util::money(p.price()) + ',' +
                std::to_string(p.quantity()) + ',' + std::to_string(p.minStock()) + ',' + util::money(p.costPrice()) + ',' +
-               util::csvSafe(p.compatibleModels()) + "\r\n";
+               util::csvSafe(p.compatibleModels()) + ',' + util::csvSafe(p.partNumber()) + "\r\n";
     return out;
 }
 

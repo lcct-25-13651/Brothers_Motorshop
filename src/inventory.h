@@ -29,6 +29,10 @@ public:
     int minStock() const { return minStock_; }
     double costPrice() const { return costPrice_; }                     // what one unit costs the shop (0 = unknown)
     const std::string& compatibleModels() const { return compatibleModels_; }
+    // "PART-NO - NAME": the complete label (part number first, then description) used wherever a part is shown or recorded by name,
+    // so two parts with the same description stay distinguishable.
+    std::string fullName() const { return partNumber_.empty() ? name_ : partNumber_ + " - " + name_; }
+    const std::string& partNumber() const { return partNumber_; }       // the real part number (shown as "Part ID"); id() stays the internal key
     // compatible_models split into individual vehicle models ("Bajaj RE 4S; Bajaj RE Compact" -> 2 entries).
     // Separators: comma, semicolon, pipe (a slash is NOT one, so "RE 4S/6S" stays a single model). Blanks and duplicates dropped.
     std::vector<std::string> modelList() const;
@@ -43,6 +47,7 @@ public:
     void setMinStock(int v) { minStock_ = v; }
     void setCostPrice(double v) { costPrice_ = v; }
     void setCompatibleModels(const std::string& v) { compatibleModels_ = v; }
+    void setPartNumber(const std::string& v) { partNumber_ = v; }
 
     std::string toCsv() const;
     static std::optional<Part> fromCsv(const std::vector<std::string>& fields);  // 8-col, 6-col or legacy 4-col
@@ -56,6 +61,7 @@ private:
     int quantity_ = 0, minStock_ = 0;
     double costPrice_ = 0.0;
     std::string compatibleModels_;
+    std::string partNumber_;
 };
 
 // Vehicle systems offered in drop-downs (data may contain others; they are listed too).
@@ -212,6 +218,7 @@ public:
 
     const std::vector<Part>& parts() const { return parts_; }
     const Part* find(int id) const;
+    const Part* findByNumber(const std::string& number) const;   // case-insensitive match on the part number (Part ID)
     const MovementLog& movements() const { return moves_; }
     const InvoiceBook& invoices() const { return invoices_; }
     const PaymentLog& payments() const { return payments_; }
@@ -221,7 +228,8 @@ public:
     Result addPart(const Part& p, const std::string& actor);
     // models == nullopt keeps the part's compatible_models unchanged.
     Result updatePart(int id, const std::string& name, const std::string& category, double price, int minStock, const std::string& actor,
-                      const std::optional<std::string>& models = std::nullopt);
+                      const std::optional<std::string>& models = std::nullopt,
+                      const std::optional<std::string>& partNumber = std::nullopt);
     Result removePart(int id, const std::string& actor);                       // logs DELETE
     Result restock(int id, int qty, double unitCost, const std::string& actor, const std::string& ref = "");
     Result adjust(int id, long long delta, const std::string& actor, const std::string& ref = "");  // ADJUSTMENT

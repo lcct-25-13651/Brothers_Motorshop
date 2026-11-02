@@ -22,6 +22,7 @@
 #include "httplib.h"
 #include "reports.h"
 #include "util.h"
+#include "login_bg_asset.h"
 #include "logo_asset.h"
 #include "web_assets.h"
 
@@ -156,6 +157,7 @@ struct WebApp::Impl {
         add("GET", "/static/app.css", &Impl::cssFile, std::nullopt, true);
         add("GET", "/static/app.js", &Impl::jsFile, std::nullopt, true);
         add("GET", "/static/logo.png", &Impl::logoFile, std::nullopt, true);
+        add("GET", "/static/login-bg.jpg", &Impl::loginBgFile, std::nullopt, true);
         add("GET", "/login", &Impl::loginPage, std::nullopt, true);
         add("POST", "/login", &Impl::doLogin, std::nullopt, true);
         add("GET", "/setup", &Impl::setupPage, std::nullopt, true);
@@ -207,6 +209,7 @@ struct WebApp::Impl {
     }
     void cssFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=3600"); c.res.set_content(kCss, "text/css; charset=utf-8"); }
     void logoFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=86400"); c.res.set_content(std::string(reinterpret_cast<const char*>(kLogoPng), kLogoPngSize), "image/png"); }
+    void loginBgFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=86400"); c.res.set_content(std::string(reinterpret_cast<const char*>(kLoginBgJpg), kLoginBgJpgSize), "image/jpeg"); }
     void jsFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=3600"); c.res.set_content(kJs, "application/javascript; charset=utf-8"); }
 
     static std::string tokenField(const Ctx& c) { return "<input type='hidden' name='csrf' value='" + h(c.sess ? c.sess->csrf : "") + "'>"; }

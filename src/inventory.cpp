@@ -30,7 +30,7 @@ std::string key(std::string s) {  // header-name normaliser: "Min Stock" -> "min
 std::string Part::toCsv() const {
     return std::to_string(id_) + ',' + util::csvEscape(name_) + ',' + util::csvEscape(category_) + ',' + util::money(price_) + ',' +
            std::to_string(quantity_) + ',' + std::to_string(minStock_) + ',' + util::money(costPrice_) + ',' +
-           util::csvEscape(compatibleModels_) + ',' + util::csvEscape(partNumber_);
+           util::csvEscape(compatibleModels_) + ',' + util::csvEscape(partNumber_) + ',' + std::to_string(supplierId_);
 }
 
 std::string Part::validate(int id, const std::string& name, const std::string& category, double price, int qty, int minStock) {
@@ -65,6 +65,7 @@ std::optional<Part> Part::fromCsv(const std::vector<std::string>& f) {
     if (f.size() > 6 && util::parseDouble(f[6], 0, limits::kMaxPrice, cost)) part.setCostPrice(cost);  // optional columns
     if (f.size() > 7) part.setCompatibleModels(util::oneLine(util::trim(f[7])));
     if (f.size() > 8) part.setPartNumber(util::oneLine(util::trim(f[8])));
+    if (f.size() > 9) { long long sid = 0; if (util::parseInt(f[9], 0, 999999, sid)) part.setSupplierId(static_cast<int>(sid)); }
     return part;
 }
 
@@ -392,7 +393,7 @@ void Inventory::load() {
 }
 
 bool Inventory::save() {
-    std::string out = std::string(kPartsHeader) + "\n";
+    std::string out = std::string(kPartsHeader) + ",SupplierID\n";
     for (const Part& p : parts_) out += p.toCsv() + "\n";
     if (!util::writeFileAtomic(path("parts.csv"), out)) { warning_ = "Could not write parts.csv - check disk space/permissions."; return false; }
     return true;
@@ -484,6 +485,21 @@ Result Inventory::restock(int id, int qty, double unitCost, const std::string& a
     if (!save()) { p->setQuantity(p->quantity() - qty); return Result::fail(warning_); }
     log(*p, MoveType::Restock, qty, unitCost, actor, ref);
     return Result::success("Stock added.");
+}
+
+Result Inventory::setSourcing(int id, int supplierId, std::optional<double> costPrice, const std::string& actor) {
+    (void)actor;
+    Part* p = mut(id);
+    if (!p) return Result::fail("Part not found.");
+    if (supplierId < 0 || supplierId > limits::kMaxId) return Result::fail("Invalid supplier.");
+    if (costPrice && !(*costPrice >= 0 && *costPrice <= limits::kMaxPrice)) return Result::fail("Cost price is out of range.");
+    warning_.clear();
+    const int oldS = p->supplierId();
+    const double oldC = p->costPrice();
+    p->setSupplierId(supplierId);
+    if (costPrice) p->setCostPrice(util::round2(*costPrice));
+    if (!save()) { p->setSupplierId(oldS); p->setCostPrice(oldC); return Result::fail(warning_); }
+    return Result::success("Supplier details updated.");
 }
 
 Result Inventory::adjust(int id, long long delta, const std::string& actor, const std::string& ref) {

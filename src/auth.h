@@ -30,7 +30,8 @@ enum class Permission {
     ExportData,     // Admin
     ImportData,     // Admin
     RunBackup,      // Admin
-    ManageUsers     // Admin
+    ManageUsers,    // Admin
+    ManageSuppliers // Admin (suppliers, purchase prices, margins)
 };
 
 // The single place that decides what each role may do.

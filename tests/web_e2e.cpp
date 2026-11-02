@@ -30,6 +30,15 @@ int main() {
     // XSS escaping
     r = s.call("POST", "/add", {{"csrf",csrf},{"id","500"},{"name","<script>alert(1)</script>"},{"category","Engine"},{"price","10"},{"qty","3"},{"min","1"}}, ck); CHECK(r.status == 303);
     r = s.call("GET", "/", {}, ck); CHECK(!has(r.body, "<script>alert") && has(r.body, "&lt;script&gt;"));
+    // p2supplier: suppliers, purchase history, supplier cost vs retail (margin)
+    r = s.call("POST", "/suppliers/save", {{"csrf",csrf},{"id","0"},{"name","Bajaj Parts Depot"},{"phone","0917"}}, ck); CHECK(has(r.headers["Location"], "ok"));
+    r = s.call("GET", "/suppliers", {}, ck); CHECK(r.status == 200 && has(r.body, "Bajaj Parts Depot"));
+    r = s.call("POST", "/suppliers/save", {{"csrf",csrf},{"id","0"},{"name","bajaj PARTS depot"}}, ck); CHECK(has(r.headers["Location"], "err"));   // duplicate name
+    r = s.call("POST", "/stock", {{"csrf",csrf},{"id","101"},{"action","restock"},{"qty","2"},{"cost","100"},{"supplier","1"},{"setcost","1"}}, ck); CHECK(has(r.headers["Location"], "ok"));
+    r = s.call("GET", "/", {}, ck); CHECK(has(r.body, "Margin</th>") && has(r.body, "Bajaj Parts Depot") && has(r.body, "&#8369;100.00"));
+    r = s.call("GET", "/suppliers", {{"view","1"}}, ck); CHECK(has(r.body, "Purchase history") && has(r.body, "Engine Oil 1L"));
+    r = s.call("POST", "/suppliers/toggle", {{"csrf",csrf},{"id","1"},{"on","0"}}, ck); CHECK(has(r.headers["Location"], "ok"));
+    r = s.call("POST", "/suppliers/toggle", {{"csrf",csrf},{"id","1"},{"on","1"}}, ck); CHECK(has(r.headers["Location"], "ok"));
     // price edit -> audit
     r = s.call("POST", "/edit", {{"csrf",csrf},{"id","101"},{"name","Engine Oil 1L"},{"category","Engine"},{"price","499.5"},{"min","8"}}, ck); CHECK(has(r.headers["Location"], "ok"));
     // p1alert: low-stock banner + sidebar counter appear when a part is below its minimum
@@ -40,6 +49,8 @@ int main() {
     auto lj = s.call("POST", "/login", {{"username","juan"},{"password","juanpass1"}});
     std::string ck2 = lj.headers["Set-Cookie"].substr(0, lj.headers["Set-Cookie"].find(';'));
     r = s.call("GET", "/", {}, ck2); CHECK(r.status == 200 && !has(r.body, "btn sm danger") && !has(r.body, ">Reports<") && has(r.body, ">Sell<"));
+    CHECK(!has(r.body, "Margin</th>") && !has(r.body, "Suppliers</a>"));   // p2supplier: Staff see no costs or margins
+    r = s.call("GET", "/suppliers", {}, ck2); CHECK(r.status == 403);
     std::string csrf2 = csrfOf(r.body);
     CHECK(s.call("GET", "/reports", {}, ck2).status == 403);
     CHECK(s.call("GET", "/users", {}, ck2).status == 403);

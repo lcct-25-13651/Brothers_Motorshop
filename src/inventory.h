@@ -29,6 +29,7 @@ public:
     int minStock() const { return minStock_; }
     double costPrice() const { return costPrice_; }                     // what one unit costs the shop (0 = unknown)
     const std::string& compatibleModels() const { return compatibleModels_; }
+    int supplierId() const { return supplierId_; }                      // 0 = no supplier recorded
     // "PART-NO - NAME": the complete label (part number first, then description) used wherever a part is shown or recorded by name,
     // so two parts with the same description stay distinguishable.
     std::string fullName() const { return partNumber_.empty() ? name_ : partNumber_ + " - " + name_; }
@@ -48,6 +49,7 @@ public:
     void setCostPrice(double v) { costPrice_ = v; }
     void setCompatibleModels(const std::string& v) { compatibleModels_ = v; }
     void setPartNumber(const std::string& v) { partNumber_ = v; }
+    void setSupplierId(int v) { supplierId_ = v; }
 
     std::string toCsv() const;
     static std::optional<Part> fromCsv(const std::vector<std::string>& fields);  // 8-col, 6-col or legacy 4-col
@@ -62,6 +64,7 @@ private:
     double costPrice_ = 0.0;
     std::string compatibleModels_;
     std::string partNumber_;
+    int supplierId_ = 0;
 };
 
 // Vehicle systems offered in drop-downs (data may contain others; they are listed too).
@@ -231,6 +234,8 @@ public:
                       const std::optional<std::string>& models = std::nullopt,
                       const std::optional<std::string>& partNumber = std::nullopt);
     Result removePart(int id, const std::string& actor);                       // logs DELETE
+    // Phase 2: sets the part's supplier (0 = none) and, if given, its cost price (what the shop pays). Saves parts.csv.
+    Result setSourcing(int id, int supplierId, std::optional<double> costPrice, const std::string& actor);
     Result restock(int id, int qty, double unitCost, const std::string& actor, const std::string& ref = "");
     Result adjust(int id, long long delta, const std::string& actor, const std::string& ref = "");  // ADJUSTMENT
 

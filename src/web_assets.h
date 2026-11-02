@@ -128,14 +128,14 @@ body.auth .auth-wrap{position:relative;z-index:1}
 @media (max-width:480px){body.auth{padding:1rem;align-items:flex-start;padding-top:8vh}body.auth .auth-card{padding:1.5rem 1.25rem 1.25rem}}
 @media (prefers-reduced-motion:reduce){body.auth .auth-card,body.auth .auth-logo,body.auth .auth-logo::before,body.auth .auth-logo::after,body.auth .gear,body.auth .gear-sm,body.auth .bg-orb,body.auth .bg-gear{animation:none!important}body.auth *{transition:none!important}}
 /* ---- login: shop artwork as the background on the left, sign-in box on the right ---- */
-body.auth{background:#d4ebfb url(/static/login-bg.jpg) left center/cover no-repeat fixed;justify-content:flex-end;
+body.auth{background:#3f8fd2 url(/static/login-bg.jpg) left center/cover no-repeat fixed;justify-content:flex-end;
 padding:1.5rem clamp(1.2rem,6vw,7rem)}
 body.auth::before,body.auth .bg-orb,body.auth .bg-gear{display:none}
 body.auth .auth-card{background:rgba(255,255,255,.94);border:1px solid rgba(255,255,255,.9);border-radius:20px;
-box-shadow:0 24px 48px -16px rgba(23,64,127,.45),0 6px 14px -6px rgba(23,64,127,.25);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+box-shadow:0 28px 56px -14px rgba(5,30,80,.65),0 8px 18px -6px rgba(5,30,80,.4);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
 body.auth .auth-logo{box-shadow:0 8px 18px -4px rgba(23,64,127,.45)}
-body.auth .auth-foot{color:#4b6685}
-@media (max-width:899px){body.auth{justify-content:center;background:linear-gradient(rgba(255,255,255,.6),rgba(255,255,255,.6)),#d4ebfb url(/static/login-bg.jpg) 36% center/cover no-repeat fixed}}
+body.auth .auth-foot{color:#eaf3ff;text-shadow:0 1px 3px rgba(5,30,80,.7)}
+@media (max-width:899px){body.auth{justify-content:center;background:linear-gradient(rgba(10,40,90,.2),rgba(10,40,90,.2)),#3f8fd2 url(/static/login-bg.jpg) 36% center/cover no-repeat fixed}}
 /* ---- left sidebar navigation (wide screens); narrow screens keep the top bar ---- */
 @media(min-width:900px){
 header.top{position:fixed;top:0;left:0;bottom:0;width:230px;flex-direction:column;flex-wrap:nowrap;align-items:stretch;gap:.6rem;padding:1rem .8rem;overflow-y:auto;z-index:20}

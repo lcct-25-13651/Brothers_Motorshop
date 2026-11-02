@@ -124,6 +124,18 @@ body.auth .auth-wrap{position:relative;z-index:1}
 @keyframes auth-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 @media (max-width:480px){body.auth{padding:1rem;align-items:flex-start;padding-top:8vh}body.auth .auth-card{padding:1.5rem 1.25rem 1.25rem}}
 @media (prefers-reduced-motion:reduce){body.auth .auth-card,body.auth .auth-logo,body.auth .auth-logo::before,body.auth .auth-logo::after,body.auth .gear,body.auth .gear-sm,body.auth .bg-orb,body.auth .bg-gear{animation:none!important}body.auth *{transition:none!important}}
+/* ---- left sidebar navigation (wide screens); narrow screens keep the top bar ---- */
+@media(min-width:900px){
+header.top{position:fixed;top:0;left:0;bottom:0;width:230px;flex-direction:column;flex-wrap:nowrap;align-items:stretch;gap:.6rem;padding:1rem .8rem;overflow-y:auto;z-index:20}
+header.top .brand{margin:0 0 .6rem;padding:.2rem .4rem;font-size:1.1rem}
+header.top nav{flex-direction:column;flex-wrap:nowrap;flex:1 1 auto;gap:.15rem}
+header.top nav a{padding:.55rem .8rem}
+header.top #clock{display:block;text-align:center;white-space:normal;border-radius:10px;font-size:.8rem;padding:.45rem .6rem}
+header.top form{flex-direction:column;align-items:stretch;gap:.5rem}
+header.top form a{display:block}header.top form .chip{display:block;text-align:center}
+header.top form button{width:100%}
+main{margin:1.2rem 0 1.2rem 230px;max-width:1400px;padding:0 1.6rem}
+}
 .an-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:.4rem 1rem}.an-head h2{margin:1.2rem 0 .6rem}
 .an-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:0 1rem}.an-grid h3{font-size:.95rem;margin:0 0 .5rem}.an-grid td{padding:.35rem .5rem}
 #clock{white-space:nowrap;font-variant-numeric:tabular-nums}
@@ -221,7 +233,7 @@ inline constexpr const char* kJs = R"JS(
   // ---- CSV import: load the chosen file into the text box (it is then posted with the form) ----
   var f = document.getElementById('csvfile'), t = document.getElementById('csvtext');
   if (f && t) f.addEventListener('change', function () {
-    if (f.files[0]) f.files[0].text().then(function (s) { t.value = s; });
+    if (f.files[0]) f.files[0].text().then(function (s) { t.value = s; if (window.confirm('Import ' + f.files[0].name + ' now?')) t.form.submit(); });
   });
   // ---- print buttons and confirm dialogs (no inline handlers: the CSP forbids them) ----
   Array.prototype.forEach.call(document.querySelectorAll('[data-print]'), function (b) {

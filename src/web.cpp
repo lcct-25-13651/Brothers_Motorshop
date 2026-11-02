@@ -178,6 +178,7 @@ struct WebApp::Impl {
         add("POST", "/payment", &Impl::doPayment, P::Receivables);
         add("GET", "/cash-report", &Impl::cashReportPage, P::CashReport);
         add("GET", "/reports", &Impl::reportsPage, P::ViewReports);
+        add("GET", "/analytics.pdf", &Impl::analyticsPdf, P::ViewReports);
         add("GET", "/movements", &Impl::movementsPage, P::ViewReports);
         add("GET", "/audit", &Impl::auditPage, P::ViewAudit);
         add("GET", "/data", &Impl::dataPage, P::ExportData);
@@ -421,7 +422,7 @@ struct WebApp::Impl {
         for (const auto& d : dead) deadValue += d.stockValue;
 
         std::string b = "<div class='an-head'><h2>Analytics</h2><span class='mut'>As of " + h(util::formatTime(now, "%A, %B %d, %Y, %I:%M %p")) +
-                        " &middot; <a href='/reports'>Full reports</a> &middot; <button class='sm sec noprint' data-print>Print</button></span></div><div class='stats'>"
+                        " &middot; <a href='/reports'>Full reports</a> &middot; <a class='btn sm sec noprint' href='/analytics.pdf'>Download PDF</a></span></div><div class='stats'>"
                         "<div class='stat'><span>Sales today</span><b>" + php(today) + "</b></div>"
                         "<div class='stat'><span>This week</span><b>" + php(week) + "</b></div>"
                         "<div class='stat'><span>This month</span><b>" + php(month) + "</b></div>"
@@ -468,6 +469,126 @@ struct WebApp::Impl {
         if (re.empty()) b += "<tr><td class='mut'>Every part is at or above its minimum.</td></tr>";
         b += "</tbody></table></div></div>";
         return b;
+    }
+
+    // ------------------------------------------------------------------ analytics PDF (downloads automatically; tiny built-in PDF writer, no libraries)
+    static std::string pdfEsc(const std::string& s) {
+        std::string o;
+        for (unsigned char ch : s) {
+            if (ch < 32 || ch > 126) o += '?';
+            else if (ch == '(' || ch == ')' || ch == '\\') { o += '\\'; o += static_cast<char>(ch); }
+            else o += static_cast<char>(ch);
+        }
+        return o;
+    }
+    static std::string pad10(size_t v) { std::string s = std::to_string(v); return std::string(10 - std::min<size_t>(10, s.size()), '0') + s; }
+    // Lines starting with '#' are printed in bold. Courier 9 pt, A4, 60 lines per page.
+    static std::string buildPdf(const std::vector<std::string>& lines) {
+        const size_t perPage = 60;
+        const size_t pages = lines.empty() ? 1 : (lines.size() + perPage - 1) / perPage;
+        std::vector<std::string> obj;   // obj[i] = object number i + 1
+        obj.push_back("<< /Type /Catalog /Pages 2 0 R >>");
+        std::string kids;
+        for (size_t p = 0; p < pages; ++p) kids += std::to_string(5 + p * 2) + " 0 R ";
+        obj.push_back("<< /Type /Pages /Kids [" + kids + "] /Count " + std::to_string(pages) + " >>");
+        obj.push_back("<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>");
+        obj.push_back("<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Bold /Encoding /WinAnsiEncoding >>");
+        for (size_t p = 0; p < pages; ++p) {
+            std::string s = "BT\n/F1 9 Tf\n12 TL\n40 806 Td\n";
+            for (size_t i = p * perPage; i < lines.size() && i < (p + 1) * perPage; ++i) {
+                if (!lines[i].empty() && lines[i][0] == '#') s += "/F2 9 Tf\n(" + pdfEsc(lines[i].substr(1)) + ") '\n/F1 9 Tf\n";
+                else s += "(" + pdfEsc(lines[i]) + ") '\n";
+            }
+            s += "ET\nBT\n/F1 8 Tf\n40 28 Td\n(Page " + std::to_string(p + 1) + " of " + std::to_string(pages) + ") Tj\nET\n";
+            obj.push_back("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents " + std::to_string(6 + p * 2) + " 0 R >>");
+            obj.push_back("<< /Length " + std::to_string(s.size()) + " >>\nstream\n" + s + "endstream");
+        }
+        std::string out = "%PDF-1.4\n";
+        std::vector<size_t> off;
+        for (size_t i = 0; i < obj.size(); ++i) {
+            off.push_back(out.size());
+            out += std::to_string(i + 1) + " 0 obj\n" + obj[i] + "\nendobj\n";
+        }
+        const size_t xref = out.size();
+        out += "xref\n0 " + std::to_string(obj.size() + 1) + "\n0000000000 65535 f \n";
+        for (size_t o : off) out += pad10(o) + " 00000 n \n";
+        out += "trailer\n<< /Size " + std::to_string(obj.size() + 1) + " /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+        return out;
+    }
+    static std::string padR(std::string s, size_t w) { if (s.size() > w) s = s.substr(0, w); return s + std::string(w - s.size(), ' '); }
+    static std::string padL(std::string s, size_t w) { if (s.size() > w) s = s.substr(0, w); return std::string(w - s.size(), ' ') + s; }
+
+    void analyticsPdf(Ctx& c) {
+        const std::time_t now = std::time(nullptr);
+        const auto& moves = inv.movements().all();
+        const auto& invoices = inv.invoices().all();
+        std::vector<std::string> L;
+        L.push_back("#" + cfg.shopName + " - Analytics Report");
+        L.push_back("Generated: " + util::formatTime(now, "%A, %B %d, %Y, %I:%M %p") + "   Prepared by: " + c.user());
+        L.push_back("All amounts in PHP.");
+        L.push_back("");
+        long long units = 0;
+        double value = 0;
+        int low = 0;
+        for (const inv::Part& p : inv.parts()) { units += p.quantity(); value += p.stockValue(); low += p.isLowStock(); }
+        L.push_back("#SUMMARY");
+        L.push_back("Parts: " + num(static_cast<long long>(inv.parts().size())) + "    Units in stock: " + num(units) + "    Below minimum: " + num(low));
+        L.push_back("Stock value: " + util::moneyFmt(value) + "    Utang outstanding: " + util::moneyFmt(reports::totalReceivable(invoices)));
+        L.push_back("");
+        auto period = [&](const std::string& title, reports::Period per, int count) {
+            L.push_back("#" + title);
+            L.push_back(padR("Period", 22) + padL("Parts", 14) + padL("Services", 14) + padL("Revenue", 14) + padL("Expenses", 14) + padL("Net", 14));
+            const auto rows = reports::revenueByPeriod(moves, invoices, per, count, now);
+            for (size_t i = rows.size(); i-- > 0;)
+                L.push_back(padR(rows[i].label, 22) + padL(util::moneyFmt(rows[i].partsRevenue), 14) + padL(util::moneyFmt(rows[i].serviceRevenue), 14) +
+                            padL(util::moneyFmt(rows[i].revenue()), 14) + padL(util::moneyFmt(rows[i].expenses), 14) + padL(util::moneyFmt(rows[i].net()), 14));
+            L.push_back("");
+        };
+        period("REVENUE - LAST 7 DAYS", reports::Period::Daily, 7);
+        period("REVENUE - LAST 8 WEEKS", reports::Period::Weekly, 8);
+        period("REVENUE - LAST 6 MONTHS", reports::Period::Monthly, 6);
+
+        L.push_back("#TOP 10 SELLERS - LAST 30 DAYS");
+        L.push_back(padR("#", 4) + padR("ID", 10) + padR("Part", 44) + padL("Units", 10) + padL("Revenue", 16));
+        int rank = 0;
+        for (const auto& t : reports::topSelling(moves, 30, 10, now))
+            L.push_back(padR(num(++rank), 4) + padR(num(t.partId), 10) + padR(t.name, 44) + padL(num(t.unitsSold), 10) + padL(util::moneyFmt(t.revenue), 16));
+        if (!rank) L.push_back("No sales recorded in this period.");
+        L.push_back("");
+
+        L.push_back("#STOCK VALUE BY SYSTEM");
+        L.push_back(padR("System", 40) + padL("Units", 12) + padL("Stock value", 20));
+        std::map<std::string, std::pair<long long, double>> bySys;
+        for (const inv::Part& p : inv.parts()) { auto& e = bySys[p.category()]; e.first += p.quantity(); e.second += p.stockValue(); }
+        for (const auto& kv : bySys) L.push_back(padR(kv.first, 40) + padL(num(kv.second.first), 12) + padL(util::moneyFmt(kv.second.second), 20));
+        L.push_back("");
+
+        const auto re = reports::reorderList(inv.parts());
+        L.push_back("#REORDER LIST (" + num(static_cast<long long>(re.size())) + " below minimum)");
+        L.push_back(padR("ID", 10) + padR("Part", 44) + padL("In stock", 12) + padL("Minimum", 12) + padL("Order", 10));
+        size_t shown = 0;
+        for (const auto& r : re) {
+            if (++shown > 40) { L.push_back("... and " + num(static_cast<long long>(re.size() - 40)) + " more (see Reports page)"); break; }
+            L.push_back(padR(num(r.part->id()), 10) + padR(r.part->name(), 44) + padL(num(r.part->quantity()), 12) + padL(num(r.part->minStock()), 12) + padL(num(r.suggestedQty), 10));
+        }
+        if (re.empty()) L.push_back("Every part is at or above its minimum.");
+        L.push_back("");
+
+        const auto dead = reports::deadStock(inv.parts(), moves, 30, now);
+        double tied = 0;
+        for (const auto& d : dead) tied += d.stockValue;
+        L.push_back("#DEAD STOCK - NO MOVEMENT FOR 30+ DAYS (" + num(static_cast<long long>(dead.size())) + " parts, " + util::moneyFmt(tied) + " tied up)");
+        L.push_back(padR("ID", 10) + padR("Part", 44) + padL("In stock", 12) + padL("Value", 16) + padL("Days idle", 10));
+        shown = 0;
+        for (const auto& d : dead) {
+            if (++shown > 15) { L.push_back("... and " + num(static_cast<long long>(dead.size() - 15)) + " more (see Reports page)"); break; }
+            L.push_back(padR(num(d.part->id()), 10) + padR(d.part->name(), 44) + padL(num(d.part->quantity()), 12) + padL(util::moneyFmt(d.stockValue), 16) + padL(num(d.daysIdle), 10));
+        }
+        if (dead.empty()) L.push_back("Nothing has been idle that long.");
+
+        audit.record(c.user(), "REPORT_DOWNLOAD", "analytics PDF", c.ip);
+        c.res.set_header("Content-Disposition", "attachment; filename=\"analytics_" + util::formatTime(now, "%Y%m%d_%H%M") + ".pdf\"");
+        c.res.set_content(buildPdf(L), "application/pdf");
     }
 
     void dashboard(Ctx& c) {

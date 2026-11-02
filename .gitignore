@@ -26,3 +26,13 @@ users*.csv
 audit.csv
 parts_*.csv
 parts.csv.*
+
+*.before
+*.before_*
+*.bak
+*.exe
+users*.csv
+audit.csv
+parts_*.csv
+parts.csv.*
+backups/

@@ -230,6 +230,90 @@ inline constexpr const char* kJs = R"JS(
     tick();
     setInterval(tick, 1000);
   }
+    // ---- Excel (.xlsx) / CSV import on the Add part page: parsed in the browser, then posted to /import ----
+  function u16(d, o) { return d[o] | (d[o + 1] << 8); }
+  function u32(d, o) { return (d[o] | (d[o + 1] << 8) | (d[o + 2] << 16) | (d[o + 3] << 24)) >>> 0; }
+  function inflateRaw(bytes) {
+    var s = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    return new Response(s).arrayBuffer().then(function (b) { return new Uint8Array(b); });
+  }
+  function unzip(buf) {
+    var d = new Uint8Array(buf), eocd = -1, dec = new TextDecoder(), jobs = [], out = {};
+    for (var i = d.length - 22; i >= Math.max(0, d.length - 65557); i--) if (u32(d, i) === 0x06054b50) { eocd = i; break; }
+    if (eocd < 0) throw new Error('This is not an .xlsx file (save it as Excel Workbook).');
+    var n = u16(d, eocd + 10), p = u32(d, eocd + 16);
+    for (var k = 0; k < n; k++) {
+      if (u32(d, p) !== 0x02014b50) break;
+      var method = u16(d, p + 10), csize = u32(d, p + 20), nl = u16(d, p + 28), el = u16(d, p + 30), cl = u16(d, p + 32), lo = u32(d, p + 42);
+      var name = dec.decode(d.subarray(p + 46, p + 46 + nl));
+      p += 46 + nl + el + cl;
+      if (!/^xl\/(workbook\.xml|_rels\/workbook\.xml\.rels|sharedStrings\.xml|worksheets\/[^\/]+\.xml)$/.test(name)) continue;
+      var start = lo + 30 + u16(d, lo + 26) + u16(d, lo + 28), raw = d.subarray(start, start + csize);
+      (function (nm, m, r) {
+        if (m === 0) out[nm] = r;
+        else if (m === 8) jobs.push(inflateRaw(r).then(function (x) { out[nm] = x; }));
+      })(name, method, raw);
+    }
+    return Promise.all(jobs).then(function () { return out; });
+  }
+  function parseXml(bytes) { return new DOMParser().parseFromString(new TextDecoder().decode(bytes), 'application/xml'); }
+  function colIndex(ref) {
+    var m = /^([A-Z]+)/.exec(ref || ''), n = 0;
+    if (!m) return -1;
+    for (var i = 0; i < m[1].length; i++) n = n * 26 + (m[1].charCodeAt(i) - 64);
+    return n - 1;
+  }
+  function csvField(v) { return /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }
+  function xlsxToCsv(buf) {
+    return unzip(buf).then(function (f) {
+      var shared = [], tags = function (el, name) { return Array.prototype.slice.call(el.getElementsByTagName(name)); };
+      if (f['xl/sharedStrings.xml']) tags(parseXml(f['xl/sharedStrings.xml']), 'si').forEach(function (si) {
+        var t = ''; tags(si, 't').forEach(function (x) { t += x.textContent; }); shared.push(t);
+      });
+      var path = 'xl/worksheets/sheet1.xml';
+      if (f['xl/workbook.xml'] && f['xl/_rels/workbook.xml.rels']) {
+        var sh = tags(parseXml(f['xl/workbook.xml']), 'sheet')[0];
+        var rid = sh && (sh.getAttribute('r:id') || sh.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id'));
+        tags(parseXml(f['xl/_rels/workbook.xml.rels']), 'Relationship').forEach(function (r) {
+          if (rid && r.getAttribute('Id') === rid) { var tg = r.getAttribute('Target') || ''; path = tg.charAt(0) === '/' ? tg.substr(1) : 'xl/' + tg; }
+        });
+      }
+      if (!f[path]) path = Object.keys(f).filter(function (x) { return /^xl\/worksheets\//.test(x); }).sort()[0];
+      if (!path || !f[path]) throw new Error('No worksheet found in the file.');
+      var rows = [];
+      tags(parseXml(f[path]), 'row').forEach(function (r) {
+        var row = [], next = 0;
+        tags(r, 'c').forEach(function (c) {
+          var ci = colIndex(c.getAttribute('r')); if (ci < 0) ci = next; next = ci + 1;
+          var t = c.getAttribute('t'), vEl = c.getElementsByTagName('v')[0], v = vEl ? vEl.textContent : '', s = '';
+          if (t === 's') s = shared[parseInt(v, 10)] || '';
+          else if (t === 'inlineStr') tags(c, 't').forEach(function (x) { s += x.textContent; });
+          else if (t === 'str') s = v;
+          else if (t === 'b') s = v === '1' ? 'TRUE' : 'FALSE';
+          else if (v !== '') { var num = Number(v); s = isFinite(num) ? (Number.isInteger(num) ? String(num) : String(Math.round(num * 100) / 100)) : v; }
+          while (row.length < ci) row.push('');
+          row[ci] = s.replace(/[\r\n]+/g, ' ').trim();
+        });
+        if (row.some(function (x) { return x !== ''; })) rows.push(row);
+      });
+      var width = rows.reduce(function (m, r) { return Math.max(m, r.length); }, 0);
+      var lines = rows.map(function (r) { while (r.length < width) r.push(''); return r.map(csvField).join(','); });
+      return { csv: lines.join('\r\n') + '\r\n', rows: Math.max(0, rows.length - 1), header: rows.length ? rows[0].join(', ') : '' };
+    });
+  }
+  var xf = document.getElementById('xlfile'), xc = document.getElementById('xlcsv');
+  if (xf && xc) xf.addEventListener('change', function () {
+    var file = xf.files[0];
+    if (!file) return;
+    var work = /\.csv$/i.test(file.name)
+      ? file.text().then(function (t) { var ls = t.split(/\r?\n/).filter(Boolean); return { csv: t, rows: Math.max(0, ls.length - 1), header: ls[0] || '' }; })
+      : file.arrayBuffer().then(xlsxToCsv);
+    work.then(function (r) {
+      if (!r.rows) { window.alert('No data rows found in ' + file.name + '.'); xf.value = ''; return; }
+      if (window.confirm('Import ' + r.rows + ' row(s) from ' + file.name + '?\n\nColumns: ' + r.header + '\n\nNew part numbers are added; existing ones are updated (Quantity = the new stock level).')) { xc.value = r.csv; xc.form.submit(); }
+      else xf.value = '';
+    }).catch(function (e) { window.alert('Could not read the file: ' + e.message); xf.value = ''; });
+  });
   // ---- CSV import: load the chosen file into the text box (it is then posted with the form) ----
   var f = document.getElementById('csvfile'), t = document.getElementById('csvtext');
   if (f && t) f.addEventListener('change', function () {

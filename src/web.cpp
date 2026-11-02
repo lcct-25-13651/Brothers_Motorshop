@@ -690,8 +690,15 @@ struct WebApp::Impl {
         for (const inv::Part& p : inv.parts()) m = std::max(m, p.id());
         return m + 1;
     }
+    static std::string excelImportCard(const Ctx& c) {
+        return "<div class='card'><h2>Import many parts from Excel</h2><p class='mut'>Choose your <b>.xlsx</b> (or .csv) file and the system reads it and adds the parts for you - no typing. "
+               "Use the same column headings as <a href='/export/inventory.csv'>Download inventory CSV</a> (it works as a template); the first row must be the headings. "
+               "Existing part numbers are updated (<b>Quantity = the new stock level</b>); new ones are added.</p>"
+               "<form method='post' action='/import' id='xlform'>" + tokenField(c) + "<input type='hidden' name='csv' id='xlcsv'>"
+               "<input id='xlfile' type='file' accept='.xlsx,.csv,text/csv'></form></div>";
+    }
     void addPage(Ctx& c) {
-        std::string b = "<h1>Add part</h1><div class='card'><form method='post' action='/add'>" + tokenField(c) + "<div class='grid'>"
+        std::string b = "<h1>Add part</h1>" + excelImportCard(c) + "<div class='card'><form method='post' action='/add'>" + tokenField(c) + "<div class='grid'>"
                         "<div><label>Part Number</label><input name='pn' maxlength='40' required placeholder='e.g. 22170434'><input type='hidden' name='id' value='" + num(nextFreeId()) + "'></div>"
                         "<div><label>Part Description</label><input name='name' maxlength='80' required></div>"
                         "<div><label>Vehicle system</label><input name='category' list='systems' required></div>"

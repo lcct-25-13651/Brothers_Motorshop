@@ -22,6 +22,7 @@
 #include "httplib.h"
 #include "reports.h"
 #include "util.h"
+#include "logo_asset.h"
 #include "web_assets.h"
 
 namespace web {
@@ -154,6 +155,7 @@ struct WebApp::Impl {
         using P = auth::Permission;
         add("GET", "/static/app.css", &Impl::cssFile, std::nullopt, true);
         add("GET", "/static/app.js", &Impl::jsFile, std::nullopt, true);
+        add("GET", "/static/logo.png", &Impl::logoFile, std::nullopt, true);
         add("GET", "/login", &Impl::loginPage, std::nullopt, true);
         add("POST", "/login", &Impl::doLogin, std::nullopt, true);
         add("GET", "/setup", &Impl::setupPage, std::nullopt, true);
@@ -204,6 +206,7 @@ struct WebApp::Impl {
         c.res.set_content(body, "text/csv; charset=utf-8");
     }
     void cssFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=3600"); c.res.set_content(kCss, "text/css; charset=utf-8"); }
+    void logoFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=86400"); c.res.set_content(std::string(reinterpret_cast<const char*>(kLogoPng), kLogoPngSize), "image/png"); }
     void jsFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=3600"); c.res.set_content(kJs, "application/javascript; charset=utf-8"); }
 
     static std::string tokenField(const Ctx& c) { return "<input type='hidden' name='csrf' value='" + h(c.sess ? c.sess->csrf : "") + "'>"; }
@@ -245,7 +248,7 @@ struct WebApp::Impl {
     std::string head(const std::string& title, const char* bodyClass = "") const {
         std::string cls = *bodyClass ? std::string(" class='") + bodyClass + "'" : "";
         return "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-               "<title>" + h(title) + " - " + h(cfg.shopName) + "</title><link rel='stylesheet' href='/static/app.css'></head><body" + cls + ">";
+               "<title>" + h(title) + " - " + h(cfg.shopName) + "</title><link rel='icon' type='image/png' href='/static/logo.png'><link rel='stylesheet' href='/static/app.css'></head><body" + cls + ">";
     }
     std::string layout(Ctx& c, const std::string& title, const std::string& body) {
         std::string o = head(title);
@@ -255,7 +258,7 @@ struct WebApp::Impl {
             auto link = [&](const std::string& href, const std::string& text) {
                 return "<a href='" + href + "'" + (path == href ? " class='on'" : "") + ">" + text + "</a>";
             };
-            o += "<header class='top'><span class='brand'>&#9881; " + h(cfg.shopName) + "</span><nav>" + link("/", "Inventory");
+            o += "<header class='top'><span class='brand'><img class='brand-logo' src='/static/logo.png' alt=''><span>" + h(cfg.shopName) + "</span></span><nav>" + link("/", "Inventory");
             if (auth::allowed(c.role, P::Sell)) o += link("/invoice", "New sale") + link("/invoices", "Invoices");
             if (auth::allowed(c.role, P::Receivables)) o += link("/receivables", "Receivables / Utang");
             if (auth::allowed(c.role, P::CashReport)) o += link("/cash-report", "Daily cash report");
@@ -279,7 +282,7 @@ struct WebApp::Impl {
                "<div class='bg-orb o1'></div><div class='bg-orb o2'></div><div class='bg-orb o3'></div>"
                "<div class='bg-gear g1' aria-hidden='true'><svg viewBox='0 0 48 48'><circle cx='24' cy='24' r='15' fill='none' stroke='currentColor' stroke-width='6' stroke-dasharray='3.93 3.93'/><circle cx='24' cy='24' r='13' fill='currentColor'/><circle cx='24' cy='24' r='5.5' fill='#0f172a'/></svg></div><div class='bg-gear g2' aria-hidden='true'><svg viewBox='0 0 48 48'><circle cx='24' cy='24' r='15' fill='none' stroke='currentColor' stroke-width='6' stroke-dasharray='3.93 3.93'/><circle cx='24' cy='24' r='13' fill='currentColor'/><circle cx='24' cy='24' r='5.5' fill='#0f172a'/></svg></div>"
                "<main class='auth-wrap'><section class='auth-card'>"
-               "<div class='auth-brand'><div class='auth-logo' aria-hidden='true'><svg viewBox='0 0 48 48'><g class='gear'><circle cx='24' cy='24' r='15' fill='none' stroke='#fff' stroke-width='6' stroke-dasharray='3.93 3.93'/><circle cx='24' cy='24' r='13' fill='#fff'/><circle cx='24' cy='24' r='5.5' fill='#2563eb'/></g></svg></div><h1>" + h(cfg.shopName) + "</h1>"
+               "<div class='auth-brand'><div class='auth-logo'><img src='/static/logo.png' alt=\"Brother's Motorshop logo\"></div><h1>" + h(cfg.shopName) + "</h1>"
                "<p class='auth-sub'>RE Parts &amp; Inventory System</p></div>" + flash(c) + body +
                "</section><p class='auth-foot'>Authorized staff only</p></main></body></html>";
     }
@@ -875,7 +878,7 @@ struct WebApp::Impl {
         if (!v) return redirect(c, msgUrl("/invoices", "Invoice not found.", false));
         std::string b = "<p class='noprint'><button data-print>&#128424; Print receipt</button> <a class='btn sec' href='/invoice'>New sale</a> <a class='btn sec' href='/invoices'>All invoices</a>" +
                         (v->balance() > 0 && auth::allowed(c.role, auth::Permission::Receivables) ? " <a class='btn' href='/payment?no=" + util::urlEncode(v->number) + "'>Record payment</a>" : std::string()) + "</p>"
-                        "<div class='receipt'><h1>" + h(cfg.shopName) + "</h1><div class='sub'>Official receipt</div><div class='meta'><div><b>Invoice:</b> " + h(v->number) +
+                        "<div class='receipt'><img class='doc-logo' src='/static/logo.png' alt=''><h1>" + h(cfg.shopName) + "</h1><div class='sub'>Official receipt</div><div class='meta'><div><b>Invoice:</b> " + h(v->number) +
                         "<br><b>Customer:</b> " + h(v->customer) + "</div><div class='right'><b>Date:</b> " + h(v->timestamp.substr(0, 10)) + "<br><b>Time:</b> " + h(v->timestamp.size() > 11 ? v->timestamp.substr(11) : "") +
                         "<br><b>Served by:</b> " + h(v->user) + "</div></div><table><thead><tr><th>Item</th><th>Type</th><th class='n'>Qty</th><th class='n'>Unit price</th><th class='n'>Amount</th></tr></thead><tbody>";
         for (const inv::InvoiceLine& l : v->lines)
@@ -1014,7 +1017,7 @@ struct WebApp::Impl {
         std::string b = warn + "<form method='get' action='/cash-report' class='bar noprint'><label class='inline'>Report date</label><input type='date' name='date' value='" + h(date) + "' max='" + h(today) + "'>"
                         "<button class='sm sec' type='submit'>Show</button>" + (date != today ? " <a class='btn sm sec' href='/cash-report'>Today</a>" : std::string()) +
                         " <button type='button' data-print>&#128424; Print report</button></form>"
-                        "<div class='report'><h1>" + h(cfg.shopName) + "</h1><div class='sub'>Daily cash report &middot; register close-out</div>"
+                        "<div class='report'><img class='doc-logo' src='/static/logo.png' alt=''><h1>" + h(cfg.shopName) + "</h1><div class='sub'>Daily cash report &middot; register close-out</div>"
                         "<div class='meta'><div><b>Date:</b> " + h(date) + "</div><div class='right'><b>Printed:</b> " + h(util::nowStamp()) + "<br><b>By:</b> " + h(c.user()) + "</div></div>"
                         "<div class='cols'><div><h2>Sales</h2><table class='kv'>" +
                         row("Invoices issued", num(r.invoiceCount)) +

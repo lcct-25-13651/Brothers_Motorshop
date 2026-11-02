@@ -9,7 +9,9 @@ inline constexpr const char* kCss = R"CSS(
 *{box-sizing:border-box}
 body{margin:0;font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink)}
 header.top{background:#0d1b2e;color:#fff;display:flex;flex-wrap:wrap;align-items:center;gap:.25rem 1rem;padding:.6rem 1.2rem}
-header.top .brand{font-weight:700;font-size:1.05rem;margin-right:.8rem}
+header.top .brand{font-weight:700;font-size:1.05rem;margin-right:.8rem;display:flex;align-items:center;gap:.6rem}
+header.top .brand-logo{width:40px;height:40px;border-radius:10px;object-fit:cover;flex:none;box-shadow:0 0 0 1px rgba(255,255,255,.15)}
+.doc-logo{display:block;width:84px;height:84px;margin:0 auto .5rem;border-radius:12px}
 header.top nav{display:flex;flex-wrap:wrap;gap:.2rem;flex:1}
 header.top a{color:#cfd9e8;text-decoration:none;padding:.35rem .7rem;border-radius:6px}
 header.top a:hover,header.top a.on{background:#1d3250;color:#fff}
@@ -68,8 +70,9 @@ body.auth .auth-wrap{width:100%;max-width:420px}
 body.auth .auth-card{background:#fff;border:1px solid rgba(255,255,255,.12);border-radius:16px;padding:2rem 2rem 1.6rem;
 box-shadow:0 20px 25px -5px rgba(0,0,0,.3),0 8px 10px -6px rgba(0,0,0,.2);animation:auth-in .35s ease-out both}
 body.auth .auth-brand{text-align:center;margin-bottom:1.4rem}
-body.auth .auth-logo{position:relative;width:68px;height:68px;margin:0 auto .9rem;border-radius:18px;display:flex;align-items:center;justify-content:center;
-color:#fff;background:linear-gradient(135deg,#3b82f6,#1d4ed8);box-shadow:0 8px 18px -4px rgba(37,99,235,.6);animation:logo-float 3.2s ease-in-out infinite}
+body.auth .auth-logo{position:relative;width:96px;height:96px;margin:0 auto .9rem;border-radius:18px;display:flex;align-items:center;justify-content:center;
+color:#fff;background:#0a0a0a;box-shadow:0 8px 18px -4px rgba(37,99,235,.6);animation:logo-float 3.2s ease-in-out infinite}
+body.auth .auth-logo img{width:100%;height:100%;border-radius:18px;object-fit:cover;display:block}
 body.auth .auth-logo::before,body.auth .auth-logo::after{content:"";position:absolute;inset:0;border-radius:18px;border:2px solid rgba(59,130,246,.55);animation:logo-ring 2.6s ease-out infinite}
 body.auth .auth-logo::after{animation-delay:1.3s}
 body.auth .auth-logo svg{width:44px;height:44px;overflow:visible}
@@ -127,7 +130,8 @@ body.auth .auth-wrap{position:relative;z-index:1}
 /* ---- left sidebar navigation (wide screens); narrow screens keep the top bar ---- */
 @media(min-width:900px){
 header.top{position:fixed;top:0;left:0;bottom:0;width:230px;flex-direction:column;flex-wrap:nowrap;align-items:stretch;gap:.6rem;padding:1rem .8rem;overflow-y:auto;z-index:20}
-header.top .brand{margin:0 0 .6rem;padding:.2rem .4rem;font-size:1.1rem}
+header.top .brand{margin:0 0 .6rem;padding:.2rem .4rem;font-size:1.1rem;flex-direction:column;text-align:center}
+header.top .brand-logo{width:96px;height:96px;border-radius:16px}
 header.top nav{flex-direction:column;flex-wrap:nowrap;flex:1 1 auto;gap:.15rem}
 header.top nav a{padding:.55rem .8rem}
 header.top #clock{display:block;text-align:center;white-space:normal;border-radius:10px;font-size:.8rem;padding:.45rem .6rem}

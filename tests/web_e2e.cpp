@@ -32,6 +32,10 @@ int main() {
     r = s.call("GET", "/", {}, ck); CHECK(!has(r.body, "<script>alert") && has(r.body, "&lt;script&gt;"));
     // price edit -> audit
     r = s.call("POST", "/edit", {{"csrf",csrf},{"id","101"},{"name","Engine Oil 1L"},{"category","Engine"},{"price","499.5"},{"min","8"}}, ck); CHECK(has(r.headers["Location"], "ok"));
+    // p1alert: low-stock banner + sidebar counter appear when a part is below its minimum
+    r = s.call("POST", "/edit", {{"csrf",csrf},{"id","101"},{"name","Engine Oil 1L"},{"category","Engine"},{"price","499.5"},{"min","99999"}}, ck); CHECK(has(r.headers["Location"], "ok"));
+    r = s.call("GET", "/", {}, ck); CHECK(has(r.body, "alert-low") && has(r.body, "nbadge") && has(r.body, "Out of stock") && has(r.body, "href='/?low=1'"));
+    r = s.call("POST", "/edit", {{"csrf",csrf},{"id","101"},{"name","Engine Oil 1L"},{"category","Engine"},{"price","499.5"},{"min","8"}}, ck); CHECK(has(r.headers["Location"], "ok"));
     // Staff session
     auto lj = s.call("POST", "/login", {{"username","juan"},{"password","juanpass1"}});
     std::string ck2 = lj.headers["Set-Cookie"].substr(0, lj.headers["Set-Cookie"].find(';'));

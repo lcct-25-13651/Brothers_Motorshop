@@ -268,6 +268,22 @@ body:not(.auth) main>.stats>.stat:nth-child(4){animation-delay:.18s}
 @media print{@page{margin:12mm}body{background:#fff;font-size:12px}header.top,.noprint,.flash{display:none!important}main{margin:0;max-width:none;padding:0}
 .receipt{border:0;padding:0}.report{border:0;padding:0;max-width:none}.card{border:0;padding:0}.stat{border:1px solid #ccc}
 tr{page-break-inside:avoid}.report h2{page-break-after:avoid}.report .cols{grid-template-columns:1fr 1fr}.tag{border:1px solid #999;background:#fff!important;color:#000!important}}
+
+/* ---- Phase 1: low-stock alerts ---- */
+.nbadge{display:inline-block;min-width:1.35rem;padding:0 .4rem;margin-left:.45rem;border-radius:99px;background:#ef4444;color:#fff;font-size:.72rem;font-weight:700;line-height:1.35rem;text-align:center;animation:badge-pulse 1.8s ease-in-out infinite}
+@keyframes badge-pulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,.55)}60%{box-shadow:0 0 0 7px rgba(239,68,68,0)}}
+.stat.bad,body:not(.auth) .stat.bad{background:linear-gradient(180deg,#fff5f4,#fdd9d5);border-color:#f3b6b1}
+.stat.bad b,body:not(.auth) .stat.bad b{color:#b42318}
+tr.outrow td{background:#fdeceb}body:not(.auth) tbody tr.outrow:hover td{background:#fbd9d6}
+.alert-low{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem 1rem;padding:.85rem 1.15rem;margin:0 0 1rem;border-radius:16px;color:#6b4500;
+  background:linear-gradient(90deg,#fff4d6,#ffe6a6);border:1px solid #f2d58a;box-shadow:0 14px 24px -16px rgba(138,90,0,.6)}
+.alert-low.has-out{color:#7a1810;background:linear-gradient(90deg,#fdeceb,#fbcbc6);border-color:#f3b6b1;box-shadow:0 14px 24px -16px rgba(180,35,24,.6)}
+.alert-low .alert-ic{flex:none;width:2.1rem;height:2.1rem;border-radius:50%;background:#f59e0b;color:#fff;font-weight:800;font-size:1.2rem;line-height:2.1rem;text-align:center;animation:badge-pulse 1.8s ease-in-out infinite}
+.alert-low.has-out .alert-ic{background:#dc2626}
+.alert-low .alert-txt{flex:1 1 240px}.alert-low .alert-txt b{font-size:1.05rem}
+.alert-low .alert-acts{display:flex;gap:.5rem;flex-wrap:wrap}
+@media (prefers-reduced-motion:reduce){.nbadge,.alert-low .alert-ic{animation:none}}
+@media print{.alert-low,.nbadge{display:none!important}}
 )CSS";
 
 inline constexpr const char* kJs = R"JS(
@@ -340,6 +356,7 @@ inline constexpr const char* kJs = R"JS(
     sys.addEventListener('change', apply);
     if (mdl) mdl.addEventListener('change', apply);
     low.addEventListener('change', apply);
+    if (/[?&]low=1/.test(location.search)) { low.checked = true; apply(); }
     Array.prototype.forEach.call(tbl.querySelectorAll('th[data-sort]'), function (th) {
       th.addEventListener('click', function () { sortBy(th); });
     });

@@ -264,7 +264,7 @@ struct WebApp::Impl {
             auto link = [&](const std::string& href, const std::string& text) {
                 return "<a href='" + href + "'" + (path == href ? " class='on'" : "") + ">" + text + "</a>";
             };
-            o += "<header class='top'><span class='brand'><img class='brand-logo' src='/static/logo.png' alt=''><span>" + h(cfg.shopName) + "</span></span><nav>" + link("/", "Inventory");
+            o += "<header class='top'><span class='brand'><img class='brand-logo' src='/static/logo.png' alt=''><span>" + h(cfg.shopName) + "</span></span><nav>" + link("/", "Inventory" + alertBadge());
             if (auth::allowed(c.role, P::Sell)) o += link("/invoice", "New sale") + link("/invoices", "Invoices");
             if (auth::allowed(c.role, P::Receivables)) o += link("/receivables", "Receivables / Utang");
             if (auth::allowed(c.role, P::CashReport)) o += link("/cash-report", "Daily cash report");
@@ -384,6 +384,15 @@ struct WebApp::Impl {
         dropUserSessions(canon);
         audit.record(canon, "PASSWORD_RESET", "via recovery answer", c.ip);
         redirect(c, msgUrl("/login", "Password changed. Please sign in.", true));
+    }
+
+    // ------------------------------------------------------------------ low-stock alert helpers (Phase 1)
+    int outOfStockCount() const { int n = 0; for (const inv::Part& p : inv.parts()) n += p.quantity() == 0; return n; }
+    int belowMinCount() const { int n = 0; for (const inv::Part& p : inv.parts()) n += p.isLowStock(); return n; }
+    int attentionCount() const { int n = 0; for (const inv::Part& p : inv.parts()) n += (p.isLowStock() || p.quantity() == 0); return n; }
+    std::string alertBadge() const {
+        const int n = attentionCount();
+        return n ? " <span class='nbadge' title='Parts that are low or out of stock'>" + num(n) + "</span>" : std::string();
     }
 
     // ------------------------------------------------------------------ inventory dashboard
@@ -619,7 +628,16 @@ struct WebApp::Impl {
                         "<small>" + h(util::formatTime(clockNow, "%p")) + "</small></div></div></div><div class='stats'><div class='stat'><span>Parts</span><b>" + num(static_cast<long long>(parts.size())) + "</b></div>"
                         "<div class='stat'><span>Units in stock</span><b>" + num(units) + "</b></div>";
         if (auth::allowed(c.role, P::ViewReports)) b += "<div class='stat'><span>Stock value</span><b>" + php(value) + "</b></div>";
-        b += std::string("<div class='stat") + (low ? " warn" : "") + "'><span>Below minimum</span><b>" + num(low) + "</b></div></div>";
+        const int outN = outOfStockCount();
+        b += std::string("<div class='stat") + (low ? " warn" : "") + "'><span>Below minimum</span><b>" + num(low) + "</b></div>"
+             "<div class='stat" + (outN ? " bad" : "") + "'><span>Out of stock</span><b>" + num(outN) + "</b></div></div>";
+        if (low || outN) {
+            b += std::string("<div class='alert-low noprint") + (outN ? " has-out" : "") + "' role='alert'><span class='alert-ic'>!</span><div class='alert-txt'><b>" +
+                 (low ? num(low) + (low == 1 ? " part is" : " parts are") + " below the reorder level" : std::string("Some parts are out of stock")) + "</b>" +
+                 (outN ? " &middot; <b>" + num(outN) + " out of stock</b>" : std::string()) +
+                 "<div class='mut'>Restock soon so you do not lose sales.</div></div><div class='alert-acts'><a class='btn sm' href='/?low=1'>Show low stock</a>" +
+                 (auth::allowed(c.role, P::ViewReports) ? "<a class='btn sm sec' href='/reports'>Reorder list</a>" : std::string()) + "</div></div>";
+        }
         if (auth::allowed(c.role, P::ViewReports)) b += analyticsPanel();
 
         b += "<div class='card'><div class='bar'><input id='q' type='search' placeholder='Search by part number, description, system or vehicle model...' autocomplete='off'>"
@@ -639,7 +657,7 @@ struct WebApp::Impl {
         b += "</div><table id='inv'><thead><tr><th data-sort='pn'>Part Number</th><th data-sort='name'>Part Description</th><th data-sort='cat'>System</th><th>Fits (vehicle models)</th>"
              "<th class='n' data-sort='price' data-type='num'>Price</th><th class='n' data-sort='qty' data-type='num'>Stock</th><th class='n' data-sort='min' data-type='num'>Min</th><th>Status</th><th></th></tr></thead><tbody>";
         for (const inv::Part& p : parts) {
-            b += "<tr" + std::string(p.isLowStock() ? " class='low'" : "") + " data-id='" + num(p.id()) + "' data-pn='" + h(util::toLower(partLabel(p))) + "' data-min='" + num(p.minStock()) + "' data-gap='" + num(p.quantity() - p.minStock()) + "' data-name='" + h(util::toLower(p.name())) +
+            b += "<tr" + std::string(p.quantity() == 0 ? " class='low outrow'" : (p.isLowStock() ? " class='low'" : "")) + " data-id='" + num(p.id()) + "' data-pn='" + h(util::toLower(partLabel(p))) + "' data-min='" + num(p.minStock()) + "' data-gap='" + num(p.quantity() - p.minStock()) + "' data-name='" + h(util::toLower(p.name())) +
                  "' data-cat='" + h(util::toLower(p.category())) + "' data-models='" + h(util::toLower(modelsKey(p))) + "' data-price='" + util::money(p.price()) + "' data-qty='" + num(p.quantity()) +
                  "' data-low='" + (p.isLowStock() ? "1" : "0") + "'><td>" + h(partLabel(p)) + "</td><td>" + h(p.name()) + "</td><td>" + h(p.category()) +
                  "</td><td class='fits'>" + (p.modelList().empty() ? std::string("<span class='mut'>-</span>") : h(modelsText(p))) +

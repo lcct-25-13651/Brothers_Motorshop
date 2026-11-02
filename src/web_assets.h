@@ -206,6 +206,58 @@ main{margin:1.2rem 0 1.2rem 230px;max-width:1400px;padding:0 1.6rem}
 .clk-time{font-size:2.9rem;font-weight:700;letter-spacing:.02em;font-variant-numeric:tabular-nums;margin-top:.2rem;white-space:nowrap}
 .clk-time small{font-size:1.15rem;font-weight:600;margin-left:.4rem;color:#9fc0f5;letter-spacing:.04em}
 @media(max-width:600px){.clock-card{width:100%;align-items:center;text-align:center}.clk-time{font-size:2.4rem}}
+/* ---- app theme: same look as the login page (blue gradient, slab cards, raised 3D buttons, Bahnschrift headings) ---- */
+body:not(.auth){--pri:#2563eb;--pri2:#1d4ed8;--line:#d3e2f3;--mut:#5d7088;--ink:#13233d;background:linear-gradient(165deg,#dcedfb 0%,#b9d8f4 52%,#8fbdea 100%) fixed;color:var(--ink)}
+body:not(.auth) h1,body:not(.auth) h2,body:not(.auth) h3,body:not(.auth) .stat b{font-family:Bahnschrift,"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif}
+body:not(.auth) h1{font-size:1.85rem;font-weight:700;letter-spacing:.01em;color:#0b2a66;text-shadow:0 2px 0 rgba(255,255,255,.85),0 6px 12px rgba(10,50,110,.18)}
+body:not(.auth) h2{font-size:1.25rem;font-weight:700;color:#0f3270}
+body:not(.auth) h3{color:#0f3270}
+body:not(.auth) header.top{background:linear-gradient(180deg,#134396 0%,#0b2b6b 55%,#061b45 100%);box-shadow:6px 0 26px -6px rgba(5,30,80,.6),inset -1px 0 0 rgba(255,255,255,.1)}
+body:not(.auth) header.top a{border-radius:10px;transition:background .15s,transform .15s,box-shadow .15s}
+body:not(.auth) header.top a:hover{background:rgba(255,255,255,.14);color:#fff}
+body:not(.auth) header.top nav a.on{background:linear-gradient(180deg,#4b94fb,#1d4ed8);color:#fff;font-weight:600;transform:translateY(-1px);box-shadow:0 3px 0 #1e3a8a,0 9px 14px -4px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.4)}
+body:not(.auth) header.top .brand{color:#fff;text-shadow:0 2px 0 rgba(0,0,0,.35)}
+body:not(.auth) header.top .brand-logo{box-shadow:0 0 0 3px #fff,0 0 0 4px #bcd2f5,0 14px 22px -6px rgba(0,0,0,.65);transition:transform .5s cubic-bezier(.2,.8,.2,1)}
+body:not(.auth) header.top .brand:hover .brand-logo{transform:perspective(500px) rotateY(24deg) scale(1.04)}
+body:not(.auth) .chip{background:rgba(255,255,255,.14);box-shadow:inset 0 1px 0 rgba(255,255,255,.15)}
+body:not(.auth) .card,body:not(.auth) .stat,body:not(.auth) .receipt,body:not(.auth) .report{background:#fff;border:1px solid rgba(255,255,255,.9);border-radius:16px;
+box-shadow:1px 1px 0 #e8f1fc,2px 2px 0 #dbe9f9,3px 3px 0 #cde0f6,0 20px 32px -16px rgba(10,50,110,.5)}
+body:not(.auth) .stat{transition:transform .25s cubic-bezier(.2,.8,.2,1),box-shadow .25s}
+body:not(.auth) .stat:hover{transform:translateY(-4px);box-shadow:1px 1px 0 #e8f1fc,2px 2px 0 #dbe9f9,3px 3px 0 #cde0f6,0 26px 38px -14px rgba(10,50,110,.55)}
+body:not(.auth) .stat span{color:#4d6786;font-weight:600;letter-spacing:.07em}
+body:not(.auth) .stat b{font-size:1.7rem;color:#0b2a66}
+body:not(.auth) .stat.warn{background:linear-gradient(180deg,#fffaf0,#fff1cc);border-color:#f2d58a;box-shadow:1px 1px 0 #fbe9bd,2px 2px 0 #f6dc9f,3px 3px 0 #f0cf84,0 20px 32px -16px rgba(138,90,0,.45)}
+body:not(.auth) .btn,body:not(.auth) button{--sh:#1e3a8a;--d:3px;background:linear-gradient(180deg,#4b94fb,#1d4ed8);border:0;border-radius:10px;font-weight:600;
+box-shadow:0 var(--d) 0 var(--sh),0 9px 14px -5px rgba(29,78,216,.5),inset 0 1px 0 rgba(255,255,255,.4);transition:transform .08s,box-shadow .08s,background .15s}
+body:not(.auth) .btn:hover,body:not(.auth) button:hover{background:linear-gradient(180deg,#5aa0ff,#2158e0);transform:translateY(-1px);box-shadow:0 calc(var(--d) + 1px) 0 var(--sh),0 13px 18px -5px rgba(29,78,216,.55),inset 0 1px 0 rgba(255,255,255,.45)}
+body:not(.auth) .btn:active,body:not(.auth) button:active{transform:translateY(var(--d));box-shadow:0 0 0 var(--sh),0 2px 5px -2px rgba(29,78,216,.6),inset 0 1px 0 rgba(255,255,255,.3)}
+body:not(.auth) .btn.sm,body:not(.auth) button.sm{--d:2px}
+body:not(.auth) .btn.sec,body:not(.auth) button.sec{--sh:#b3cbeb;background:linear-gradient(180deg,#fff,#e9f2fd);color:#1d4ed8;border:1px solid #bcd2f5;box-shadow:0 var(--d) 0 var(--sh),0 8px 12px -6px rgba(29,78,216,.3),inset 0 1px 0 #fff}
+body:not(.auth) .btn.sec:hover,body:not(.auth) button.sec:hover{background:linear-gradient(180deg,#fff,#dcebfc);color:#1d4ed8}
+body:not(.auth) .btn.danger,body:not(.auth) button.danger{--sh:#7a1810;background:linear-gradient(180deg,#ef5a4c,#b42318);color:#fff}
+body:not(.auth) .btn.danger:hover,body:not(.auth) button.danger:hover{background:linear-gradient(180deg,#f46d60,#c42a1d)}
+body:not(.auth) input:not([type=checkbox]):not([type=radio]):not([type=hidden]):not([type=file]),body:not(.auth) select,body:not(.auth) textarea{border:1px solid #b9cee7;border-radius:10px;background:#f8fbff;padding:.5rem .7rem;box-shadow:inset 0 2px 5px rgba(15,40,90,.1);transition:border-color .15s,box-shadow .15s,background .15s}
+body:not(.auth) input:focus,body:not(.auth) select:focus,body:not(.auth) textarea:focus{outline:none;background:#fff;border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.3)}
+body:not(.auth) label{color:#456080;font-weight:600}
+body:not(.auth) th{color:#36587f;border-bottom:2px solid #cfe0f3}
+body:not(.auth) tbody tr{transition:background .12s}body:not(.auth) tbody tr:hover td{background:#eef6ff}
+body:not(.auth) .meter{height:10px;border-radius:99px;background:#dbe9fb;box-shadow:inset 0 1px 3px rgba(15,40,90,.2)}
+body:not(.auth) .meter i{border-radius:99px;background:linear-gradient(90deg,#60a5fa,#2563eb);box-shadow:0 1px 3px rgba(37,99,235,.5)}
+body:not(.auth) .flash{display:flex;align-items:flex-start;gap:.55rem;border-radius:12px;border:1px solid transparent;box-shadow:0 8px 16px -10px rgba(10,50,110,.5)}
+body:not(.auth) .flash::before{flex:none;width:1.25rem;height:1.25rem;border-radius:50%;font-size:.8rem;font-weight:700;line-height:1.25rem;text-align:center;color:#fff}
+body:not(.auth) .flash.ok{background:#f0fdf4;border-color:#bbf7d0}body:not(.auth) .flash.ok::before{content:"\2713";background:#16a34a}
+body:not(.auth) .flash.err{background:#fef2f2;border-color:#fecaca}body:not(.auth) .flash.err::before{content:"!";background:#dc2626}
+body:not(.auth) .an-head h2{color:#0f3270}
+body:not(.auth) main{perspective:1400px}
+body:not(.auth) main>.card,body:not(.auth) main>.stats>.stat,body:not(.auth) main>.an-grid>.card{animation:pg-in .5s cubic-bezier(.2,.8,.2,1) backwards}
+body:not(.auth) main>.stats>.stat:nth-child(2),body:not(.auth) main>.an-grid>.card:nth-child(2){animation-delay:.06s}
+body:not(.auth) main>.stats>.stat:nth-child(3),body:not(.auth) main>.an-grid>.card:nth-child(3){animation-delay:.12s}
+body:not(.auth) main>.stats>.stat:nth-child(4){animation-delay:.18s}
+@keyframes pg-in{from{opacity:0;transform:translateY(16px) rotateX(9deg)}}
+::-webkit-scrollbar{width:12px;height:12px}::-webkit-scrollbar-track{background:#cfe3f8}
+::-webkit-scrollbar-thumb{background:linear-gradient(180deg,#5aa6e6,#2563eb);border-radius:99px;border:3px solid #cfe3f8}
+@media (prefers-reduced-motion:reduce){body:not(.auth) main>.card,body:not(.auth) main>.stats>.stat,body:not(.auth) main>.an-grid>.card{animation:none}body:not(.auth) .stat:hover,body:not(.auth) .btn:hover,body:not(.auth) button:hover{transform:none}}
+@media print{body:not(.auth){background:#fff}body:not(.auth) .card,body:not(.auth) .stat,body:not(.auth) .receipt,body:not(.auth) .report{box-shadow:none;border-radius:0}body:not(.auth) h1{text-shadow:none}body:not(.auth) main>.card,body:not(.auth) main>.stats>.stat{animation:none}}
 @media print{@page{margin:12mm}body{background:#fff;font-size:12px}header.top,.noprint,.flash{display:none!important}main{margin:0;max-width:none;padding:0}
 .receipt{border:0;padding:0}.report{border:0;padding:0;max-width:none}.card{border:0;padding:0}.stat{border:1px solid #ccc}
 tr{page-break-inside:avoid}.report h2{page-break-after:avoid}.report .cols{grid-template-columns:1fr 1fr}.tag{border:1px solid #999;background:#fff!important;color:#000!important}}

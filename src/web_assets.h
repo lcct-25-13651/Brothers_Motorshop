@@ -134,7 +134,6 @@ header.top .brand{margin:0 0 .6rem;padding:.2rem .4rem;font-size:1.1rem;flex-dir
 header.top .brand-logo{width:96px;height:96px;border-radius:16px}
 header.top nav{flex-direction:column;flex-wrap:nowrap;flex:1 1 auto;gap:.15rem}
 header.top nav a{padding:.55rem .8rem}
-header.top #clock{display:block;text-align:center;white-space:normal;border-radius:10px;font-size:.8rem;padding:.45rem .6rem}
 header.top form{flex-direction:column;align-items:stretch;gap:.5rem}
 header.top form a{display:block}header.top form .chip{display:block;text-align:center}
 header.top form button{width:100%}
@@ -142,7 +141,14 @@ main{margin:1.2rem 0 1.2rem 230px;max-width:1400px;padding:0 1.6rem}
 }
 .an-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:.4rem 1rem}.an-head h2{margin:1.2rem 0 .6rem}
 .an-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:0 1rem}.an-grid h3{font-size:.95rem;margin:0 0 .5rem}.an-grid td{padding:.35rem .5rem}
-#clock{white-space:nowrap;font-variant-numeric:tabular-nums}
+.page-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.4rem 1.2rem;margin-bottom:.6rem}.page-head h1{margin:.2rem 0}
+.clock-card{display:flex;flex-direction:column;align-items:flex-end;text-align:right;padding:.65rem 1.4rem .7rem;border-radius:16px;color:#fff;line-height:1.1;
+  background:linear-gradient(135deg,#0d1b2e 0%,#17407f 62%,#0f5fd7 100%);box-shadow:0 10px 24px -12px rgba(15,95,215,.8),inset 0 0 0 1px rgba(255,255,255,.08);
+  font-family:Bahnschrift,"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif}
+.clk-date{font-size:1.05rem;font-weight:500;letter-spacing:.06em;text-transform:uppercase;color:#bcd2f5}
+.clk-time{font-size:2.9rem;font-weight:700;letter-spacing:.02em;font-variant-numeric:tabular-nums;margin-top:.2rem;white-space:nowrap}
+.clk-time small{font-size:1.15rem;font-weight:600;margin-left:.4rem;color:#9fc0f5;letter-spacing:.04em}
+@media(max-width:600px){.clock-card{width:100%;align-items:center;text-align:center}.clk-time{font-size:2.4rem}}
 @media print{@page{margin:12mm}body{background:#fff;font-size:12px}header.top,.noprint,.flash{display:none!important}main{margin:0;max-width:none;padding:0}
 .receipt{border:0;padding:0}.report{border:0;padding:0;max-width:none}.card{border:0;padding:0}.stat{border:1px solid #ccc}
 tr{page-break-inside:avoid}.report h2{page-break-after:avoid}.report .cols{grid-template-columns:1fr 1fr}.tag{border:1px solid #999;background:#fff!important;color:#000!important}}
@@ -223,13 +229,17 @@ inline constexpr const char* kJs = R"JS(
     });
     apply();
   }
-  // ---- live date & time in the header ----
-  var clk = document.getElementById('clock');
-  if (clk) {
+  // ---- live date & time (big clock on the Inventory page) ----
+  var cd = document.getElementById('clkdate'), ct = document.getElementById('clktime');
+  if (cd && ct) {
     var tick = function () {
       var d = new Date();
-      clk.textContent = '\uD83D\uDCC5 ' + d.toLocaleDateString('en-US', {weekday: 'short', month: 'short', day: 'numeric', year: 'numeric'}) +
-                        ' \u00b7 ' + d.toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit', second: '2-digit'});
+      cd.textContent = d.toLocaleDateString('en-US', {weekday: 'long', month: 'long', day: 'numeric', year: 'numeric'});
+      var t = d.toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit', second: '2-digit'}).split(' ');
+      ct.textContent = t[0];
+      var sm = document.createElement('small');
+      sm.textContent = t[1] || '';
+      ct.appendChild(sm);
     };
     tick();
     setInterval(tick, 1000);

@@ -267,7 +267,7 @@ struct WebApp::Impl {
             if (auth::allowed(c.role, P::ExportData)) o += link("/data", "Data &amp; backups");
             if (auth::allowed(c.role, P::ViewAudit)) o += link("/audit", "Audit");
             if (auth::allowed(c.role, P::ManageUsers)) o += link("/users", "Users");
-            o += "</nav><span class='chip' id='clock' title='Current date and time'>&#128197; " + h(util::formatTime(std::time(nullptr), "%a, %b %d, %Y  %I:%M %p")) + "</span>"
+            o += "</nav>"
                  "<form method='post' action='/logout'>" + tokenField(c) + "<a href='/account'><span class='chip'>" + h(c.user()) + " &middot; " +
                  auth::roleName(c.role) + "</span></a><button class='sm sec' type='submit'>Log out</button></form></header>";
         }
@@ -424,8 +424,7 @@ struct WebApp::Impl {
         double deadValue = 0;
         for (const auto& d : dead) deadValue += d.stockValue;
 
-        std::string b = "<div class='an-head'><h2>Analytics</h2><span class='mut'>As of " + h(util::formatTime(now, "%A, %B %d, %Y, %I:%M %p")) +
-                        " &middot; <a href='/reports'>Full reports</a> &middot; <a class='btn sm sec noprint' href='/analytics.pdf'>Download PDF</a></span></div><div class='stats'>"
+        std::string b = "<div class='an-head'><h2>Analytics</h2><span class='mut'><a href='/reports'>Full reports</a> &middot; <a class='btn sm sec noprint' href='/analytics.pdf'>Download PDF</a></span></div><div class='stats'>"
                         "<div class='stat'><span>Sales today</span><b>" + php(today) + "</b></div>"
                         "<div class='stat'><span>This week</span><b>" + php(week) + "</b></div>"
                         "<div class='stat'><span>This month</span><b>" + php(month) + "</b></div>"
@@ -460,17 +459,7 @@ struct WebApp::Impl {
         if (bySys.empty()) b += "<tr><td class='mut'>No parts yet.</td></tr>";
         b += "</tbody></table></div>";
 
-        // Reorder alerts (most short first)
-        const auto re = reports::reorderList(inv.parts());
-        b += "<div class='card'><h3>Reorder soon <span class='mut'>(" + num(static_cast<long long>(re.size())) + " below minimum)</span></h3><table><tbody>";
-        size_t shown = 0;
-        for (const auto& r : re) {
-            if (++shown > 5) break;
-            b += "<tr><td>" + h(r.part->name()) + "</td><td class='n'>" + num(r.part->quantity()) + " / " + num(r.part->minStock()) +
-                 "</td><td class='n'><b>+" + num(r.suggestedQty) + "</b></td></tr>";
-        }
-        if (re.empty()) b += "<tr><td class='mut'>Every part is at or above its minimum.</td></tr>";
-        b += "</tbody></table></div></div>";
+        b += "</div>";
         return b;
     }
 
@@ -605,7 +594,10 @@ struct WebApp::Impl {
 
         const std::vector<std::string> models = inv.allModels();
         const std::string wantModel = util::trim(c.param("model"));
-        std::string b = "<h1>Inventory</h1><div class='stats'><div class='stat'><span>Parts</span><b>" + num(static_cast<long long>(parts.size())) + "</b></div>"
+        const std::time_t clockNow = std::time(nullptr);
+        std::string b = "<div class='page-head'><h1>Inventory</h1><div class='clock-card noprint' id='clock' title='Current date and time'><div class='clk-date' id='clkdate'>" +
+                        h(util::formatTime(clockNow, "%A, %B %d, %Y")) + "</div><div class='clk-time' id='clktime'>" + h(util::formatTime(clockNow, "%I:%M:%S")) +
+                        "<small>" + h(util::formatTime(clockNow, "%p")) + "</small></div></div></div><div class='stats'><div class='stat'><span>Parts</span><b>" + num(static_cast<long long>(parts.size())) + "</b></div>"
                         "<div class='stat'><span>Units in stock</span><b>" + num(units) + "</b></div>";
         if (auth::allowed(c.role, P::ViewReports)) b += "<div class='stat'><span>Stock value</span><b>" + php(value) + "</b></div>";
         b += std::string("<div class='stat") + (low ? " warn" : "") + "'><span>Below minimum</span><b>" + num(low) + "</b></div></div>";

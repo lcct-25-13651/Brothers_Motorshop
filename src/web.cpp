@@ -24,6 +24,7 @@
 #include "util.h"
 #include "login_bg_asset.h"
 #include "logo_asset.h"
+#include "re_asset.h"
 #include "web_assets.h"
 
 namespace web {
@@ -158,6 +159,7 @@ struct WebApp::Impl {
         add("GET", "/static/app.js", &Impl::jsFile, std::nullopt, true);
         add("GET", "/static/logo.png", &Impl::logoFile, std::nullopt, true);
         add("GET", "/static/login-bg.jpg", &Impl::loginBgFile, std::nullopt, true);
+        add("GET", "/static/re.jpg", &Impl::reFile, std::nullopt, true);
         add("GET", "/login", &Impl::loginPage, std::nullopt, true);
         add("POST", "/login", &Impl::doLogin, std::nullopt, true);
         add("GET", "/setup", &Impl::setupPage, std::nullopt, true);
@@ -209,6 +211,7 @@ struct WebApp::Impl {
     }
     void cssFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=3600"); c.res.set_content(kCss, "text/css; charset=utf-8"); }
     void logoFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=86400"); c.res.set_content(std::string(reinterpret_cast<const char*>(kLogoPng), kLogoPngSize), "image/png"); }
+    void reFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=86400"); c.res.set_content(std::string(reinterpret_cast<const char*>(kReJpg), kReJpgSize), "image/jpeg"); }
     void loginBgFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=86400"); c.res.set_content(std::string(reinterpret_cast<const char*>(kLoginBgJpg), kLoginBgJpgSize), "image/jpeg"); }
     void jsFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=3600"); c.res.set_content(kJs, "application/javascript; charset=utf-8"); }
 
@@ -270,7 +273,7 @@ struct WebApp::Impl {
             if (auth::allowed(c.role, P::ExportData)) o += link("/data", "Data &amp; backups");
             if (auth::allowed(c.role, P::ViewAudit)) o += link("/audit", "Audit");
             if (auth::allowed(c.role, P::ManageUsers)) o += link("/users", "Users");
-            o += "</nav>"
+            o += "</nav><div class='re-badge' aria-hidden='true'><img src='/static/re.jpg' alt='Bajaj RE'><span>Bajaj RE Parts</span></div>"
                  "<form method='post' action='/logout'>" + tokenField(c) + "<a href='/account'><span class='chip'>" + h(c.user()) + " &middot; " +
                  auth::roleName(c.role) + "</span></a><button class='sm sec' type='submit'>Log out</button></form></header>";
         }

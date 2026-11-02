@@ -206,6 +206,13 @@ main{margin:1.2rem 0 1.2rem 230px;max-width:1400px;padding:0 1.6rem}
 .clk-time{font-size:2.9rem;font-weight:700;letter-spacing:.02em;font-variant-numeric:tabular-nums;margin-top:.2rem;white-space:nowrap}
 .clk-time small{font-size:1.15rem;font-weight:600;margin-left:.4rem;color:#9fc0f5;letter-spacing:.04em}
 @media(max-width:600px){.clock-card{width:100%;align-items:center;text-align:center}.clk-time{font-size:2.4rem}}
+/* ---- Bajaj RE picture inside the system: sidebar badge + faint watermark behind every page ---- */
+header.top .re-badge{display:flex;flex-direction:column;align-items:center;gap:.3rem;margin:.4rem 0;color:#cfe0ff;font-size:.78rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+header.top .re-badge img{width:100%;max-width:190px;border-radius:12px;box-shadow:0 0 0 2px rgba(255,255,255,.7),0 10px 18px -6px rgba(0,0,0,.6)}
+body:not(.auth)::after{content:"";position:fixed;right:1.5rem;bottom:1rem;width:min(38vw,460px);aspect-ratio:390/285;background:url(/static/re.jpg) center/contain no-repeat;opacity:.13;mix-blend-mode:multiply;pointer-events:none;z-index:0}
+body:not(.auth) main{position:relative;z-index:1}
+@media(max-width:899px){header.top .re-badge{display:none}}
+@media print{body:not(.auth)::after,header.top .re-badge{display:none}}
 /* ---- app theme: same look as the login page (blue gradient, slab cards, raised 3D buttons, Bahnschrift headings) ---- */
 body:not(.auth){--pri:#2563eb;--pri2:#1d4ed8;--line:#d3e2f3;--mut:#5d7088;--ink:#13233d;background:linear-gradient(165deg,#dcedfb 0%,#b9d8f4 52%,#8fbdea 100%) fixed;color:var(--ink)}
 body:not(.auth) h1,body:not(.auth) h2,body:not(.auth) h3,body:not(.auth) .stat b{font-family:Bahnschrift,"Segoe UI Variable Display","Segoe UI",system-ui,sans-serif}

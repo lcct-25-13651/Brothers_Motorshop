@@ -505,6 +505,26 @@ inline constexpr const char* kJs = R"JS(
     vin.addEventListener('input', onVehicle);
     onCustomer(); onVehicle();
   }
+  // ---- new sale: "+ Add 5 more rows" for the parts table ----
+  var addPartRow = document.getElementById('add-part-row'), partRows = document.getElementById('part-rows');
+  if (addPartRow && partRows) {
+    var maxPartRows = parseInt(addPartRow.getAttribute('data-max'), 10) || 60;
+    addPartRow.addEventListener('click', function () {
+      var first = null;
+      for (var added = 0; added < 5 && partRows.rows.length < maxPartRows; added++) {
+        var k = partRows.rows.length + 1;
+        var tr = partRows.rows[partRows.rows.length - 1].cloneNode(true);
+        Array.prototype.forEach.call(tr.querySelectorAll('input'), function (inp) {
+          inp.value = '';
+          inp.name = inp.name.replace(/[0-9]+$/, String(k));   // p_id_8 -> p_id_9
+        });
+        partRows.appendChild(tr);
+        if (!first) first = tr.querySelector('input');
+      }
+      if (first) first.focus();
+      if (partRows.rows.length >= maxPartRows) addPartRow.disabled = true;
+    });
+  }
   // ---- print buttons and confirm dialogs (no inline handlers: the CSP forbids them) ----
   Array.prototype.forEach.call(document.querySelectorAll('[data-print]'), function (b) {
     b.addEventListener('click', function () { window.print(); });

@@ -1330,7 +1330,7 @@ struct WebApp::Impl {
     }
 
     // ------------------------------------------------------------------ invoices / receipts
-    static constexpr int kPartRows = 8, kSvcRows = 4;
+    static constexpr int kPartRows = 60, kStartPartRows = 8, kSvcRows = 4;   // kPartRows = most part rows one invoice accepts
 
     void invoicePage(Ctx& c) {
         const std::string no = c.param("no");
@@ -1341,14 +1341,18 @@ struct WebApp::Impl {
                         "<label>Vehicle plate <span class='mut'>(optional - pick one of the customer's saved vehicles)</span></label><input id='veh-in' name='vehicle' list='vehs' maxlength='120' autocomplete='off' placeholder='e.g. ABC 1234' value='" + h(c.param("vehicle")) + "'>"
                         "<input type='hidden' id='veh-id' name='vehicle_id' value=''>" + vehiclesDatalist() +
                         "<p class='mut'><a href='/customer/edit?from=sale'>+ New customer</a> &middot; <a href='/customers'>Find a customer / plate</a></p>" +
-                        "<h2>Parts <span class='mut'>(type or pick a part ID - the catalogue price is applied)</span></h2><table><thead><tr><th>Part number</th><th>Quantity</th></tr></thead><tbody>";
+                        "<h2>Parts <span class='mut'>(type or pick a part ID - the catalogue price is applied)</span></h2><table><thead><tr><th>Part number</th><th>Quantity</th></tr></thead><tbody id='part-rows'>";
         const std::string pre = c.param("part");
+        int shownRows = kStartPartRows;   // rows beyond the first 8 are kept if a failed submit sent them back
+        for (int i = kStartPartRows + 1; i <= kPartRows; ++i)
+            if (!c.param("p_id_" + num(i)).empty() || !c.param("p_qty_" + num(i)).empty()) shownRows = i;
         for (int i = 1; i <= kPartRows; ++i) {
             std::string id = c.param("p_id_" + num(i)), qty = c.param("p_qty_" + num(i));
+            if (i > shownRows) break;
             if (i == 1 && id.empty() && !pre.empty()) { id = pre; if (const inv::Part* pp = resolvePart(pre)) id = partLabel(*pp); qty = "1"; }
             b += "<tr><td><input name='p_id_" + num(i) + "' list='plist' value='" + h(id) + "'></td><td><input name='p_qty_" + num(i) + "' type='number' min='1' value='" + h(qty) + "'></td></tr>";
         }
-        b += "</tbody></table><datalist id='plist'>";
+        b += "</tbody></table><p><button type='button' class='sec' id='add-part-row' data-max='" + num(kPartRows) + "'>+ Add 5 more rows</button></p><datalist id='plist'>";
         for (const inv::Part& p : inv.parts())
             b += "<option value='" + h(partLabel(p)) + "'>" + h(p.fullName()) + " - &#8369;" + util::moneyFmt(p.price()) + " (" + num(p.quantity()) + " in stock)</option>";
         b += "</datalist><h2>Services <span class='mut'>(labour, repairs - optional)</span></h2><table><thead><tr><th>Description</th><th>Qty</th><th>Price (&#8369;)</th></tr></thead><tbody>";

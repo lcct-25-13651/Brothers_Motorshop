@@ -9,7 +9,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Business logic (no HTTP): reused by the app and by the self-test.
-add_library(core STATIC src/util.cpp src/auth.cpp src/inventory.cpp src/reports.cpp)
+add_library(core STATIC src/util.cpp src/auth.cpp src/inventory.cpp src/reports.cpp src/jobs.cpp)
 target_include_directories(core PUBLIC src)
 if(MSVC)
   target_compile_options(core PRIVATE /W4)
@@ -37,6 +37,11 @@ enable_testing()
 add_executable(smoke_test tests/smoke_test.cpp)
 target_link_libraries(smoke_test PRIVATE core)
 add_test(NAME smoke COMMAND smoke_test)
+
+# Phase 4 job orders data layer.
+add_executable(jobs_test tests/jobs_test.cpp)
+target_link_libraries(jobs_test PRIVATE core Threads::Threads)
+add_test(NAME jobs COMMAND jobs_test)
 
 # Web-layer test against an in-process stand-in for httplib (no sockets).
 add_executable(web_e2e tests/web_e2e.cpp src/web.cpp)

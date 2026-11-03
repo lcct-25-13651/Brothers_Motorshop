@@ -93,7 +93,8 @@ public:
 
     // "Forgot password": only for accounts that set a recovery phrase.
     std::string recoveryQuestion(const std::string& username) const;      // "" = none
-    std::string recoverPassword(const std::string& username, const std::string& answer, const std::string& newPassword);
+    std::string recoverPassword(const std::string& username, const std::string& answer, const std::string& newPassword,
+                                const std::string& newUsername = "");
 
 private:
     static std::string normAnswer(const std::string& s);

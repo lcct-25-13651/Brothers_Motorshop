@@ -30,7 +30,7 @@ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 th[data-sort]{cursor:pointer;user-select:none}th[data-sort]:hover{color:var(--pri)}
 th.asc::after{content:" \25B2"}th.desc::after{content:" \25BC"}
 tr.low td{background:#fffaf0}tr[hidden]{display:none}
-.tag{display:inline-block;padding:.1rem .55rem;border-radius:99px;font-size:.78rem;font-weight:600}
+.tag{display:inline-block;padding:.1rem .55rem;border-radius:99px;font-size:.78rem;font-weight:600;white-space:nowrap}
 .tag.ok{background:var(--okbg);color:var(--ok)}.tag.low{background:var(--warnbg);color:var(--warn)}.tag.out{background:var(--badbg);color:var(--bad)}
 .tag.adm{background:#e8eefc;color:var(--pri2)}.tag.stf{background:#eef0f3;color:#445}
 .plus{color:var(--ok);font-weight:600}.minus{color:var(--bad);font-weight:600}

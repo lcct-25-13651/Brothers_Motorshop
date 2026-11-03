@@ -404,7 +404,10 @@ struct WebApp::Impl {
         std::string b = "<h2>Reset password</h2><form method='post' action='/forgot'><label>Username</label><input name='username' value='" + h(u) + "' required>";
         if (!u.empty() && !q.empty()) b += "<p><b>Recovery question:</b> " + h(q) + "</p>";
         else if (!u.empty()) b += "<p class='mut'>No recovery question is set for that account. Ask an Admin to reset your password.</p>";
-        b += "<label>Recovery answer</label><input name='answer' required><label>New password (min 8 characters)</label>"
+        b += "<label>Recovery answer</label><input name='answer' required>"
+             "<label>New username (optional &mdash; leave blank to keep the current one)</label>"
+             "<input name='newusername' autocomplete='off' placeholder='3-32 letters, digits, _ . -'>"
+             "<label>New password (min 8 characters)</label>"
              "<input name='password' type='password' required autocomplete='new-password'><p><button type='submit'>Reset password</button> "
              "<a class='btn sec' href='/login'>Cancel</a></p></form>";
         if (u.empty()) b += "<form method='get' action='/forgot'><p class='mut'>Not sure of your question? Enter your username and show it:</p>"
@@ -414,17 +417,23 @@ struct WebApp::Impl {
     void doForgot(Ctx& c) {
         const std::string name = c.param("username"), key = c.ip + "|recover";
         if (throttle.blocked(key)) return redirect(c, msgUrl("/login", "Too many attempts. Wait a few minutes and try again.", false));
-        const std::string err = users.recoverPassword(name, c.param("answer"), c.param("password"));
+        const std::string newName = util::trim(c.param("newusername"));
+        const std::string oldCanon = users.canonicalName(name);
+        const std::string err = users.recoverPassword(name, c.param("answer"), c.param("password"), newName);
         if (!err.empty()) {
             throttle.fail(key);
             audit.record(name, "LOGIN_FAILED", "password recovery attempt failed", c.ip);
             return redirect(c, msgUrl("/forgot?u=" + util::urlEncode(name), err, false));
         }
         throttle.ok(key);
-        const std::string canon = users.canonicalName(name);
-        dropUserSessions(canon);
+        const std::string canon = users.canonicalName(newName.empty() ? name : newName);
+        dropUserSessions(oldCanon);
+        if (canon != oldCanon && !canon.empty()) {
+            dropUserSessions(canon);
+            audit.record(canon, "USERNAME_CHANGED", oldCanon + " -> " + canon + " (via recovery answer)", c.ip);
+        }
         audit.record(canon, "PASSWORD_RESET", "via recovery answer", c.ip);
-        redirect(c, msgUrl("/login", "Password changed. Please sign in.", true));
+        redirect(c, msgUrl("/login", canon != oldCanon ? "Username and password changed. Please sign in with your new username." : "Password changed. Please sign in.", true));
     }
 
     // ------------------------------------------------------------------ low-stock alert helpers (Phase 1)
@@ -440,7 +449,7 @@ struct WebApp::Impl {
     static std::string statusTag(const inv::Part& p) {
         if (p.quantity() == 0) return "<span class='tag out'>Out of stock</span>";
         if (p.isLowStock()) return "<span class='tag low'>Low</span>";
-        return "<span class='tag ok'>OK</span>";
+        return "<span class='tag ok'>In Stock</span>";
     }
 
     static std::string modelsText(const inv::Part& p) {   // "Bajaj RE 4S, Bajaj RE Compact"
@@ -706,7 +715,7 @@ struct WebApp::Impl {
                  statusTag(p) + "</td>" + sourcingCells(c, p) + "<td class='right'>";
             const std::string id = "?id=" + num(p.id());
             if (auth::allowed(c.role, P::Sell)) b += "<a class='btn sm' href='/invoice?part=" + util::urlEncode(partLabel(p)) + "'>Sell</a> ";
-            if (auth::allowed(c.role, P::AdjustStock)) b += "<a class='btn sm sec' href='/stock" + id + "'>Stock</a> ";
+            if (auth::allowed(c.role, P::AdjustStock) && !auth::allowed(c.role, P::EditPart)) b += "<a class='btn sm sec' href='/stock" + id + "'>Stock</a> ";
             if (auth::allowed(c.role, P::EditPart)) b += "<a class='btn sm sec' href='/edit" + id + "'>Edit</a> ";
             if (auth::allowed(c.role, P::DeletePart)) b += "<a class='btn sm danger' href='/delete" + id + "'>Delete</a>";
             b += "</td></tr>";
@@ -932,6 +941,22 @@ struct WebApp::Impl {
         }
         redirect(c, msgUrl("/add", err, false));
     }
+    // Restock / Adjust cards, shown on the Edit page (Admin) so the Stock button can leave the row.
+    std::string stockCards(Ctx& c, const inv::Part& p) {
+        if (!auth::allowed(c.role, auth::Permission::AdjustStock)) return std::string();
+        const std::string id = num(p.id());
+        return "<div class='grid'><div class='card'><h2>Restock (stock arrives)</h2>"
+               "<form method='post' action='/stock'>" + tokenField(c) + "<input type='hidden' name='id' value='" + id + "'><input type='hidden' name='action' value='restock'>"
+               "<label>Quantity received</label><input name='qty' type='number' min='1' required>"
+               "<label>Supplier (optional - recorded in the purchase history)</label>" + supplierSelect(p.supplierId()) +
+               "<label>Unit cost paid (&#8369;, optional - used for expense reports)</label><input name='cost' type='number' step='0.01' min='0'>" +
+               std::string(auth::allowed(c.role, auth::Permission::ViewReports) ? "<label class='inline'><input type='checkbox' name='setcost' value='1'> Use this as the part's cost price (for margin)</label>" : "") +
+               "<label>Note (optional)</label><input name='note' maxlength='80'><p><button type='submit'>Add stock</button></p></form></div>"
+               "<div class='card'><h2>Adjust (count correction, damage, loss)</h2><form method='post' action='/stock'>" + tokenField(c) +
+               "<input type='hidden' name='id' value='" + id + "'><input type='hidden' name='action' value='adjust'>"
+               "<label>Change (use a minus sign to remove, e.g. -2)</label><input name='qty' type='number' required>"
+               "<label>Reason</label><input name='note' maxlength='80' required><p><button type='submit'>Apply adjustment</button></p></form></div></div>";
+    }
     void editPage(Ctx& c) {
         const inv::Part* p = inv.find(intParam(c, "id", 1, inv::limits::kMaxId, 0));
         if (!p) return redirect(c, msgUrl("/", "Part not found.", false));
@@ -943,8 +968,8 @@ struct WebApp::Impl {
                         "<div class='grid'><div><label>Supplier</label>" + supplierSelect(p->supplierId()) + "</div><div><label>Cost price (&#8369;, what you pay the supplier)</label><input name='cost' type='number' step='0.01' min='0' value='" + (p->costPrice() > 0 ? util::money(p->costPrice()) : std::string()) + "'></div></div>"
                         "<label>Compatible vehicle models <span class='mut'>(separate with commas)</span></label>"
                         "<input name='models' maxlength='300' style='width:100%' value='" + h(p->compatibleModels()) + "' placeholder='Bajaj RE 4S, Bajaj RE Compact, Bajaj RE Maxima'>" + systemsDatalist() +
-                        "<p class='mut'>Current stock is " + num(p->quantity()) + ". Change it with <a href='/stock?id=" + num(p->id()) + "'>Restock / Adjust</a> so the movement is logged.</p>"
-                        "<p><button type='submit'>Save changes</button> <a class='btn sec' href='/'>Cancel</a></p></form></div>";
+                        "<p class='mut'>Current stock is " + num(p->quantity()) + ". Change it with <b>Restock / Adjust</b> below so the movement is logged.</p>"
+                        "<p><button type='submit'>Save changes</button> <a class='btn sec' href='/'>Cancel</a></p></form></div>" + stockCards(c, *p);
         html(c, layout(c, "Edit part", b));
     }
     void doEdit(Ctx& c) {

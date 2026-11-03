@@ -1341,7 +1341,7 @@ struct WebApp::Impl {
                         "<label>Vehicle plate <span class='mut'>(optional - pick one of the customer's saved vehicles)</span></label><input id='veh-in' name='vehicle' list='vehs' maxlength='120' autocomplete='off' placeholder='e.g. ABC 1234' value='" + h(c.param("vehicle")) + "'>"
                         "<input type='hidden' id='veh-id' name='vehicle_id' value=''>" + vehiclesDatalist() +
                         "<p class='mut'><a href='/customer/edit?from=sale'>+ New customer</a> &middot; <a href='/customers'>Find a customer / plate</a></p>" +
-                        "<h2>Parts <span class='mut'>(type or pick a part ID - the catalogue price is applied)</span></h2><table><thead><tr><th>Part number</th><th>Quantity</th></tr></thead><tbody id='part-rows'>";
+                        "<h2>Parts <span class='mut'>(type or pick a part ID - the catalogue price is applied)</span></h2><table><thead><tr><th>Part number</th><th>Quantity</th><th class='n'>Price</th><th class='n'>Amount</th></tr></thead><tbody id='part-rows'>";
         const std::string pre = c.param("part");
         int shownRows = kStartPartRows;   // rows beyond the first 8 are kept if a failed submit sent them back
         for (int i = kStartPartRows + 1; i <= kPartRows; ++i)
@@ -1350,16 +1350,16 @@ struct WebApp::Impl {
             std::string id = c.param("p_id_" + num(i)), qty = c.param("p_qty_" + num(i));
             if (i > shownRows) break;
             if (i == 1 && id.empty() && !pre.empty()) { id = pre; if (const inv::Part* pp = resolvePart(pre)) id = partLabel(*pp); qty = "1"; }
-            b += "<tr><td><input name='p_id_" + num(i) + "' list='plist' value='" + h(id) + "'></td><td><input name='p_qty_" + num(i) + "' type='number' min='1' value='" + h(qty) + "'></td></tr>";
+            b += "<tr><td><input name='p_id_" + num(i) + "' list='plist' value='" + h(id) + "'></td><td><input name='p_qty_" + num(i) + "' type='number' min='1' value='" + h(qty) + "'></td><td class='n price-cell'></td><td class='n amount-cell'></td></tr>";
         }
-        b += "</tbody></table><p><button type='button' class='sec' id='add-part-row' data-max='" + num(kPartRows) + "'>+ Add 5 more rows</button></p><datalist id='plist'>";
+        b += "</tbody></table><p class='right'><b>Parts total: <span id='parts-total'>&#8369;0.00</span></b></p><p><button type='button' class='sec' id='add-part-row' data-max='" + num(kPartRows) + "'>+ Add 5 more rows</button></p><datalist id='plist'>";
         for (const inv::Part& p : inv.parts())
-            b += "<option value='" + h(partLabel(p)) + "'>" + h(p.fullName()) + " - &#8369;" + util::moneyFmt(p.price()) + " (" + num(p.quantity()) + " in stock)</option>";
-        b += "</datalist><h2>Services <span class='mut'>(labour, repairs - optional)</span></h2><table><thead><tr><th>Description</th><th>Qty</th><th>Price (&#8369;)</th></tr></thead><tbody>";
+            b += "<option value='" + h(partLabel(p)) + "' data-id='" + num(p.id()) + "' data-price='" + util::money(p.price()) + "'>" + h(p.fullName()) + " - &#8369;" + util::moneyFmt(p.price()) + " (" + num(p.quantity()) + " in stock)</option>";
+        b += "</datalist><h2>Services <span class='mut'>(labour, repairs - optional)</span></h2><table><thead><tr><th>Description</th><th>Price (&#8369;)</th></tr></thead><tbody id='svc-rows'>";
         for (int i = 1; i <= kSvcRows; ++i)
-            b += "<tr><td><input name='s_desc_" + num(i) + "' maxlength='100' value='" + h(c.param("s_desc_" + num(i))) + "'></td><td><input name='s_qty_" + num(i) +
-                 "' type='number' min='1' value='" + h(c.param("s_qty_" + num(i))) + "'></td><td><input name='s_price_" + num(i) + "' type='number' step='0.01' min='0' value='" + h(c.param("s_price_" + num(i))) + "'></td></tr>";
-        b += "</tbody></table><h2>Payment</h2><div class='grid'><div><label>Amount paid now (&#8369;) - leave blank if paid in full</label>"
+            b += "<tr><td><input name='s_desc_" + num(i) + "' maxlength='100' value='" + h(c.param("s_desc_" + num(i))) + "'></td>" +
+                 "<td><input name='s_price_" + num(i) + "' type='number' step='0.01' min='0' value='" + h(c.param("s_price_" + num(i))) + "'></td></tr>";
+        b += "</tbody></table><p class='right'><b>Services total: <span id='svc-total'>&#8369;0.00</span></b></p><h2>Payment</h2><div class='grid'><div><label>Amount paid now (&#8369;) - leave blank if paid in full</label>"
              "<input name='amount_paid' inputmode='decimal' autocomplete='off' placeholder='full amount' value='" + h(c.param("amount_paid")) + "'></div>"
              "<div><label>Payment method</label>" + methodSelect(c.param("method")) + "</div></div>"
              "<p class='mut'>Credit sale (utang): type what the customer pays now (0 if nothing). The rest is tracked under <b>Receivables / Utang</b> and needs a customer name.</p>"

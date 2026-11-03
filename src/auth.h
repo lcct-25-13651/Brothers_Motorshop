@@ -23,6 +23,8 @@ enum class Permission {
     Receivables,    // see customer balances + record payments (utang) -> Staff + Admin
     CashReport,     // end-of-day register close-out report -> Staff + Admin
     Customers,      // Phase 3: look up / add / edit customers and vehicles -> Staff + Admin
+    Jobs,           // Phase 4: job orders / repair tickets (open, lines, status, print) -> Staff + Admin
+    ServiceCatalog, // Phase 4: edit the service catalogue (labour fees, reminder intervals) -> Admin
     ArchiveCustomers, // Phase 3: archive / restore / delete customer + vehicle records -> Admin
     AddPart,        // sets a price  -> Admin
     EditPart,       // price/name/min stock -> Admin
@@ -126,7 +128,9 @@ struct AuditEntry {
 
 // Events: LOGIN, LOGIN_FAILED, LOGOUT, PRICE_CHANGE, RECORD_DELETED, PASSWORD_RESET,
 //         PASSWORD_CHANGED, USER_CREATED, USER_DELETED, ROLE_CHANGED, BACKUP, IMPORT, ACCESS_DENIED,
-//         CREDIT_SALE, PAYMENT_RECORDED, PART_MODELS_CHANGED
+//         CREDIT_SALE, PAYMENT_RECORDED, PART_MODELS_CHANGED,
+//         JOB_CREATED, JOB_UPDATED, JOB_MECHANIC, JOB_STATUS, JOB_LINE_ADDED, JOB_LINE_REMOVED,
+//         JOB_STOCK_RECONCILED, SERVICE_ADDED, SERVICE_UPDATED, SERVICE_TOGGLED
 class AuditLog {
 public:
     explicit AuditLog(std::string file = "audit.csv");

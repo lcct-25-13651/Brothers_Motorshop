@@ -25,7 +25,7 @@ if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/httplib.h")
 endif()
 
 find_package(Threads REQUIRED)
-add_executable(re_parts_tracker src/main.cpp src/web.cpp)
+add_executable(re_parts_tracker src/main.cpp src/web.cpp src/api.cpp)
 target_include_directories(re_parts_tracker PRIVATE third_party)
 target_link_libraries(re_parts_tracker PRIVATE core Threads::Threads)
 if(WIN32)
@@ -38,13 +38,23 @@ add_executable(smoke_test tests/smoke_test.cpp)
 target_link_libraries(smoke_test PRIVATE core)
 add_test(NAME smoke COMMAND smoke_test)
 
+<<<<<<< HEAD
 # Phase 4 job orders data layer.
+=======
+# Phase 4: job-order logic (stock, state machine, concurrency, recovery).
+>>>>>>> origin/main
 add_executable(jobs_test tests/jobs_test.cpp)
 target_link_libraries(jobs_test PRIVATE core Threads::Threads)
 add_test(NAME jobs COMMAND jobs_test)
 
 # Web-layer test against an in-process stand-in for httplib (no sockets).
-add_executable(web_e2e tests/web_e2e.cpp src/web.cpp)
-target_include_directories(web_e2e PRIVATE tests/stub)
+add_executable(web_e2e tests/web_e2e.cpp src/web.cpp src/api.cpp)
+target_include_directories(web_e2e PRIVATE tests/stub third_party)
 target_link_libraries(web_e2e PRIVATE core)
 add_test(NAME web_e2e COMMAND web_e2e)
+
+# Phase 4: the JSON API, run against the same in-process stand-in for httplib.
+add_executable(api_e2e tests/api_e2e.cpp src/api.cpp)
+target_include_directories(api_e2e PRIVATE tests/stub)
+target_link_libraries(api_e2e PRIVATE core)
+add_test(NAME api_e2e COMMAND api_e2e)

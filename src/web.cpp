@@ -705,7 +705,7 @@ struct WebApp::Impl {
              "<label class='inline mut'><input id='lowonly' type='checkbox'> Low stock only</label><span id='count' class='mut grow'></span>";
         if (auth::allowed(c.role, P::AddPart)) b += "<a class='btn' href='/add'>+ Add part</a>";
         b += "</div><table id='inv'><thead><tr><th data-sort='pn'>Part Number</th><th data-sort='name'>Part Description</th><th data-sort='cat'>System</th><th>Fits (vehicle models)</th>"
-             "<th class='n' data-sort='price' data-type='num'>Price</th><th class='n' data-sort='qty' data-type='num'>Stock</th><th class='n' data-sort='min' data-type='num'>Min</th><th>Status</th>" + std::string(auth::allowed(c.role, P::ViewReports) ? "<th>Supplier</th><th class='n'>Cost</th><th class='n'>Margin</th>" : "") + "<th></th></tr></thead><tbody>";
+             "<th class='n' data-sort='price' data-type='num'>Price</th><th class='n' data-sort='qty' data-type='num'>Stock</th><th class='n' data-sort='min' data-type='num'>Min</th><th>Status</th>" + std::string(auth::allowed(c.role, P::ViewReports) ? "<th class='n'>Cost</th><th class='n'>Margin</th>" : "") + "<th></th></tr></thead><tbody>";
         for (const inv::Part& p : parts) {
             b += "<tr" + std::string(p.quantity() == 0 ? " class='low outrow'" : (p.isLowStock() ? " class='low'" : "")) + " data-id='" + num(p.id()) + "' data-pn='" + h(util::toLower(partLabel(p))) + "' data-min='" + num(p.minStock()) + "' data-gap='" + num(p.quantity() - p.minStock()) + "' data-name='" + h(util::toLower(p.name())) +
                  "' data-cat='" + h(util::toLower(p.category())) + "' data-models='" + h(util::toLower(modelsKey(p))) + "' data-price='" + util::money(p.price()) + "' data-qty='" + num(p.quantity()) +
@@ -749,8 +749,7 @@ struct WebApp::Impl {
     }
     std::string sourcingCells(Ctx& c, const inv::Part& p) const {   // Admin-only inventory columns: Supplier | Cost | Margin
         if (!auth::allowed(c.role, auth::Permission::ViewReports)) return "";
-        const std::string sn = suppliers.nameOf(p.supplierId());
-        return "<td>" + (sn.empty() ? std::string("<span class='mut'>-</span>") : h(sn)) + "</td>" + marginCells(p);
+        return marginCells(p);
     }
     void suppliersPage(Ctx& c) {
         const int editId = intParam(c, "edit", 1, 999999, 0), viewId = intParam(c, "view", 1, 999999, 0);

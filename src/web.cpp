@@ -1574,8 +1574,22 @@ struct WebApp::Impl {
         const bool onCredit = c.param("pay_type") == "credit";
         if (onCredit && partyName.empty()) return back("Utang needs a customer name - type one or pick a saved customer.");
         if (onCredit && util::trim(c.param("amount_paid")).empty()) paid = 0.0;
+        // Utang to a typed name with no customer record yet: save the person as a customer first.
+        int autoCustomer = 0;
+        if (onCredit && partyCustomer == 0 && !util::equalsIgnoreCase(partyName, "Walk-in customer")) {
+            crm::Customer nk;
+            nk.name = partyName; nk.notes = "Auto-added from a credit (utang) sale";
+            int nid = 0;
+            if (people.saveCustomer(0, nk, nid).empty()) {
+                if (const crm::Customer* made = people.findCustomer(nid)) { partyName = made->name; partyCustomer = nid; autoCustomer = nid; }
+            }
+        }
         const inv::CheckoutResult r = inv.checkout(partyName, lines, c.user(), paid, c.param("method").empty() ? "Cash" : c.param("method"), partyCustomer, partyVehicle, recvBy);
-        if (!r.ok) return back(r.message);
+        if (!r.ok) {
+            if (autoCustomer) people.removeCustomer(autoCustomer, false);
+            return back(r.message);
+        }
+        if (autoCustomer) audit.record(c.user(), "CUSTOMER_ADDED", "#" + num(autoCustomer) + " " + partyName + " (auto, from credit sale " + r.invoiceNumber + ")", c.ip);
         if (r.balance > 0) {
             const inv::Invoice* v = inv.invoices().find(r.invoiceNumber);
             audit.record(c.user(), "CREDIT_SALE", r.invoiceNumber + " " + (v ? v->customer : std::string()) + ": total " + util::money(r.paid + r.balance) + ", paid " + util::money(r.paid) +
@@ -1658,7 +1672,7 @@ struct WebApp::Impl {
         for (const auto& d : debtors)
             b += "<tr><td><b>" + customerNameLink(d.customer) + "</b></td><td class='n'>" + num(d.openInvoices) + "</td><td class='n'>" + php(d.billed) + "</td><td class='n'>" + php(d.paid) +
                  "</td><td class='n'><b class='minus'>" + php(d.balance) + "</b></td><td>" + h(d.oldestDate) + " <span class='mut'>(" + num(d.oldestDays) + " day" + (d.oldestDays == 1 ? "" : "s") + ")</span></td>"
-                 "<td class='right'><a class='btn sm sec' href='/receivables?customer=" + util::urlEncode(d.customer) + "'>View invoices</a></td></tr>";
+                 "<td class='right'>" + (people.findByName(d.customer).empty() && d.customer != "Walk-in customer" ? "<a class='btn sm' href='/customer/edit?name=" + util::urlEncode(d.customer) + "'>+ Save as customer</a> " : std::string()) + "<a class='btn sm sec' href='/receivables?customer=" + util::urlEncode(d.customer) + "'>View invoices</a></td></tr>";
         if (debtors.empty()) b += "<tr><td colspan='7' class='mut'>Nobody owes the shop anything right now.</td></tr>";
         b += "</tbody></table></div>";
 

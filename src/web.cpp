@@ -1519,7 +1519,8 @@ struct WebApp::Impl {
                  "<td><input name='s_price_" + num(i) + "' type='number' step='0.01' min='0' value='" + h(c.param("s_price_" + num(i))) + "'></td></tr>";
         b += "</tbody></table><p class='right'><b>Services total: <span id='svc-total'>&#8369;0.00</span></b></p><h2>Payment</h2><div class='grid'><div><label>Amount paid now (&#8369;) - leave blank if paid in full</label>"
              "<input name='amount_paid' inputmode='decimal' autocomplete='off' placeholder='full amount' value='" + h(c.param("amount_paid")) + "'></div>"
-             "<div><label>Payment method</label>" + methodSelect(c.param("method")) + "</div></div>"
+             "<div><label>Payment method</label>" + methodSelect(c.param("method")) + "</div>"
+             "<div><label>Received by (optional - leave blank for " + h(c.user()) + ")</label><input name='received_by' maxlength='40' autocomplete='off' value='" + h(c.param("received_by")) + "'></div></div>"
              "<p class='mut'>Credit sale (utang): type what the customer pays now (0 if nothing). The rest is tracked under <b>Receivables / Utang</b> and needs a customer name.</p>"
              "<p><button type='submit'>Record sale &amp; create receipt</button> <a class='btn sec' href='/'>Cancel</a></p></form></div>";
         html(c, layout(c, "New sale", b));
@@ -1528,7 +1529,7 @@ struct WebApp::Impl {
     void doInvoice(Ctx& c) {
         auto back = [&](const std::string& msg) {  // keep what was typed
             std::string q = "/invoice?customer=" + util::urlEncode(c.param("customer")) + "&amount_paid=" + util::urlEncode(c.param("amount_paid")) +
-                            "&method=" + util::urlEncode(c.param("method")) + "&vehicle=" + util::urlEncode(c.param("vehicle"));
+                            "&method=" + util::urlEncode(c.param("method")) + "&received_by=" + util::urlEncode(c.param("received_by")) + "&vehicle=" + util::urlEncode(c.param("vehicle"));
             for (int i = 1; i <= kPartRows; ++i) q += "&p_id_" + num(i) + "=" + util::urlEncode(c.param("p_id_" + num(i))) + "&p_qty_" + num(i) + "=" + util::urlEncode(c.param("p_qty_" + num(i)));
             for (int i = 1; i <= kSvcRows; ++i)
                 q += "&s_desc_" + num(i) + "=" + util::urlEncode(c.param("s_desc_" + num(i))) + "&s_qty_" + num(i) + "=" + util::urlEncode(c.param("s_qty_" + num(i))) +
@@ -1566,7 +1567,9 @@ struct WebApp::Impl {
         int partyCustomer = 0, partyVehicle = 0;
         const std::string partyErr = resolveParty(c, partyName, partyCustomer, partyVehicle);
         if (!partyErr.empty()) return back(partyErr);
-        const inv::CheckoutResult r = inv.checkout(partyName, lines, c.user(), paid, c.param("method").empty() ? "Cash" : c.param("method"), partyCustomer, partyVehicle);
+        const std::string recvBy = util::oneLine(util::trim(c.param("received_by")));
+        if (recvBy.size() > 40) return back("Received by is too long (max 40 characters).");
+        const inv::CheckoutResult r = inv.checkout(partyName, lines, c.user(), paid, c.param("method").empty() ? "Cash" : c.param("method"), partyCustomer, partyVehicle, recvBy);
         if (!r.ok) return back(r.message);
         if (r.balance > 0) {
             const inv::Invoice* v = inv.invoices().find(r.invoiceNumber);
@@ -1604,7 +1607,7 @@ struct WebApp::Impl {
                 b += "<tr><td>" + h(p->timestamp) + "</td><td>" + h(p->method) + "</td><td>" + h(p->user) + "</td><td>" + h(p->note) + "</td><td class='n'>" + php(p->amount) + "</td><td class='n'>" + php(p->balanceAfter) + "</td></tr>";
             b += "</tbody></table>";
         }
-        b += "<p class='thanks'>Thank you for your business!</p></div>";
+        b += "</div>";
         html(c, layout(c, "Receipt " + no, b));
     }
 
@@ -1683,6 +1686,7 @@ struct WebApp::Impl {
                         "<label>Amount (&#8369;) - the full balance is pre-filled; type less for a partial / installment payment</label>"
                         "<input name='amount' inputmode='decimal' autocomplete='off' value='" + util::money(v->balance()) + "' required>"
                         "<label>Payment method</label>" + methodSelect(c.param("method")) +
+                        "<label>Received by (optional - leave blank for " + h(c.user()) + ")</label><input name='received_by' maxlength='40' autocomplete='off'>" +
                         "<label>Note (optional, e.g. reference no.)</label><input name='note' maxlength='80'>"
                         "<p><button type='submit'>Save payment</button> <a class='btn sec' href='/receivables'>Cancel</a></p></form></div></div>";
         const auto pays = inv.payments().forInvoice(v->number);
@@ -1701,7 +1705,9 @@ struct WebApp::Impl {
         double amount = 0, expected = -1.0;
         if (!parseMoneyText(c.param("amount"), amount)) return redirect(c, msgUrl(back, "Enter the payment amount as a number.", false));
         if (!c.param("balance").empty() && !util::parseDouble(c.param("balance"), 0, inv::limits::kMaxPrice, expected)) expected = -1.0;
-        const inv::PaymentResult r = inv.recordPayment(no, amount, c.param("method"), c.param("note"), c.user(), expected);
+        const std::string recvBy = util::oneLine(util::trim(c.param("received_by")));
+        if (recvBy.size() > 40) return redirect(c, msgUrl(back, "Received by is too long (max 40 characters).", false));
+        const inv::PaymentResult r = inv.recordPayment(no, amount, c.param("method"), c.param("note"), c.user(), expected, recvBy);
         if (!r.ok) return redirect(c, msgUrl(inv.invoices().find(no) && inv.invoices().find(no)->balance() > 0 ? back : "/receivables", r.message, false));
         const std::string note = util::trim(c.param("note"));
         audit.record(c.user(), "PAYMENT_RECORDED", no + " " + r.customer + ": " + util::money(r.applied) + " via " + inv::canonicalMethod(c.param("method")) + ", balance " + util::money(r.balance) + " (" +

@@ -159,6 +159,7 @@ public:
     const std::vector<Payment>& all() const { return entries_; }
     std::vector<const Payment*> forInvoice(const std::string& number) const;  // oldest first
     double paidFor(const std::string& number) const;
+    bool setUser(std::size_t index, const std::string& user);  // change "received by" on one payment; rewrites payments.csv
 
 private:
     std::string file_;
@@ -231,6 +232,7 @@ public:
     const MovementLog& movements() const { return moves_; }
     const InvoiceBook& invoices() const { return invoices_; }
     const PaymentLog& payments() const { return payments_; }
+    bool setPaymentReceivedBy(std::size_t index, const std::string& user) { return payments_.setUser(index, user); }
     const std::string& dataDir() const { return dir_; }
     const std::string& lastWarning() const { return warning_; }   // e.g. "movements.csv could not be written"
 

@@ -233,6 +233,20 @@ std::vector<const Payment*> PaymentLog::forInvoice(const std::string& number) co
     return out;
 }
 
+bool PaymentLog::setUser(std::size_t index, const std::string& user) {
+    if (index >= entries_.size()) return false;
+    const std::string old = entries_[index].user;
+    entries_[index].user = util::oneLine(user);
+    std::string out = std::string(kPaymentHeader) + "\n";
+    for (const Payment& p : entries_)
+        out += util::csvEscape(p.timestamp) + ',' + util::csvEscape(p.invoiceNo) + ',' + util::csvEscape(p.user) + ',' + util::money(p.amount) + ',' +
+               util::csvEscape(p.method) + ',' + util::money(p.balanceAfter) + ',' + util::csvEscape(p.note) + "\n";
+    std::error_code ec;
+    fs::copy_file(file_, file_ + ".bak", fs::copy_options::overwrite_existing, ec);   // keep the previous version
+    if (!util::writeFileAtomic(file_, out)) { entries_[index].user = old; return false; }
+    return true;
+}
+
 double PaymentLog::paidFor(const std::string& number) const {
     double t = 0;
     for (const Payment& p : entries_) if (p.invoiceNo == number) t = util::round2(t + p.amount);

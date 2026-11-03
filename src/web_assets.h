@@ -573,6 +573,17 @@ inline constexpr const char* kJs = R"JS(
       }
     });
     saleParts.closest('form').addEventListener('input', recalc);
+    var payType = document.getElementById('pay-type');
+    if (payType) {
+      var amtInput = document.querySelector('input[name="amount_paid"]'), amtLabel = document.getElementById('amt-label');
+      var syncPay = function () {
+        var credit = payType.value === 'credit';
+        amtLabel.textContent = credit ? 'Down payment now (\u20B1) - leave blank if nothing paid yet' : 'Amount paid now (\u20B1) - leave blank if paid in full';
+        amtInput.placeholder = credit ? '0' : 'full amount';
+      };
+      payType.addEventListener('change', syncPay);
+      syncPay();
+    }
     var addBtn = document.getElementById('add-part-row');
     if (addBtn) addBtn.addEventListener('click', recalc);
     recalc();

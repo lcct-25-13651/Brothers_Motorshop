@@ -542,6 +542,7 @@ inline constexpr const char* kJs = R"JS(
         var pc = tr.querySelector('.price-cell'), ac = tr.querySelector('.amount-cell');
         if (price === undefined || isNaN(price)) { pc.textContent = ''; ac.textContent = ''; return; }
         pc.textContent = peso(price);
+        if (isNaN(qty) && document.activeElement !== ins[1]) { ins[1].value = '1'; qty = 1; }
         if (qty > 0) { ac.textContent = peso(price * qty); total += price * qty; } else { ac.textContent = ''; }
       });
       document.getElementById('parts-total').textContent = peso(total);

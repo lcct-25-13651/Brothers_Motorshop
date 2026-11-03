@@ -30,7 +30,7 @@ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 th[data-sort]{cursor:pointer;user-select:none}th[data-sort]:hover{color:var(--pri)}
 th.asc::after{content:" \25B2"}th.desc::after{content:" \25BC"}
 tr.low td{background:#fffaf0}tr[hidden]{display:none}
-.tag{display:inline-block;padding:.1rem .55rem;border-radius:99px;font-size:.78rem;font-weight:600}
+.tag{display:inline-block;padding:.1rem .55rem;border-radius:99px;font-size:.78rem;font-weight:600;white-space:nowrap}
 .tag.ok{background:var(--okbg);color:var(--ok)}.tag.low{background:var(--warnbg);color:var(--warn)}.tag.out{background:var(--badbg);color:var(--bad)}
 .tag.adm{background:#e8eefc;color:var(--pri2)}.tag.stf{background:#eef0f3;color:#445}
 .plus{color:var(--ok);font-weight:600}.minus{color:var(--bad);font-weight:600}
@@ -504,6 +504,56 @@ inline constexpr const char* kJs = R"JS(
     cin.addEventListener('input', onCustomer);
     vin.addEventListener('input', onVehicle);
     onCustomer(); onVehicle();
+  }
+  // ---- new sale: "+ Add 5 more rows" for the parts table ----
+  var addPartRow = document.getElementById('add-part-row'), partRows = document.getElementById('part-rows');
+  if (addPartRow && partRows) {
+    var maxPartRows = parseInt(addPartRow.getAttribute('data-max'), 10) || 60;
+    addPartRow.addEventListener('click', function () {
+      var first = null;
+      for (var added = 0; added < 5 && partRows.rows.length < maxPartRows; added++) {
+        var k = partRows.rows.length + 1;
+        var tr = partRows.rows[partRows.rows.length - 1].cloneNode(true);
+        Array.prototype.forEach.call(tr.querySelectorAll('input'), function (inp) {
+          inp.value = '';
+          inp.name = inp.name.replace(/[0-9]+$/, String(k));   // p_id_8 -> p_id_9
+        });
+        partRows.appendChild(tr);
+        if (!first) first = tr.querySelector('input');
+      }
+      if (first) first.focus();
+      if (partRows.rows.length >= maxPartRows) addPartRow.disabled = true;
+    });
+  }
+  // ---- new sale: live price / amount per part row and the parts + services totals ----
+  var saleParts = document.getElementById('part-rows'), saleSvc = document.getElementById('svc-rows'), saleList = document.getElementById('plist');
+  if (saleParts) {
+    var peso = function (n) { return '\u20B1' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); };
+    var priceOf = {};
+    if (saleList) Array.prototype.forEach.call(saleList.options, function (o) {
+      var p = parseFloat(o.getAttribute('data-price'));
+      priceOf[o.value.toLowerCase()] = p;
+      priceOf[o.getAttribute('data-id')] = p;
+    });
+    var recalc = function () {
+      var total = 0;
+      Array.prototype.forEach.call(saleParts.rows, function (tr) {
+        var ins = tr.querySelectorAll('input'), price = priceOf[ins[0].value.trim().toLowerCase()], qty = parseInt(ins[1].value, 10);
+        var pc = tr.querySelector('.price-cell'), ac = tr.querySelector('.amount-cell');
+        if (price === undefined || isNaN(price)) { pc.textContent = ''; ac.textContent = ''; return; }
+        pc.textContent = peso(price);
+        if (qty > 0) { ac.textContent = peso(price * qty); total += price * qty; } else { ac.textContent = ''; }
+      });
+      document.getElementById('parts-total').textContent = peso(total);
+      var st = 0;
+      if (saleSvc) Array.prototype.forEach.call(saleSvc.querySelectorAll('input[name^="s_price_"]'), function (i) { var v = parseFloat(i.value); if (v > 0) st += v; });
+      var sv = document.getElementById('svc-total');
+      if (sv) sv.textContent = peso(st);
+    };
+    saleParts.closest('form').addEventListener('input', recalc);
+    var addBtn = document.getElementById('add-part-row');
+    if (addBtn) addBtn.addEventListener('click', recalc);
+    recalc();
   }
   // ---- print buttons and confirm dialogs (no inline handlers: the CSP forbids them) ----
   Array.prototype.forEach.call(document.querySelectorAll('[data-print]'), function (b) {

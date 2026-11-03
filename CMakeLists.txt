@@ -38,7 +38,11 @@ add_executable(smoke_test tests/smoke_test.cpp)
 target_link_libraries(smoke_test PRIVATE core)
 add_test(NAME smoke COMMAND smoke_test)
 
+<<<<<<< HEAD
+# Phase 4 job orders data layer.
+=======
 # Phase 4: job-order logic (stock, state machine, concurrency, recovery).
+>>>>>>> origin/main
 add_executable(jobs_test tests/jobs_test.cpp)
 target_link_libraries(jobs_test PRIVATE core Threads::Threads)
 add_test(NAME jobs COMMAND jobs_test)

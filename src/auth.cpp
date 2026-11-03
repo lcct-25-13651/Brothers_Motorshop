@@ -281,13 +281,28 @@ std::string Authenticator::recoveryQuestion(const std::string& username) const {
     return (c && !c->recHash.empty()) ? c->recQuestion : std::string();
 }
 
-std::string Authenticator::recoverPassword(const std::string& username, const std::string& answer, const std::string& newPassword) {
+std::string Authenticator::recoverPassword(const std::string& username, const std::string& answer, const std::string& newPassword,
+                                           const std::string& newUsername) {
     const Credential* c = find(username);
     const bool has = c && !c->recHash.empty();
     const std::string salt = has ? c->recSalt : std::string("RE-PT:no-such-recovery");
     const std::string computed = hashPassword(salt, normAnswer(answer));
     if (!(constantTimeEquals(computed, has ? c->recHash : std::string(64, '0')) && has)) return "Username or recovery answer is incorrect.";
-    return resetPassword(c->username, newPassword);
+    Credential* m = findMutable(username);
+    const std::string wanted = util::trim(newUsername);
+    const bool rename = !wanted.empty() && wanted != m->username;
+    if (rename) {
+        std::string err = checkUsername(wanted);
+        if (!err.empty()) return err;
+        const Credential* other = find(wanted);
+        if (other && other != m) return "That username is already taken.";
+    }
+    if (const std::string perr = checkPassword(newPassword); !perr.empty()) return perr;
+    const std::string oldName = m->username;
+    if (rename) m->username = wanted;
+    const std::string err = resetPassword(m->username, newPassword);
+    if (!err.empty() && rename) m->username = oldName;
+    return err;
 }
 
 // Temp file + rename: a crash can never leave a half-written users.csv.

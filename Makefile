@@ -2,8 +2,13 @@
 #                    self-test:   make test       (no httplib needed)
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic
+<<<<<<< HEAD
+SRC       = src/main.cpp src/web.cpp src/auth.cpp src/inventory.cpp src/reports.cpp src/util.cpp src/jobs.cpp
+CORE      = src/auth.cpp src/inventory.cpp src/reports.cpp src/util.cpp src/jobs.cpp
+=======
 SRC       = src/main.cpp src/web.cpp src/api.cpp src/jobs.cpp src/auth.cpp src/inventory.cpp src/reports.cpp src/util.cpp
 CORE      = src/auth.cpp src/inventory.cpp src/reports.cpp src/jobs.cpp src/util.cpp
+>>>>>>> origin/main
 
 ifeq ($(OS),Windows_NT)
   EXE      = .exe
@@ -54,7 +59,19 @@ seed: tools/seed_data.cpp
 	$(CXX) $(CXXFLAGS) tools/seed_data.cpp -o seed_data$(EXE)
 	./seed_data$(EXE)
 
+<<<<<<< HEAD
+# Phase 4 (job orders) data-layer tests.
+jobs: tests/jobs_test.cpp $(CORE) $(wildcard src/*.h)
+	$(CXX) $(CXXFLAGS) tests/jobs_test.cpp $(CORE) -o jobs_test$(EXE) $(LDLIBS)
+	./jobs_test$(EXE)
+
+clean:
+	rm -f $(TARGET) smoke_test$(EXE) web_e2e$(EXE) seed_data$(EXE) jobs_test$(EXE)
+
+.PHONY: all test e2e jobs seed clean
+=======
 clean:
 	rm -f $(TARGET) smoke_test$(EXE) web_e2e$(EXE) jobs_test$(EXE) api_e2e$(EXE) seed_data$(EXE)
 
 .PHONY: all test jobstest e2e apie2e check seed clean
+>>>>>>> origin/main

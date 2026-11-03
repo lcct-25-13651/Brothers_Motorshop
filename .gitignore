@@ -51,3 +51,11 @@ suppliers.csv
 purchases.csv
 customers.csv.bak
 vehicles.csv.bak
+
+# Phase 4 runtime data (job orders hold customer/vehicle info - never commit)
+jobs.csv
+job_lines.csv
+jobs.lock
+jobs.csv.bak
+job_lines.csv.bak
+jobs_test

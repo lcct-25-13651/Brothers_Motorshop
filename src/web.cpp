@@ -1544,6 +1544,7 @@ struct WebApp::Impl {
             if (!rp || !util::parseInt(c.param("p_qty_" + num(i)), 1, inv::limits::kMaxQty, qty))
                 return back("Part row " + num(i) + ": enter a valid Part ID (that exists) and a quantity of at least 1.");
             inv::InvoiceLine l;
+            for (const inv::InvoiceLine& x : lines) if (x.partId == rp->id()) return back("Part row " + num(i) + ": that part is already in this sale - increase its quantity instead.");
             l.kind = inv::InvoiceLine::Kind::Part; l.partId = rp->id(); l.qty = static_cast<int>(qty);
             lines.push_back(l);
         }

@@ -529,18 +529,23 @@ inline constexpr const char* kJs = R"JS(
   var saleParts = document.getElementById('part-rows'), saleSvc = document.getElementById('svc-rows'), saleList = document.getElementById('plist');
   if (saleParts) {
     var peso = function (n) { return '\u20B1' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); };
-    var priceOf = {};
+    var priceOf = {}, idOf = {};
     if (saleList) Array.prototype.forEach.call(saleList.options, function (o) {
       var p = parseFloat(o.getAttribute('data-price'));
       priceOf[o.value.toLowerCase()] = p;
       priceOf[o.getAttribute('data-id')] = p;
+      idOf[o.value.toLowerCase()] = o.getAttribute('data-id');
+      idOf[o.getAttribute('data-id')] = o.getAttribute('data-id');
     });
     var recalc = function () {
-      var total = 0;
+      var total = 0, seen = {};
       Array.prototype.forEach.call(saleParts.rows, function (tr) {
         var ins = tr.querySelectorAll('input'), price = priceOf[ins[0].value.trim().toLowerCase()], qty = parseInt(ins[1].value, 10);
         var pc = tr.querySelector('.price-cell'), ac = tr.querySelector('.amount-cell');
         if (price === undefined || isNaN(price)) { pc.textContent = ''; ac.textContent = ''; return; }
+        var pk = idOf[ins[0].value.trim().toLowerCase()];
+        if (seen[pk] !== undefined) { pc.textContent = ''; ac.textContent = 'Already in row ' + seen[pk]; return; }
+        seen[pk] = tr.rowIndex;
         pc.textContent = peso(price);
         if (isNaN(qty) && document.activeElement !== ins[1]) { ins[1].value = '1'; qty = 1; }
         if (qty > 0) { ac.textContent = peso(price * qty); total += price * qty; } else { ac.textContent = ''; }
@@ -551,6 +556,22 @@ inline constexpr const char* kJs = R"JS(
       var sv = document.getElementById('svc-total');
       if (sv) sv.textContent = peso(st);
     };
+    saleParts.addEventListener('change', function (e) {
+      var t = e.target;
+      if (!t || !t.name || t.name.indexOf('p_id_') !== 0) return;
+      var k = idOf[t.value.trim().toLowerCase()];
+      if (k === undefined) return;
+      for (var i = 0; i < saleParts.rows.length; i++) {
+        var o = saleParts.rows[i].querySelectorAll('input');
+        if (o[0] !== t && idOf[o[0].value.trim().toLowerCase()] === k) {
+          t.value = '';
+          recalc();
+          window.alert('That part is already in this sale. Increase its quantity in row ' + (i + 1) + ' instead.');
+          o[1].focus(); o[1].select();
+          return;
+        }
+      }
+    });
     saleParts.closest('form').addEventListener('input', recalc);
     var addBtn = document.getElementById('add-part-row');
     if (addBtn) addBtn.addEventListener('click', recalc);

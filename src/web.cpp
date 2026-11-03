@@ -712,7 +712,7 @@ struct WebApp::Impl {
                  "' data-low='" + (p.isLowStock() ? "1" : "0") + "'><td>" + h(partLabel(p)) + "</td><td>" + h(p.name()) + "</td><td>" + h(p.category()) +
                  "</td><td class='fits'>" + (p.modelList().empty() ? std::string("<span class='mut'>-</span>") : h(modelsText(p))) +
                  "</td><td class='n'>" + php(p.price()) + "</td><td class='n'>" + num(p.quantity()) + "</td><td class='n'>" + num(p.minStock()) + "</td><td>" +
-                 statusTag(p) + "</td>" + sourcingCells(c, p) + "<td class='right'>";
+                 statusTag(p) + "</td>" + sourcingCells(c, p) + "<td class='right' style='white-space:nowrap'>";
             const std::string id = "?id=" + num(p.id());
             if (auth::allowed(c.role, P::Sell)) b += "<a class='btn sm' href='/invoice?part=" + util::urlEncode(partLabel(p)) + "'>Sell</a> ";
             if (auth::allowed(c.role, P::AdjustStock) && !auth::allowed(c.role, P::EditPart)) b += "<a class='btn sm sec' href='/stock" + id + "'>Stock</a> ";

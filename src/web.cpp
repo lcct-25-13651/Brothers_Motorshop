@@ -266,9 +266,9 @@ struct WebApp::Impl {
         add("POST", "/users/role", &Impl::doUserRole, P::ManageUsers);
         add("POST", "/users/reset", &Impl::doUserReset, P::ManageUsers);
         add("POST", "/users/delete", &Impl::doUserDelete, P::ManageUsers);
-        add("GET", "/suppliers", &Impl::suppliersPage, P::ManageSuppliers);
-        add("POST", "/suppliers/save", &Impl::doSupplierSave, P::ManageSuppliers);
-        add("POST", "/suppliers/toggle", &Impl::doSupplierToggle, P::ManageSuppliers);
+        // Suppliers pages disabled (confidential): add("GET", "/suppliers", &Impl::suppliersPage, P::ManageSuppliers);
+        // add("POST", "/suppliers/save", &Impl::doSupplierSave, P::ManageSuppliers);
+        // add("POST", "/suppliers/toggle", &Impl::doSupplierToggle, P::ManageSuppliers);
         add("GET", "/account", &Impl::accountPage);
         add("POST", "/account/password", &Impl::doAccountPassword);
         add("GET", "/jobs", &Impl::jobsPage, P::Jobs);
@@ -449,7 +449,7 @@ struct WebApp::Impl {
             if (auth::allowed(c.role, P::ViewReports)) o += link("/reports", "Reports") + link("/movements", "Movements");
             if (auth::allowed(c.role, P::ExportData)) o += link("/data", "Data &amp; backups");
             if (auth::allowed(c.role, P::ViewAudit)) o += link("/audit", "Audit");
-            if (auth::allowed(c.role, P::ManageSuppliers)) o += link("/suppliers", "Suppliers");
+            // Suppliers link hidden (confidential)
             // Users link hidden (single-owner shop); the page is still at /users
             o += "</nav><div class='re-badge' aria-hidden='true'><img src='/static/re.jpg' alt='Bajaj RE'><span>Bajaj RE Parts</span></div>"
                  "<form method='post' action='/logout'>" + tokenField(c) + "<a href='/account'><span class='chip'>" + h(c.user()) + " &middot; " +

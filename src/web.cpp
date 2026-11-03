@@ -238,6 +238,8 @@ struct WebApp::Impl {
         add("GET", "/receivables", &Impl::receivablesPage, P::Receivables);
         add("GET", "/payment", &Impl::paymentPage, P::Receivables);
         add("POST", "/payment", &Impl::doPayment, P::Receivables);
+        add("GET", "/payment-edit", &Impl::paymentEditPage, P::Receivables);
+        add("POST", "/payment-edit", &Impl::doPaymentEdit, P::Receivables);
         add("GET", "/cash-report", &Impl::cashReportPage, P::CashReport);
         add("GET", "/customers", &Impl::customersPage, P::Customers);
         add("GET", "/customer", &Impl::customerPage, P::Customers);
@@ -264,9 +266,9 @@ struct WebApp::Impl {
         add("POST", "/users/role", &Impl::doUserRole, P::ManageUsers);
         add("POST", "/users/reset", &Impl::doUserReset, P::ManageUsers);
         add("POST", "/users/delete", &Impl::doUserDelete, P::ManageUsers);
-        add("GET", "/suppliers", &Impl::suppliersPage, P::ManageSuppliers);
-        add("POST", "/suppliers/save", &Impl::doSupplierSave, P::ManageSuppliers);
-        add("POST", "/suppliers/toggle", &Impl::doSupplierToggle, P::ManageSuppliers);
+        // Suppliers pages disabled (confidential): add("GET", "/suppliers", &Impl::suppliersPage, P::ManageSuppliers);
+        // add("POST", "/suppliers/save", &Impl::doSupplierSave, P::ManageSuppliers);
+        // add("POST", "/suppliers/toggle", &Impl::doSupplierToggle, P::ManageSuppliers);
         add("GET", "/account", &Impl::accountPage);
         add("POST", "/account/password", &Impl::doAccountPassword);
         add("GET", "/jobs", &Impl::jobsPage, P::Jobs);
@@ -447,8 +449,8 @@ struct WebApp::Impl {
             if (auth::allowed(c.role, P::ViewReports)) o += link("/reports", "Reports") + link("/movements", "Movements");
             if (auth::allowed(c.role, P::ExportData)) o += link("/data", "Data &amp; backups");
             if (auth::allowed(c.role, P::ViewAudit)) o += link("/audit", "Audit");
-            if (auth::allowed(c.role, P::ManageSuppliers)) o += link("/suppliers", "Suppliers");
-            if (auth::allowed(c.role, P::ManageUsers)) o += link("/users", "Users");
+            // Suppliers link hidden (confidential)
+            // Users link hidden (single-owner shop); the page is still at /users
             o += "</nav><div class='re-badge' aria-hidden='true'><img src='/static/re.jpg' alt='Bajaj RE'><span>Bajaj RE Parts</span></div>"
                  "<form method='post' action='/logout'>" + tokenField(c) + "<a href='/account'><span class='chip'>" + h(c.user()) + " &middot; " +
                  auth::roleName(c.role) + "</span></a><button class='sm sec' type='submit'>Log out</button></form></header>";
@@ -1517,9 +1519,10 @@ struct WebApp::Impl {
         for (int i = 1; i <= kSvcRows; ++i)
             b += "<tr><td><input name='s_desc_" + num(i) + "' maxlength='100' value='" + h(c.param("s_desc_" + num(i))) + "'></td>" +
                  "<td><input name='s_price_" + num(i) + "' type='number' step='0.01' min='0' value='" + h(c.param("s_price_" + num(i))) + "'></td></tr>";
-        b += "</tbody></table><p class='right'><b>Services total: <span id='svc-total'>&#8369;0.00</span></b></p><h2>Payment</h2><div class='grid'><div><label>Amount paid now (&#8369;) - leave blank if paid in full</label>"
+        b += "</tbody></table><p class='right'><b>Services total: <span id='svc-total'>&#8369;0.00</span></b></p><h2>Payment</h2><div class='grid'><div><label>Payment type</label><select name='pay_type' id='pay-type'><option value='full'>Paid in full</option><option value='credit'" + std::string(c.param("pay_type") == "credit" ? " selected" : "") + ">Utang (credit)</option></select></div><div><label id='amt-label'>Amount paid now (&#8369;) - leave blank if paid in full</label>"
              "<input name='amount_paid' inputmode='decimal' autocomplete='off' placeholder='full amount' value='" + h(c.param("amount_paid")) + "'></div>"
-             "<div><label>Payment method</label>" + methodSelect(c.param("method")) + "</div></div>"
+             "<div><label>Payment method</label>" + methodSelect(c.param("method")) + "</div>"
+             "<div><label>Received by (optional - leave blank for " + h(c.user()) + ")</label><input name='received_by' maxlength='40' autocomplete='off' value='" + h(c.param("received_by")) + "'></div></div>"
              "<p class='mut'>Credit sale (utang): type what the customer pays now (0 if nothing). The rest is tracked under <b>Receivables / Utang</b> and needs a customer name.</p>"
              "<p><button type='submit'>Record sale &amp; create receipt</button> <a class='btn sec' href='/'>Cancel</a></p></form></div>";
         html(c, layout(c, "New sale", b));
@@ -1528,7 +1531,7 @@ struct WebApp::Impl {
     void doInvoice(Ctx& c) {
         auto back = [&](const std::string& msg) {  // keep what was typed
             std::string q = "/invoice?customer=" + util::urlEncode(c.param("customer")) + "&amount_paid=" + util::urlEncode(c.param("amount_paid")) +
-                            "&method=" + util::urlEncode(c.param("method")) + "&vehicle=" + util::urlEncode(c.param("vehicle"));
+                            "&method=" + util::urlEncode(c.param("method")) + "&received_by=" + util::urlEncode(c.param("received_by")) + "&pay_type=" + util::urlEncode(c.param("pay_type")) + "&vehicle=" + util::urlEncode(c.param("vehicle"));
             for (int i = 1; i <= kPartRows; ++i) q += "&p_id_" + num(i) + "=" + util::urlEncode(c.param("p_id_" + num(i))) + "&p_qty_" + num(i) + "=" + util::urlEncode(c.param("p_qty_" + num(i)));
             for (int i = 1; i <= kSvcRows; ++i)
                 q += "&s_desc_" + num(i) + "=" + util::urlEncode(c.param("s_desc_" + num(i))) + "&s_qty_" + num(i) + "=" + util::urlEncode(c.param("s_qty_" + num(i))) +
@@ -1544,6 +1547,7 @@ struct WebApp::Impl {
             if (!rp || !util::parseInt(c.param("p_qty_" + num(i)), 1, inv::limits::kMaxQty, qty))
                 return back("Part row " + num(i) + ": enter a valid Part ID (that exists) and a quantity of at least 1.");
             inv::InvoiceLine l;
+            for (const inv::InvoiceLine& x : lines) if (x.partId == rp->id()) return back("Part row " + num(i) + ": that part is already in this sale - increase its quantity instead.");
             l.kind = inv::InvoiceLine::Kind::Part; l.partId = rp->id(); l.qty = static_cast<int>(qty);
             lines.push_back(l);
         }
@@ -1565,7 +1569,12 @@ struct WebApp::Impl {
         int partyCustomer = 0, partyVehicle = 0;
         const std::string partyErr = resolveParty(c, partyName, partyCustomer, partyVehicle);
         if (!partyErr.empty()) return back(partyErr);
-        const inv::CheckoutResult r = inv.checkout(partyName, lines, c.user(), paid, c.param("method").empty() ? "Cash" : c.param("method"), partyCustomer, partyVehicle);
+        const std::string recvBy = util::oneLine(util::trim(c.param("received_by")));
+        if (recvBy.size() > 40) return back("Received by is too long (max 40 characters).");
+        const bool onCredit = c.param("pay_type") == "credit";
+        if (onCredit && partyName.empty()) return back("Utang needs a customer name - type one or pick a saved customer.");
+        if (onCredit && util::trim(c.param("amount_paid")).empty()) paid = 0.0;
+        const inv::CheckoutResult r = inv.checkout(partyName, lines, c.user(), paid, c.param("method").empty() ? "Cash" : c.param("method"), partyCustomer, partyVehicle, recvBy);
         if (!r.ok) return back(r.message);
         if (r.balance > 0) {
             const inv::Invoice* v = inv.invoices().find(r.invoiceNumber);
@@ -1600,10 +1609,12 @@ struct WebApp::Impl {
         if (!pays.empty()) {
             b += "<h2>Payments received</h2><table><thead><tr><th>Date</th><th>Method</th><th>Received by</th><th>Note</th><th class='n'>Amount</th><th class='n'>Balance after</th></tr></thead><tbody>";
             for (const inv::Payment* p : pays)
-                b += "<tr><td>" + h(p->timestamp) + "</td><td>" + h(p->method) + "</td><td>" + h(p->user) + "</td><td>" + h(p->note) + "</td><td class='n'>" + php(p->amount) + "</td><td class='n'>" + php(p->balanceAfter) + "</td></tr>";
+                b += "<tr><td>" + h(p->timestamp) + "</td><td>" + h(p->method) + "</td><td>" + h(p->user) +
+                     (auth::allowed(c.role, auth::Permission::Receivables) ? " <span class='noprint'><a href='/payment-edit?no=" + util::urlEncode(v->number) + "&amp;i=" + num(p - inv.payments().all().data()) + "'>edit</a></span>" : std::string()) +
+                     "</td><td>" + h(p->note) + "</td><td class='n'>" + php(p->amount) + "</td><td class='n'>" + php(p->balanceAfter) + "</td></tr>";
             b += "</tbody></table>";
         }
-        b += "<p class='thanks'>Thank you for your business!</p></div>";
+        b += "</div>";
         html(c, layout(c, "Receipt " + no, b));
     }
 
@@ -1682,6 +1693,7 @@ struct WebApp::Impl {
                         "<label>Amount (&#8369;) - the full balance is pre-filled; type less for a partial / installment payment</label>"
                         "<input name='amount' inputmode='decimal' autocomplete='off' value='" + util::money(v->balance()) + "' required>"
                         "<label>Payment method</label>" + methodSelect(c.param("method")) +
+                        "<label>Received by (optional - leave blank for " + h(c.user()) + ")</label><input name='received_by' maxlength='40' autocomplete='off'>" +
                         "<label>Note (optional, e.g. reference no.)</label><input name='note' maxlength='80'>"
                         "<p><button type='submit'>Save payment</button> <a class='btn sec' href='/receivables'>Cancel</a></p></form></div></div>";
         const auto pays = inv.payments().forInvoice(v->number);
@@ -1694,13 +1706,47 @@ struct WebApp::Impl {
         html(c, layout(c, "Record payment", b));
     }
 
+    bool findPayment(Ctx& c, std::string& no, long long& i) {
+        no = c.param("no");
+        const auto& all = inv.payments().all();
+        return util::parseInt(c.param("i"), 0, 1000000000, i) && static_cast<size_t>(i) < all.size() && all[static_cast<size_t>(i)].invoiceNo == no;
+    }
+
+    void paymentEditPage(Ctx& c) {
+        std::string no; long long i = -1;
+        if (!findPayment(c, no, i)) return redirect(c, msgUrl("/invoices", "Payment not found.", false));
+        const inv::Payment& p = inv.payments().all()[static_cast<size_t>(i)];
+        std::string b = "<h1>Edit payment - " + h(no) + "</h1><div class='card'><table class='kv'>"
+                        "<tr><td>Date</td><td>" + h(p.timestamp) + "</td></tr><tr><td>Method</td><td>" + h(p.method) + "</td></tr>"
+                        "<tr><td>Amount</td><td class='n'>" + php(p.amount) + "</td></tr></table>"
+                        "<form method='post' action='/payment-edit'>" + tokenField(c) + "<input type='hidden' name='no' value='" + h(no) + "'><input type='hidden' name='i' value='" + num(i) + "'>"
+                        "<label>Received by</label><input name='received_by' maxlength='40' autocomplete='off' value='" + h(p.user) + "' required>"
+                        "<p><button type='submit'>Save</button> <a class='btn sec' href='/invoice?no=" + util::urlEncode(no) + "'>Cancel</a></p></form></div>";
+        html(c, layout(c, "Edit payment", b));
+    }
+
+    void doPaymentEdit(Ctx& c) {
+        std::string no; long long i = -1;
+        if (!findPayment(c, no, i)) return redirect(c, msgUrl("/invoices", "Payment not found.", false));
+        const std::string again = "/payment-edit?no=" + util::urlEncode(no) + "&i=" + num(i);
+        const std::string who = util::oneLine(util::trim(c.param("received_by")));
+        if (who.empty()) return redirect(c, msgUrl(again, "Enter who received the payment.", false));
+        if (who.size() > 40) return redirect(c, msgUrl(again, "Received by is too long (max 40 characters).", false));
+        const std::string old = inv.payments().all()[static_cast<size_t>(i)].user;
+        if (!inv.setPaymentReceivedBy(static_cast<size_t>(i), who)) return redirect(c, msgUrl(again, "Could not write payments.csv - check disk space/permissions.", false));
+        audit.record(c.user(), "PAYMENT_EDITED", no + " received by: " + old + " -> " + who, c.ip);
+        redirect(c, msgUrl("/invoice?no=" + util::urlEncode(no), "Received by updated.", true));
+    }
+
     void doPayment(Ctx& c) {
         const std::string no = c.param("no");
         const std::string back = "/payment?no=" + util::urlEncode(no);
         double amount = 0, expected = -1.0;
         if (!parseMoneyText(c.param("amount"), amount)) return redirect(c, msgUrl(back, "Enter the payment amount as a number.", false));
         if (!c.param("balance").empty() && !util::parseDouble(c.param("balance"), 0, inv::limits::kMaxPrice, expected)) expected = -1.0;
-        const inv::PaymentResult r = inv.recordPayment(no, amount, c.param("method"), c.param("note"), c.user(), expected);
+        const std::string recvBy = util::oneLine(util::trim(c.param("received_by")));
+        if (recvBy.size() > 40) return redirect(c, msgUrl(back, "Received by is too long (max 40 characters).", false));
+        const inv::PaymentResult r = inv.recordPayment(no, amount, c.param("method"), c.param("note"), c.user(), expected, recvBy);
         if (!r.ok) return redirect(c, msgUrl(inv.invoices().find(no) && inv.invoices().find(no)->balance() > 0 ? back : "/receivables", r.message, false));
         const std::string note = util::trim(c.param("note"));
         audit.record(c.user(), "PAYMENT_RECORDED", no + " " + r.customer + ": " + util::money(r.applied) + " via " + inv::canonicalMethod(c.param("method")) + ", balance " + util::money(r.balance) + " (" +

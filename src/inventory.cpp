@@ -233,6 +233,20 @@ std::vector<const Payment*> PaymentLog::forInvoice(const std::string& number) co
     return out;
 }
 
+bool PaymentLog::setUser(std::size_t index, const std::string& user) {
+    if (index >= entries_.size()) return false;
+    const std::string old = entries_[index].user;
+    entries_[index].user = util::oneLine(user);
+    std::string out = std::string(kPaymentHeader) + "\n";
+    for (const Payment& p : entries_)
+        out += util::csvEscape(p.timestamp) + ',' + util::csvEscape(p.invoiceNo) + ',' + util::csvEscape(p.user) + ',' + util::money(p.amount) + ',' +
+               util::csvEscape(p.method) + ',' + util::money(p.balanceAfter) + ',' + util::csvEscape(p.note) + "\n";
+    std::error_code ec;
+    fs::copy_file(file_, file_ + ".bak", fs::copy_options::overwrite_existing, ec);   // keep the previous version
+    if (!util::writeFileAtomic(file_, out)) { entries_[index].user = old; return false; }
+    return true;
+}
+
 double PaymentLog::paidFor(const std::string& number) const {
     double t = 0;
     for (const Payment& p : entries_) if (p.invoiceNo == number) t = util::round2(t + p.amount);
@@ -557,7 +571,7 @@ Result Inventory::applyStock(const std::vector<StockDelta>& deltas, MoveType typ
 }
 
 CheckoutResult Inventory::checkout(const std::string& customerIn, const std::vector<InvoiceLine>& in, const std::string& actor, double amountPaid,
-                                   const std::string& methodIn, int customerId, int vehicleId) {
+                                   const std::string& methodIn, int customerId, int vehicleId, const std::string& receivedBy) {
     auto fail = [](const std::string& m) { return CheckoutResult{false, m, "", 0, 0}; };
     const bool anonymous = util::trim(customerIn).empty() || util::equalsIgnoreCase(util::trim(customerIn), "Walk-in customer");
     const std::string customer = util::oneLine(anonymous ? std::string("Walk-in customer") : util::trim(customerIn));
@@ -624,7 +638,7 @@ CheckoutResult Inventory::checkout(const std::string& customerIn, const std::vec
     if (!invoices_.add(invoice)) warning_ += (warning_.empty() ? "" : " ") + std::string("invoices.csv could not be written.");
     if (paidNow > 0) {
         Payment pay;
-        pay.timestamp = invoice.timestamp; pay.invoiceNo = invoice.number; pay.user = actor; pay.amount = paidNow; pay.method = method;
+        pay.timestamp = invoice.timestamp; pay.invoiceNo = invoice.number; pay.user = receivedBy.empty() ? actor : receivedBy; pay.amount = paidNow; pay.method = method;
         pay.balanceAfter = util::round2(total - paidNow); pay.note = "paid at sale";
         if (!payments_.record(pay)) warning_ += (warning_.empty() ? "" : " ") + std::string("payments.csv could not be written.");
     }
@@ -632,7 +646,7 @@ CheckoutResult Inventory::checkout(const std::string& customerIn, const std::vec
 }
 
 PaymentResult Inventory::recordPayment(const std::string& invoiceNo, double amountIn, const std::string& methodIn, const std::string& noteIn,
-                                       const std::string& actor, double expectedBalance) {
+                                       const std::string& actor, double expectedBalance, const std::string& receivedBy) {
     auto fail = [](const std::string& m) { PaymentResult r; r.message = m; return r; };
     const Invoice* inv = invoices_.find(invoiceNo);
     if (!inv) return fail("Invoice not found.");
@@ -653,7 +667,7 @@ PaymentResult Inventory::recordPayment(const std::string& invoiceNo, double amou
     if (!invoices_.setAmountPaid(invoiceNo, newPaid)) return fail(invoices_.warning());
     inv = invoices_.find(invoiceNo);
     Payment p;
-    p.timestamp = util::nowStamp(); p.invoiceNo = invoiceNo; p.user = actor; p.amount = amount; p.method = method; p.note = note;
+    p.timestamp = util::nowStamp(); p.invoiceNo = invoiceNo; p.user = receivedBy.empty() ? actor : receivedBy; p.amount = amount; p.method = method; p.note = note;
     p.balanceAfter = inv->balance();
     if (!payments_.record(p)) warning_ = "payments.csv could not be written.";
     PaymentResult r;

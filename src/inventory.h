@@ -159,6 +159,7 @@ public:
     const std::vector<Payment>& all() const { return entries_; }
     std::vector<const Payment*> forInvoice(const std::string& number) const;  // oldest first
     double paidFor(const std::string& number) const;
+    bool setUser(std::size_t index, const std::string& user);  // change "received by" on one payment; rewrites payments.csv
 
 private:
     std::string file_;
@@ -231,6 +232,7 @@ public:
     const MovementLog& movements() const { return moves_; }
     const InvoiceBook& invoices() const { return invoices_; }
     const PaymentLog& payments() const { return payments_; }
+    bool setPaymentReceivedBy(std::size_t index, const std::string& user) { return payments_.setUser(index, user); }
     const std::string& dataDir() const { return dir_; }
     const std::string& lastWarning() const { return warning_; }   // e.g. "movements.csv could not be written"
 
@@ -261,13 +263,14 @@ public:
     // then required. Whatever is paid now is logged in payments.csv with `method`.
     // Phase 3: customerId / vehicleId (0 = none) are stored on the invoice as given; the caller has already checked they exist.
     CheckoutResult checkout(const std::string& customer, const std::vector<InvoiceLine>& lines, const std::string& actor,
-                            double amountPaid = -1.0, const std::string& method = "Cash", int customerId = 0, int vehicleId = 0);
+                            double amountPaid = -1.0, const std::string& method = "Cash", int customerId = 0, int vehicleId = 0,
+                            const std::string& receivedBy = "");
 
     // Logs a payment against an open invoice: updates invoices.csv (amount_paid / payment_status) and payments.csv.
     // expectedBalance (>= 0) is the balance the cashier was looking at; if it has changed meanwhile (double click,
     // another cashier) the payment is refused instead of being applied twice. Pass -1 to skip that check.
     PaymentResult recordPayment(const std::string& invoiceNo, double amount, const std::string& method, const std::string& note,
-                                const std::string& actor, double expectedBalance = -1.0);
+                                const std::string& actor, double expectedBalance = -1.0, const std::string& receivedBy = "");
 
     ImportSummary importCsv(const std::string& text, const std::string& actor);
 

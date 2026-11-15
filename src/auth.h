@@ -20,7 +20,7 @@ enum class Permission {
     ViewInventory,  // everyone
     Sell,           // create invoices / sales
     AdjustStock,    // restock + stock adjustments
-    Receivables,    // see customer balances + record payments (utang) -> Staff + Admin
+    Receivables,    // see customer balances + record payments (credit sales) -> Staff + Admin
     CashReport,     // end-of-day register close-out report -> Staff + Admin
     Customers,      // Phase 3: look up / add / edit customers and vehicles -> Staff + Admin
     Jobs,           // Phase 4: job orders / repair tickets (open, lines, status, print) -> Staff + Admin

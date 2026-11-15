@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -96,6 +97,33 @@ std::vector<PeriodTotals> revenueByPeriod(const std::vector<inv::Movement>& move
         for (const inv::InvoiceLine& l : inv.lines)
             if (l.kind == inv::InvoiceLine::Kind::Service) b->serviceRevenue += l.total();
     }
+    return out;
+}
+
+std::vector<PeriodTotals> revenueByPeriod(const std::vector<inv::Movement>& moves, const std::vector<inv::Invoice>& invoices,
+                                          const std::vector<inv::Payment>& payments, Period period, int count, std::time_t now) {
+    // Start from the accrual buckets only to get the labelled, empty buckets and the expenses; then rebuild revenue from payments.
+    std::vector<PeriodTotals> out = revenueByPeriod(moves, std::vector<inv::Invoice>{}, period, count, now);
+    for (PeriodTotals& pt : out) pt.partsRevenue = 0;   // (SALE movements are the accrual figure - not used here)
+    std::map<std::string, size_t> index;
+    for (size_t i = 0; i < out.size(); ++i) index[out[i].label] = i;
+    std::map<std::string, const inv::Invoice*> byNo;
+    for (const inv::Invoice& v : invoices) byNo[v.number] = &v;
+    for (const inv::Payment& p : payments) {
+        const auto it = byNo.find(p.invoiceNo);
+        if (it == byNo.end()) continue;
+        const auto t = util::parseStamp(p.timestamp);
+        if (!t) continue;
+        const auto bi = index.find(keyFor(*t, period));
+        if (bi == index.end()) continue;
+        double parts = 0, svc = 0;
+        for (const inv::InvoiceLine& l : it->second->lines) (l.kind == inv::InvoiceLine::Kind::Service ? svc : parts) += l.total();
+        const double total = parts + svc;
+        if (total <= 0) continue;
+        out[bi->second].partsRevenue += p.amount * parts / total;
+        out[bi->second].serviceRevenue += p.amount * svc / total;
+    }
+    for (PeriodTotals& pt : out) { pt.partsRevenue = util::round2(pt.partsRevenue); pt.serviceRevenue = util::round2(pt.serviceRevenue); }
     return out;
 }
 
@@ -246,6 +274,116 @@ DailyCashReport dailyCashReport(const std::vector<inv::Invoice>& invoices, const
     std::stable_sort(r.invoices.begin(), r.invoices.end(), [](const inv::Invoice* a, const inv::Invoice* b) { return a->timestamp < b->timestamp; });
     r.outstandingNow = totalReceivable(invoices);
     r.customersOwing = static_cast<int>(receivablesByCustomer(invoices, std::time(nullptr)).size());
+    return r;
+}
+
+// ================================================================ custom date-range sales report
+namespace {
+bool parseDay(const std::string& date, std::tm& out) {
+    if (!validDate(date)) return false;
+    out = std::tm{};
+    out.tm_year = std::atoi(date.substr(0, 4).c_str()) - 1900;
+    out.tm_mon = std::atoi(date.substr(5, 2).c_str()) - 1;
+    out.tm_mday = std::atoi(date.substr(8, 2).c_str());
+    out.tm_hour = 12;   // noon: stays on the right calendar day whatever DST does
+    out.tm_isdst = -1;
+    return true;
+}
+}  // namespace
+
+std::string addDays(const std::string& date, int days) {
+    std::tm t;
+    if (!parseDay(date, t)) return "";
+    t.tm_mday += days;
+    t.tm_isdst = -1;
+    if (std::mktime(&t) == static_cast<std::time_t>(-1)) return "";
+    char b[16];
+    std::strftime(b, sizeof b, "%Y-%m-%d", &t);
+    return b;
+}
+
+int daysBetween(const std::string& from, const std::string& to) {
+    std::tm a, b;
+    if (!parseDay(from, a) || !parseDay(to, b)) return 0;
+    const std::time_t ta = std::mktime(&a), tb = std::mktime(&b);
+    return static_cast<int>(std::lround(static_cast<double>(tb - ta) / kDay));
+}
+
+int weekdayOf(const std::string& date) {
+    std::tm t;
+    if (!parseDay(date, t)) return -1;
+    std::mktime(&t);
+    return t.tm_wday;
+}
+
+RangeSalesReport salesRangeReport(const std::vector<inv::Invoice>& invoices, const std::vector<inv::Payment>& payments,
+                                  const std::vector<inv::Movement>& moves, const std::string& from, const std::string& to) {
+    RangeSalesReport r;
+    r.from = from;
+    r.to = to;
+    if (!validDate(from) || !validDate(to) || from > to) return r;
+    r.dayCount = daysBetween(from, to) + 1;
+    if (r.dayCount > kMaxRangeDays) { r.dayCount = 0; return r; }
+
+    std::map<std::string, size_t> dayIndex;
+    std::string d = from;
+    for (int i = 0; i < r.dayCount; ++i, d = addDays(d, 1)) {
+        dayIndex[d] = r.byDay.size();
+        DaySales ds;
+        ds.date = d;
+        r.byDay.push_back(ds);
+    }
+    auto inRange = [&](const std::string& stamp) {
+        return dayIndex.count(stamp.substr(0, 10)) > 0;   // also skips malformed timestamps
+    };
+
+    std::map<std::string, const inv::Invoice*> mine;
+    for (const inv::Invoice& i : invoices) {
+        if (!inRange(i.timestamp)) continue;
+        mine[i.number] = &i;
+        r.invoices.push_back(&i);
+        ++r.invoiceCount;
+        const double total = util::round2(i.total());
+        r.grossSales = util::round2(r.grossSales + total);
+        for (const inv::InvoiceLine& l : i.lines) {
+            if (l.kind == inv::InvoiceLine::Kind::Service) r.serviceSales = util::round2(r.serviceSales + l.total());
+            else r.partsSales = util::round2(r.partsSales + l.total());
+        }
+        r.stillOwing = util::round2(r.stillOwing + i.balance());
+        switch (i.status()) {
+            case inv::PayStatus::Paid: ++r.paidCount; break;
+            case inv::PayStatus::Partial: ++r.partialCount; break;
+            default: ++r.unpaidCount; break;
+        }
+        DaySales& ds = r.byDay[dayIndex[i.timestamp.substr(0, 10)]];
+        ++ds.invoiceCount;
+        ds.grossSales = util::round2(ds.grossSales + total);
+    }
+
+    std::map<std::string, MethodTotal> methods;
+    for (const inv::Payment& p : payments) {
+        if (!inRange(p.timestamp)) continue;
+        r.payments.push_back(&p);
+        r.collected = util::round2(r.collected + p.amount);
+        if (mine.count(p.invoiceNo)) r.collectedOnRange = util::round2(r.collectedOnRange + p.amount);
+        else r.collectedOnOlder = util::round2(r.collectedOnOlder + p.amount);
+        DaySales& ds = r.byDay[dayIndex[p.timestamp.substr(0, 10)]];
+        ds.collected = util::round2(ds.collected + p.amount);
+        MethodTotal& m = methods[p.method];
+        m.method = p.method;
+        ++m.count;
+        m.amount = util::round2(m.amount + p.amount);
+    }
+    for (const inv::Movement& m : moves)
+        if (m.type == inv::MoveType::Restock && inRange(m.timestamp)) r.expenses = util::round2(r.expenses + m.qtyChanged * m.unitPrice);
+
+    for (auto& kv : methods) r.byMethod.push_back(kv.second);
+    std::sort(r.byMethod.begin(), r.byMethod.end(), [](const MethodTotal& a, const MethodTotal& b) {
+        if (a.amount != b.amount) return a.amount > b.amount;
+        return a.method < b.method;
+    });
+    std::stable_sort(r.invoices.begin(), r.invoices.end(), [](const inv::Invoice* a, const inv::Invoice* b) { return a->timestamp < b->timestamp; });
+    std::stable_sort(r.payments.begin(), r.payments.end(), [](const inv::Payment* a, const inv::Payment* b) { return a->timestamp < b->timestamp; });
     return r;
 }
 

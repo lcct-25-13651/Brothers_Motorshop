@@ -1,0 +1,2007 @@
+#include "web.h"
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#endif
+
+#include <algorithm>
+#include <chrono>
+#include <ctime>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <set>
+#include <sstream>
+
+#include "httplib.h"
+#include "api.h"
+#include "crm.h"
+#include "jobs.h"
+#include "jobs_ui.h"
+#include "json.h"
+#include "reports.h"
+#include "util.h"
+#include "login_bg_v2.h"
+#include "logo_asset.h"
+#include "suppliers.h"
+#include <cstdio>
+#include "re_asset.h"
+#include "web_assets.h"
+
+namespace web {
+
+using util::htmlEscape;
+namespace {
+
+std::string h(const std::string& s) { return htmlEscape(s); }
+std::string php(double v) { return "&#8369;" + util::moneyFmt(v); }  // peso sign
+std::string num(long long v) { return std::to_string(v); }
+
+struct Session {
+    std::string user, csrf;
+    std::chrono::steady_clock::time_point expires;
+};
+
+// Everything a handler needs about the current request.
+struct Ctx {
+    const httplib::Request& req;
+    httplib::Response& res;
+    Session* sess = nullptr;                // null on public pages
+    auth::Role role = auth::Role::Staff;
+    std::string ip;
+    Ctx(const httplib::Request& rq, httplib::Response& rs) : req(rq), res(rs) {}
+    std::string param(const std::string& k) const { return req.get_param_value(k); }
+    const std::string& user() const { static const std::string none; return sess ? sess->user : none; }
+};
+
+std::string cookieValue(const httplib::Request& req, const std::string& name) {
+    const std::string c = req.get_header_value("Cookie");
+    size_t pos = 0;
+    while (pos < c.size()) {
+        size_t end = c.find(';', pos);
+        if (end == std::string::npos) end = c.size();
+        const std::string item = util::trim(c.substr(pos, end - pos));
+        if (item.rfind(name + "=", 0) == 0) return item.substr(name.size() + 1);
+        pos = end + 1;
+    }
+    return "";
+}
+
+std::string msgUrl(const std::string& path, const std::string& msg, bool ok) {
+    return path + (path.find('?') == std::string::npos ? "?" : "&") + "kind=" + (ok ? "ok" : "err") + "&msg=" + util::urlEncode(msg);
+}
+
+}  // namespace
+
+// ============================================================================ Impl
+struct WebApp::Impl {
+    inv::Inventory& inv;
+    auth::Authenticator& users;
+    auth::AuditLog& audit;
+    Config cfg;
+    httplib::Server svr;
+    std::mutex mtx;  // httplib is multi-threaded; the stores are not
+    sup::SupplierBook suppliers;   // Phase 2
+    sup::PurchaseLog purchases;
+    crm::Registry people;          // Phase 3: customers + vehicles
+    jobs::JobBook jobbook;         // Phase 4: job orders / repair tickets
+    std::map<std::string, Session> sessions;
+    std::string kioskToken_;   // the shared session used by --auto-login (kiosk / demo mode)
+    auth::LoginThrottle throttle;
+    static constexpr std::chrono::minutes kIdle{30};
+
+    Impl(inv::Inventory& i, auth::Authenticator& u, auth::AuditLog& a, Config c) : inv(i), users(u), audit(a), cfg(std::move(c)) {
+        suppliers.open(inv.dataDir());
+        purchases.open(inv.dataDir());
+        people.open(inv.dataDir());
+        jobbook.open(inv.dataDir(), inv, &audit, &people);
+        if (!cfg.autoLogin.empty())
+            audit.record(cfg.autoLogin, "AUTO_LOGIN", "kiosk/demo mode: every request is signed in without a session cookie", "");
+        svr.set_payload_max_length(8 * 1024 * 1024);
+        svr.set_exception_handler([](const httplib::Request&, httplib::Response& res, std::exception_ptr) {
+            res.status = 500;
+            res.set_content("<h1>Something went wrong</h1><p>The request could not be completed.</p>", "text/html; charset=utf-8");
+        });
+        routes();
+    }
+
+    // ------------------------------------------------------------------ sessions
+    Session* sessionFor(const httplib::Request& req, std::string* tokenOut = nullptr) {
+        const std::string t = cookieValue(req, "sid");
+        auto it = sessions.find(t);
+        if (t.empty() || it == sessions.end()) return nullptr;
+        if (std::chrono::steady_clock::now() > it->second.expires) { sessions.erase(it); return nullptr; }
+        it->second.expires = std::chrono::steady_clock::now() + kIdle;
+        if (tokenOut) *tokenOut = t;
+        return &it->second;
+    }
+    // Session for a request, honouring kiosk mode (see Config::autoLogin): when it is on there is no
+    // cookie to read, so the request is signed in as the configured account.
+    Session* sessionForRequest(const httplib::Request& req, std::string* tokenOut = nullptr) {
+        if (Session* s = sessionFor(req, tokenOut)) return s;
+        if (cfg.autoLogin.empty()) return nullptr;
+        const std::string who = users.canonicalName(cfg.autoLogin);
+        if (who.empty()) return nullptr;
+        // ONE shared session for every cookie-less request: a kiosk is one workstation, and handing
+        // out a new session per request would also hand out a new CSRF token and break every form.
+        auto it = kioskToken_.empty() ? sessions.end() : sessions.find(kioskToken_);
+        if (it == sessions.end()) {
+            kioskToken_ = startSession(who);
+            it = sessions.find(kioskToken_);
+        }
+        it->second.expires = std::chrono::steady_clock::now() + kIdle;
+        if (tokenOut) *tokenOut = kioskToken_;
+        return &it->second;
+    }
+
+    std::string startSession(const std::string& user) {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = sessions.begin(); it != sessions.end();) it = now > it->second.expires ? sessions.erase(it) : std::next(it);
+        const std::string t = auth::newToken();
+        sessions[t] = {user, auth::newToken(), now + kIdle};
+        return t;
+    }
+    void dropUserSessions(const std::string& user, const std::string& keep = "") {
+        for (auto it = sessions.begin(); it != sessions.end();)
+            it = (util::equalsIgnoreCase(it->second.user, user) && it->first != keep) ? sessions.erase(it) : std::next(it);
+    }
+
+    // The session cookie: same attributes everywhere, so login and logout always agree.
+    std::string sessionCookie(const std::string& token, bool clear) const {
+        std::string c = "sid=" + token + "; Path=/; HttpOnly; SameSite=" + cfg.cookieSameSite;
+        if (cfg.secureCookies) c += "; Secure";             // required for SameSite=None, harmless otherwise
+        if (cfg.partitionedCookies) c += "; Partitioned";   // survives third-party cookie blocking
+        if (clear) c += "; Max-Age=0";
+        return c;
+    }
+
+    // ------------------------------------------------------------------ routing + gatekeeping
+    using Fn = void (Impl::*)(Ctx&);
+
+    // perm == nullopt  -> any logged-in user.   pub == true -> no login needed.
+    void add(const char* method, const std::string& path, Fn fn, std::optional<auth::Permission> perm = std::nullopt, bool pub = false) {
+        auto handler = [this, fn, perm, pub, path](const httplib::Request& req, httplib::Response& res) {
+            std::lock_guard<std::mutex> lock(mtx);
+            res.set_header("X-Content-Type-Options", "nosniff");
+            res.set_header("Referrer-Policy", "same-origin");
+            res.set_header("Cache-Control", "no-store");
+            // Framing is refused unless the operator asked for it (--allow-embedding).
+            if (!cfg.allowEmbedding) {
+                res.set_header("X-Frame-Options", "DENY");
+                res.set_header("Content-Security-Policy",
+                               "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; form-action 'self'");
+            } else {
+                res.set_header("Content-Security-Policy",
+                               "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'self'");
+            }
+            Ctx c{req, res};
+            c.ip = req.remote_addr;
+            if (!users.isConfigured()) {  // brand-new install: only the setup page works
+                if (path != "/setup" && path.rfind("/static/", 0) != 0) return redirect(c, "/setup");
+            } else if (!pub) {
+                std::string token;
+                c.sess = sessionForRequest(req, &token);
+                const auto role = c.sess ? users.roleOf(c.sess->user) : std::nullopt;
+                if (!c.sess || !role) {
+                    if (c.sess) sessions.erase(token);  // account was deleted meanwhile
+                    // Just logged in (?welcome=1) and already anonymous again: say why instead of
+                    // silently bouncing back to a bare login form.
+                    if (req.has_param("welcome")) return redirect(c, "/login?nocookie=1");
+                    return redirect(c, "/login");
+                }
+                c.role = *role;
+                if (perm && !auth::allowed(c.role, *perm)) {
+                    audit.record(c.user(), "ACCESS_DENIED", std::string(req.method) + " " + req.path, c.ip);
+                    return forbidden(c, "Your role (" + std::string(auth::roleName(c.role)) + ") is not allowed to do that.");
+                }
+                if (req.method == "POST" && !auth::constantTimeEquals(c.param("csrf"), c.sess->csrf)) {
+                    return forbidden(c, "Security token missing or expired. Go back, reload the page and try again.");
+                }
+            }
+            (this->*fn)(c);
+        };
+        if (std::string(method) == "GET") svr.Get(path, handler); else svr.Post(path, handler);
+    }
+
+    void routes() {
+        using P = auth::Permission;
+        add("GET", "/static/app.css", &Impl::cssFile, std::nullopt, true);
+        add("GET", "/static/app.js", &Impl::jsFile, std::nullopt, true);
+        add("GET", "/static/logo.png", &Impl::logoFile, std::nullopt, true);
+        add("GET", "/static/login-bg.jpg", &Impl::loginBgFile, std::nullopt, true);
+        add("GET", "/static/re.jpg", &Impl::reFile, std::nullopt, true);
+        add("GET", "/login", &Impl::loginPage, std::nullopt, true);
+        add("POST", "/login", &Impl::doLogin, std::nullopt, true);
+        add("GET", "/setup", &Impl::setupPage, std::nullopt, true);
+        add("POST", "/setup", &Impl::doSetup, std::nullopt, true);
+        add("GET", "/forgot", &Impl::forgotPage, std::nullopt, true);
+        add("POST", "/forgot", &Impl::doForgot, std::nullopt, true);
+        add("POST", "/logout", &Impl::doLogout);
+        add("GET", "/", &Impl::dashboard, P::ViewInventory);
+        add("GET", "/stock", &Impl::stockPage, P::AdjustStock);
+        add("POST", "/stock", &Impl::doStock, P::AdjustStock);
+        add("GET", "/add", &Impl::addPage, P::AddPart);
+        add("POST", "/add", &Impl::doAdd, P::AddPart);
+        add("GET", "/edit", &Impl::editPage, P::EditPart);
+        add("POST", "/edit", &Impl::doEdit, P::EditPart);
+        add("GET", "/delete", &Impl::deletePage, P::DeletePart);
+        add("POST", "/delete", &Impl::doDelete, P::DeletePart);
+        add("GET", "/invoice", &Impl::invoicePage, P::Sell);
+        add("POST", "/invoice", &Impl::doInvoice, P::Sell);
+        add("GET", "/invoices", &Impl::invoiceList, P::Sell);
+        add("GET", "/receivables", &Impl::receivablesPage, P::Receivables);
+        add("GET", "/payment", &Impl::paymentPage, P::Receivables);
+        add("POST", "/payment", &Impl::doPayment, P::Receivables);
+        add("GET", "/payment-edit", &Impl::paymentEditPage, P::Receivables);
+        add("POST", "/payment-edit", &Impl::doPaymentEdit, P::Receivables);
+        add("GET", "/cash-report", &Impl::cashReportPage, P::CashReport);
+        add("GET", "/customers", &Impl::customersPage, P::Customers);
+        add("GET", "/customer", &Impl::customerPage, P::Customers);
+        add("GET", "/customer/edit", &Impl::customerEditPage, P::Customers);
+        add("POST", "/customer/save", &Impl::doCustomerSave, P::Customers);
+        add("POST", "/customer/archive", &Impl::doCustomerArchive, P::ArchiveCustomers);
+        add("POST", "/customer/delete", &Impl::doCustomerDelete, P::ArchiveCustomers);
+        add("GET", "/vehicle", &Impl::vehiclePage, P::Customers);
+        add("GET", "/vehicle/edit", &Impl::vehicleEditPage, P::Customers);
+        add("POST", "/vehicle/save", &Impl::doVehicleSave, P::Customers);
+        add("POST", "/vehicle/archive", &Impl::doVehicleArchive, P::ArchiveCustomers);
+        add("POST", "/vehicle/delete", &Impl::doVehicleDelete, P::ArchiveCustomers);
+        add("GET", "/reports", &Impl::reportsPage, P::ViewReports);
+        add("GET", "/analytics.pdf", &Impl::analyticsPdf, P::ViewReports);
+        add("GET", "/movements", &Impl::movementsPage, P::ViewReports);
+        add("GET", "/audit", &Impl::auditPage, P::ViewAudit);
+        add("GET", "/data", &Impl::dataPage, P::ExportData);
+        add("GET", "/export/inventory.csv", &Impl::exportInventory, P::ExportData);
+        add("GET", "/export/movements.csv", &Impl::exportMovements, P::ExportData);
+        add("POST", "/import", &Impl::doImport, P::ImportData);
+        add("POST", "/backup", &Impl::doBackup, P::RunBackup);
+        add("GET", "/users", &Impl::usersPage, P::ManageUsers);
+        add("POST", "/users/add", &Impl::doUserAdd, P::ManageUsers);
+        add("POST", "/users/role", &Impl::doUserRole, P::ManageUsers);
+        add("POST", "/users/reset", &Impl::doUserReset, P::ManageUsers);
+        add("POST", "/users/delete", &Impl::doUserDelete, P::ManageUsers);
+        // Suppliers pages disabled (confidential): add("GET", "/suppliers", &Impl::suppliersPage, P::ManageSuppliers);
+        // add("POST", "/suppliers/save", &Impl::doSupplierSave, P::ManageSuppliers);
+        // add("POST", "/suppliers/toggle", &Impl::doSupplierToggle, P::ManageSuppliers);
+        add("GET", "/account", &Impl::accountPage);
+        add("POST", "/account/password", &Impl::doAccountPassword);
+        add("GET", "/jobs", &Impl::jobsPage, P::Jobs); 
+        add("GET", "/static/jobs.js", &Impl::jobsJsFile, P::Jobs);
+        apiRoutes(); 
+    }
+
+    // ------------------------------------------------------------------ Phase 4: the JSON API
+    // Sessions, roles and CSRF stay here (single source of truth); api.cpp only knows job logic.
+    void apiRoutes() {
+        api::Deps deps;
+        deps.inv = &inv;
+        deps.jobs = &jobbook;
+        deps.people = &people;
+        deps.audit = &audit;
+        deps.shopName = cfg.shopName;
+        deps.corsOrigin = cfg.corsOrigin;
+        deps.dataLock = &mtx;   // the same mutex every HTML request is served under
+        api::registerRoutes(svr, deps,
+                            [this](const httplib::Request& rq, httplib::Response& rs, auth::Permission need, api::Credentials& out) {
+                                return apiAuthorize(rq, rs, need, out);
+                            });
+    }
+
+    // JSON answer for a refused API call (the web pages get HTML instead, see forbidden()).
+    static void apiDeny(Ctx& c, int status, const std::string& error) {
+        c.res.status = status;
+        c.res.set_content(json::obj({{"ok", json::boolean(false)}, {"error", json::str(error)}, {"status", json::num(status)}}),
+                          "application/json; charset=utf-8");
+    }
+
+    bool apiAuthorize(const httplib::Request& req, httplib::Response& res, auth::Permission need, api::Credentials& out) {
+        Ctx c{req, res};
+        c.ip = req.remote_addr;
+        if (!users.isConfigured()) {
+            apiDeny(c, 401, "This shop has no accounts yet - open the app and create the Admin account.");
+            return false;
+        }
+        std::string token;
+        c.sess = sessionForRequest(req, &token);
+        if (!c.sess) {
+            apiDeny(c, 401, "Not signed in (open the app in a browser and log in).");
+            return false;
+        }
+        const auto role = users.roleOf(c.sess->user);
+        if (!role) {
+            sessions.erase(token);
+            apiDeny(c, 401, "That account no longer exists.");
+            return false;
+        }
+        c.role = *role;
+        if (!auth::allowed(c.role, need)) {
+            audit.record(c.user(), "ACCESS_DENIED", std::string(req.method) + " " + req.path, c.ip);
+            apiDeny(c, 403, "Your role (" + std::string(auth::roleName(c.role)) + ") is not allowed to do that.");
+            return false;
+        }
+        if (req.method != "GET" && req.method != "OPTIONS") {
+            // The token may ride in the X-CSRF-Token header (fetch), as a form field or inside a JSON body.
+            std::string given = req.get_header_value("X-CSRF-Token");
+            if (given.empty()) given = req.get_param_value("csrf");
+            if (given.empty() && !req.body.empty())
+                if (auto body = json::parse(req.body))
+                    if (const json::Value* f = body->find("csrf")) given = f->asString();
+            if (!auth::constantTimeEquals(given, c.sess->csrf)) {
+                apiDeny(c, 403, "Security token missing or expired. Reload the page and try again.");
+                return false;
+            }
+        }
+        out.user = c.user();
+        out.role = c.role;
+        out.ip = c.ip;
+        return true;
+    }
+
+    // The job-order page: the normal layout, with a body + script that live in jobs_ui.h.
+    void jobsPage(Ctx& c) {
+        std::string body = kJobsBody;
+        auto inject = [](std::string& text, const char* marker, const std::string& with) {
+            const std::string needle = marker;
+            const size_t at = text.find(needle);
+            if (at != std::string::npos) text.replace(at, needle.size(), with);
+        };
+        inject(body, "/*CSRF*/", htmlEscape(c.sess ? c.sess->csrf : std::string()));
+        inject(body, "/*SHOP*/", htmlEscape(cfg.shopName));
+        html(c, layout(c, "Job orders", body));
+    }
+    void jobsJsFile(Ctx& c) {
+        c.res.set_header("Cache-Control", "no-store");   // carries no secret, but keep it fresh
+        c.res.set_content(kJobsScript, "application/javascript; charset=utf-8");
+    }
+
+    // ------------------------------------------------------------------ response helpers
+    static void redirect(Ctx& c, const std::string& url) { c.res.set_redirect(url, 303); }
+    static void html(Ctx& c, const std::string& body, int status = 200) { c.res.status = status; c.res.set_content(body, "text/html; charset=utf-8"); }
+    void forbidden(Ctx& c, const std::string& why) { html(c, layout(c, "Not allowed", "<div class='flash err'>" + h(why) + "</div><p><a class='btn sec' href='/'>Back to inventory</a></p>"), 403); }
+    static void csv(Ctx& c, const std::string& name, const std::string& body) {
+        c.res.set_header("Content-Disposition", "attachment; filename=\"" + name + "\"");
+        c.res.set_content(body, "text/csv; charset=utf-8");
+    }
+    void cssFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=3600"); c.res.set_content(kCss, "text/css; charset=utf-8"); }
+    void logoFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=86400"); c.res.set_content(std::string(reinterpret_cast<const char*>(kLogoPng), kLogoPngSize), "image/png"); }
+    void reFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=86400"); c.res.set_content(std::string(reinterpret_cast<const char*>(kReJpg), kReJpgSize), "image/jpeg"); }
+    void loginBgFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=86400"); c.res.set_content(std::string(reinterpret_cast<const char*>(kLoginBgJpg), kLoginBgJpgSize), "image/jpeg"); }
+    void jsFile(Ctx& c) { c.res.set_header("Cache-Control", "max-age=3600"); c.res.set_content(kJs, "application/javascript; charset=utf-8"); }
+
+    static std::string tokenField(const Ctx& c) { return "<input type='hidden' name='csrf' value='" + h(c.sess ? c.sess->csrf : "") + "'>"; }
+    static std::string flash(Ctx& c) {
+        const std::string m = c.param("msg");
+        if (m.empty()) return "";
+        return std::string("<div class='flash ") + (c.param("kind") == "ok" ? "ok" : "err") + "' role='" + (c.param("kind") == "ok" ? "status" : "alert") + "'><span>" + h(m) + "</span></div>";
+    }
+    int intParam(Ctx& c, const char* name, int lo, int hi, int dflt) {
+        long long v;
+        return util::parseInt(c.param(name), lo, hi, v) ? static_cast<int>(v) : dflt;
+    }
+
+    // Money typed by a person: allows "1,200.50" and surrounding spaces. Blank -> false.
+    static bool parseMoneyText(const std::string& in, double& out) {
+        std::string s;
+        for (char ch : util::trim(in)) if (ch != ',') s += ch;
+        return !s.empty() && util::parseDouble(s, 0, inv::limits::kMaxPrice, out);
+    }
+    static std::string statusTag(inv::PayStatus s) {
+        const char* cls = s == inv::PayStatus::Paid ? "ok" : s == inv::PayStatus::Partial ? "low" : "out";
+        return std::string("<span class='tag ") + cls + "'>" + inv::payStatusName(s) + "</span>";
+    }
+    static std::string methodSelect(const std::string& chosen, const char* name = "method") {
+        std::string o = std::string("<select name='") + name + "'>";
+        const std::string pick = inv::canonicalMethod(chosen).empty() ? "Cash" : inv::canonicalMethod(chosen);
+        for (const std::string& m : inv::paymentMethods()) o += "<option" + std::string(m == pick ? " selected" : "") + ">" + h(m) + "</option>";
+        return o + "</select>";
+    }
+    // Autocomplete lists for New sale: saved customers (with their id) first, then older free-text names that are not a saved customer.
+    std::string customersDatalist() const {
+        std::set<std::string> seen;
+        std::string o = "<datalist id='custs'>";
+        for (const crm::Customer& k : people.customers()) {
+            if (k.archived) continue;
+            seen.insert(reports::customerKey(k.name));
+            o += "<option value='" + h(customerLabel(k)) + "' data-id='" + num(k.id) + "'>";
+        }
+        size_t legacy = 0;
+        for (const inv::Invoice& i : inv.invoices().all())
+            if (i.customer != "Walk-in customer" && seen.insert(reports::customerKey(i.customer)).second && ++legacy <= 500) o += "<option value='" + h(i.customer) + "'>";
+        return o + "</datalist>";
+    }
+    std::string vehiclesDatalist() const {
+        std::string o = "<datalist id='vehs'>";
+        for (const crm::Vehicle& v : people.vehicles()) {
+            const crm::Customer* k = people.findCustomer(v.customerId);
+            if (v.archived || !k || k->archived) continue;
+            o += "<option value='" + h(vehicleLabel(v)) + "' data-id='" + num(v.id) + "' data-cid='" + num(v.customerId) + "'>";
+        }
+        return o + "</datalist>";
+    }
+
+    // ------------------------------------------------------------------ layout
+    std::string head(const std::string& title, const char* bodyClass = "") const {
+        std::string cls = *bodyClass ? std::string(" class='") + bodyClass + "'" : "";
+        return "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+               "<title>" + h(title) + " - " + h(cfg.shopName) + "</title><link rel='icon' type='image/png' href='/static/logo.png'><link rel='stylesheet' href='/static/app.css'></head><body" + cls + ">";
+    }
+    std::string layout(Ctx& c, const std::string& title, const std::string& body) {
+        std::string o = head(title);
+        if (c.sess) {
+            using P = auth::Permission;
+            const std::string path = c.req.path;
+            auto link = [&](const std::string& href, const std::string& text) {
+                return "<a href='" + href + "'" + (path == href ? " class='on'" : "") + ">" + text + "</a>";
+            };
+            o += "<header class='top'><span class='brand'><img class='brand-logo' src='/static/logo.png' alt=''><span>" + h(cfg.shopName) + "</span></span><nav>" + link("/", "Inventory" + alertBadge());
+            if (auth::allowed(c.role, P::Sell)) o += link("/invoice", "New sale") + link("/invoices", "Invoices");
+            if (auth::allowed(c.role, P::Jobs)) o += link("/jobs", "Job orders");  
+            if (auth::allowed(c.role, P::Customers)) o += link("/customers", "Customers");
+            if (auth::allowed(c.role, P::Receivables)) o += link("/receivables", "Accounts Receivable");
+            if (auth::allowed(c.role, P::CashReport)) o += link("/cash-report", "Daily cash report");
+            if (auth::allowed(c.role, P::AddPart)) o += link("/add", "Add part");
+            if (auth::allowed(c.role, P::ViewReports)) o += link("/reports", "Reports") + link("/movements", "Movements");
+            if (auth::allowed(c.role, P::ExportData)) o += link("/data", "Data &amp; backups");
+            if (auth::allowed(c.role, P::ViewAudit)) o += link("/audit", "Audit");
+            // Suppliers link hidden (confidential)
+            // Users link hidden (single-owner shop); the page is still at /users
+            o += "</nav><div class='re-badge' aria-hidden='true'><img src='/static/re.jpg' alt='Bajaj RE'><span>Bajaj RE Parts</span></div>"
+                 "<form method='post' action='/logout'>" + tokenField(c) + "<a href='/account'><span class='chip'>" + h(c.user()) + " &middot; " +
+                 auth::roleName(c.role) + "</span></a><button class='sm sec' type='submit'>Log out</button></form></header>";
+        }
+        o += "<main>" + flash(c);
+        if (!inv.lastWarning().empty()) o += "<div class='flash err'>" + h(inv.lastWarning()) + "</div>";
+        if (!jobbook.warning().empty()) o += "<div class='flash err'>" + h(jobbook.warning()) + "</div>";
+        o += body + "</main><script src='/static/app.js'></script></body></html>";
+        return o;
+    }
+    // Pages shown before login (no nav bar).
+    // Splash screen with the spinning 3D logo: shown once per browser session (a session cookie remembers it), or any time with ?splash=1.
+    static std::string splashHtml() {
+        std::string layers;
+        for (int i = 0; i < 9; ++i) layers += "<img src='/static/logo.png' alt=''>";
+        return "<div class='splash' aria-hidden='true'><div class='splash-stage'><div class='splash-glow'></div><div class='coin'>" + layers +
+               "</div><div class='splash-floor'></div><div class='splash-name'>Brothers Motorshop</div>"
+               "<div class='splash-sub'>RE Parts &amp; Inventory System</div><div class='splash-bar'><i></i></div></div></div>";
+    }
+    std::string bare(Ctx& c, const std::string& title, const std::string& body) {
+        std::string splash;
+        if (c.param("splash") == "1" || (c.req.method == "GET" && c.param("msg").empty())) {
+            splash = splashHtml();
+            c.res.set_header("Set-Cookie", "splash=1; Path=/; SameSite=Lax");
+        }
+        return head(title, "auth") + splash +
+               "<div class='bg-orb o1'></div><div class='bg-orb o2'></div><div class='bg-orb o3'></div>"
+               "<div class='bg-gear g1' aria-hidden='true'><svg viewBox='0 0 48 48'><circle cx='24' cy='24' r='15' fill='none' stroke='currentColor' stroke-width='6' stroke-dasharray='3.93 3.93'/><circle cx='24' cy='24' r='13' fill='currentColor'/><circle cx='24' cy='24' r='5.5' fill='#0f172a'/></svg></div><div class='bg-gear g2' aria-hidden='true'><svg viewBox='0 0 48 48'><circle cx='24' cy='24' r='15' fill='none' stroke='currentColor' stroke-width='6' stroke-dasharray='3.93 3.93'/><circle cx='24' cy='24' r='13' fill='currentColor'/><circle cx='24' cy='24' r='5.5' fill='#0f172a'/></svg></div>"
+               "<main class='auth-wrap'><section class='auth-card'>"
+               "<div class='auth-brand'><div class='auth-logo'><img src='/static/logo.png' alt=\"Brother's Motorshop logo\"></div><h1>" + h(cfg.shopName) + "</h1>"
+               "<p class='auth-sub'>RE Parts &amp; Inventory System</p></div>" + flash(c) + body +
+               "</section><p class='auth-foot'>Authorized staff only</p></main><script src='/static/app.js'></script></body></html>";
+    }
+
+    // ------------------------------------------------------------------ login / setup / recovery
+    void loginPage(Ctx& c) {
+        if (sessionFor(c.req) || !cfg.autoLogin.empty()) return redirect(c, "/");   // kiosk mode needs no login
+        // ?nocookie=1 is set when somebody logs in and lands back here: the browser threw the session
+        // cookie away (the app is inside a frame on another site and third-party cookies are blocked).
+        // Say so and offer the address to open in its own tab, where cookies are first-party.
+        std::string banner;
+        if (c.param("nocookie") == "1") {
+            const std::string host = c.req.get_header_value("Host");
+            std::string url;
+            if (!host.empty()) {
+                std::string scheme = c.req.get_header_value("X-Forwarded-Proto");
+                if (scheme.empty()) scheme = "http";
+                url = scheme + "://" + host + "/";
+            }
+            banner = "<div class='flash err' role='alert'><span>Your browser did not keep the session cookie, "
+                     "so the app cannot keep you signed in. That happens when the app is shown inside a frame "
+                     "on another site and the browser blocks third-party cookies. ";
+            if (!url.empty())
+                banner += "Open it in its own tab instead: <a href='" + h(url) + "'>" + h(url) + "</a> - ";
+            banner += "or allow third-party cookies for this site and log in again. (Some framed previews cannot "
+                      "store cookies at all - starting the app with --auto-login USER bypasses the session for a "
+                      "kiosk or demo screen.)</span></div>";
+        }
+        html(c, bare(c, "Sign in",
+                     banner +
+                     "<h2>Sign in</h2><p class='mut'>Enter your account details to continue.</p>"
+                     "<form method='post' action='/login'><label for='username'>Username</label><input id='username' name='username' autofocus required autocomplete='username' autocapitalize='off' spellcheck='false' placeholder='Your username'>"
+                     "<label for='password'>Password</label><input id='password' name='password' type='password' required autocomplete='current-password' placeholder='Your password'><label class='pw-show'><input type='checkbox' id='show-pw' data-toggle-pw='password'> Show password</label><p><button type='submit'>Log In</button></p>"
+                     "<p class='mut'><a href='/forgot'>Forgot password?</a></p></form>"));
+    }
+    void doLogin(Ctx& c) {
+        const std::string name = c.param("username"), key = c.ip + "|" + util::toLower(name);
+        if (throttle.blocked(key) || throttle.blocked(c.ip + "|*")) return redirect(c, msgUrl("/login", "Too many failed attempts. Wait a few minutes and try again.", false));
+        auto who = users.login(name, c.param("password"));
+        if (!who) {
+            throttle.fail(key);
+            throttle.fail(c.ip + "|*");
+            audit.record(name, "LOGIN_FAILED", "bad username or password", c.ip);
+            return redirect(c, msgUrl("/login", "Wrong username or password.", false));
+        }
+        throttle.ok(key);
+        const std::string token = startSession(who->first);
+        audit.record(who->first, "LOGIN", std::string("role ") + auth::roleName(who->second), c.ip);
+        c.res.set_header("Set-Cookie", sessionCookie(token, false));
+        redirect(c, "/?welcome=1");
+    }
+    void doLogout(Ctx& c) {
+        std::string token;
+        sessionFor(c.req, &token);
+        audit.record(c.user(), "LOGOUT", "", c.ip);
+        sessions.erase(token);
+        c.res.set_header("Set-Cookie", sessionCookie("", true));
+        redirect(c, msgUrl("/login", "You have been signed out.", true));
+    }
+    void setupPage(Ctx& c) {
+        if (users.isConfigured()) return redirect(c, "/login");
+        html(c, bare(c, "First-time setup",
+                     "<h2>First-time setup</h2><p class='mut'>Create the Admin account. Passwords are stored only as salted hashes.</p>"
+                     "<form method='post' action='/setup'><label>Admin username</label><input name='username' value='admin' required>"
+                     "<label>Password (min 8 characters)</label><input name='password' type='password' required autocomplete='new-password'>"
+                     "<label>Repeat password</label><input name='password2' type='password' required autocomplete='new-password'>"
+                     "<label>Recovery question</label><input name='question' required placeholder='e.g. Name of my first motorcycle?'>"
+                     "<label>Recovery answer (min 8 characters)</label><input name='answer' required>"
+                     "<p><button type='submit'>Create account</button></p></form>"));
+    }
+    void doSetup(Ctx& c) {
+        if (users.isConfigured()) return redirect(c, "/login");
+        if (c.param("password") != c.param("password2")) return redirect(c, msgUrl("/setup", "The two passwords do not match.", false));
+        const std::string err = users.initialSetup(c.param("username"), c.param("password"), c.param("question"), c.param("answer"));
+        if (!err.empty()) return redirect(c, msgUrl("/setup", err, false));
+        audit.record(c.param("username"), "USER_CREATED", "first Admin account", c.ip);
+        redirect(c, msgUrl("/login", "Account created. Please sign in.", true));
+    }
+    void forgotPage(Ctx& c) {
+        const std::string u = c.param("u"), q = users.recoveryQuestion(u);
+        std::string b = "<h2>Reset password</h2><form method='post' action='/forgot'><label>Username</label><input name='username' value='" + h(u) + "' required>";
+        if (!u.empty() && !q.empty()) b += "<p><b>Recovery question:</b> " + h(q) + "</p>";
+        else if (!u.empty()) b += "<p class='mut'>No recovery question is set for that account. Ask an Admin to reset your password.</p>";
+        b += "<label>Recovery answer</label><input name='answer' required>"
+             "<label>New username (optional &mdash; leave blank to keep the current one)</label>"
+             "<input name='newusername' autocomplete='off' placeholder='3-32 letters, digits, _ . -'>"
+             "<label>New password (min 8 characters)</label>"
+             "<input name='password' type='password' required autocomplete='new-password'><p><button type='submit'>Reset password</button> "
+             "<a class='btn sec' href='/login'>Cancel</a></p></form>";
+        if (u.empty()) b += "<form method='get' action='/forgot'><p class='mut'>Not sure of your question? Enter your username and show it:</p>"
+                            "<input name='u' placeholder='username'> <button class='sec' type='submit'>Show question</button></form>";
+        html(c, bare(c, "Reset password", b));
+    }
+    void doForgot(Ctx& c) {
+        const std::string name = c.param("username"), key = c.ip + "|recover";
+        if (throttle.blocked(key)) return redirect(c, msgUrl("/login", "Too many attempts. Wait a few minutes and try again.", false));
+        const std::string newName = util::trim(c.param("newusername"));
+        const std::string oldCanon = users.canonicalName(name);
+        const std::string err = users.recoverPassword(name, c.param("answer"), c.param("password"), newName);
+        if (!err.empty()) {
+            throttle.fail(key);
+            audit.record(name, "LOGIN_FAILED", "password recovery attempt failed", c.ip);
+            return redirect(c, msgUrl("/forgot?u=" + util::urlEncode(name), err, false));
+        }
+        throttle.ok(key);
+        const std::string canon = users.canonicalName(newName.empty() ? name : newName);
+        dropUserSessions(oldCanon);
+        if (canon != oldCanon && !canon.empty()) {
+            dropUserSessions(canon);
+            audit.record(canon, "USERNAME_CHANGED", oldCanon + " -> " + canon + " (via recovery answer)", c.ip);
+        }
+        audit.record(canon, "PASSWORD_RESET", "via recovery answer", c.ip);
+        redirect(c, msgUrl("/login", canon != oldCanon ? "Username and password changed. Please sign in with your new username." : "Password changed. Please sign in.", true));
+    }
+
+    // ------------------------------------------------------------------ low-stock alert helpers (Phase 1)
+    int outOfStockCount() const { int n = 0; for (const inv::Part& p : inv.parts()) n += p.quantity() == 0; return n; }
+    int belowMinCount() const { int n = 0; for (const inv::Part& p : inv.parts()) n += p.isLowStock(); return n; }
+    int attentionCount() const { int n = 0; for (const inv::Part& p : inv.parts()) n += (p.isLowStock() || p.quantity() == 0); return n; }
+    std::string alertBadge() const {
+        const int n = attentionCount();
+        return n ? " <span class='nbadge' title='Parts that are low or out of stock'>" + num(n) + "</span>" : std::string();
+    }
+
+    // ------------------------------------------------------------------ inventory dashboard
+    static std::string statusTag(const inv::Part& p) {
+        if (p.quantity() == 0) return "<span class='tag out'>Out of stock</span>";
+        if (p.isLowStock()) return "<span class='tag low'>Low</span>";
+        return "<span class='tag ok'>In Stock</span>";
+    }
+
+    static std::string modelsText(const inv::Part& p) {   // "Bajaj RE 4S, Bajaj RE Compact"
+        std::string o;
+        for (const std::string& m : p.modelList()) o += (o.empty() ? "" : ", ") + m;
+        return o;
+    }
+    static std::string modelsKey(const inv::Part& p) {    // "bajaj re 4s|bajaj re compact" (matched exactly by the filter)
+        std::string o;
+        for (const std::string& m : p.modelList()) o += (o.empty() ? "" : "|") + m;
+        return o;
+    }
+
+    // What the shop sees as "Part ID": the real part number, or the internal number for old parts that have none.
+    static std::string partLabel(const inv::Part& p) { return p.partNumber().empty() ? num(p.id()) : p.partNumber(); }
+    // True when a stored description already carries this part's number: old "NAME [PN]" or new "PN - NAME".
+    bool carriesLabel(const std::string& d, int id) const {
+        const std::string label = partLabelById(id);
+        return d.find("[" + label + "]") != std::string::npos || d.rfind(label + " - ", 0) == 0;
+    }
+    std::string partLabelById(int id) const { const inv::Part* p = inv.find(id); return p ? partLabel(*p) : num(id); }
+    // Accepts a part number (Part ID) or, as a fallback, the internal numeric id.
+    const inv::Part* resolvePart(const std::string& text) const {
+        const std::string t = util::trim(text);
+        if (t.empty()) return nullptr;
+        if (const inv::Part* p = inv.findByNumber(t)) return p;
+        long long id;
+        if (util::parseInt(t, 1, inv::limits::kMaxId, id)) return inv.find(static_cast<int>(id));
+        return nullptr;
+    }
+
+    // ------------------------------------------------------------------ dashboard analytics (Admin: same permission as Reports)
+    static std::string barRow(const std::string& label, const std::string& value, double pct) {
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        return "<tr><td>" + label + "</td><td style='width:38%'><div class='meter'><i style='width:" + util::money(pct) + "%'></i></div></td><td class='n'>" + value + "</td></tr>";
+    }
+    std::string analyticsPanel() {
+        const std::time_t now = std::time(nullptr);
+        const auto& moves = inv.movements().all();
+        const auto& invoices = inv.invoices().all();
+        const auto day = reports::revenueByPeriod(moves, invoices, inv.payments().all(), reports::Period::Daily, 7, now);
+        const auto wk = reports::revenueByPeriod(moves, invoices, inv.payments().all(), reports::Period::Weekly, 1, now);
+        const auto mo = reports::revenueByPeriod(moves, invoices, inv.payments().all(), reports::Period::Monthly, 1, now);
+        const double today = day.empty() ? 0 : day.back().revenue();
+        const double week = wk.empty() ? 0 : wk.back().revenue();
+        const double month = mo.empty() ? 0 : mo.back().revenue();
+        const double monthNet = mo.empty() ? 0 : mo.back().net();
+        const auto dead = reports::deadStock(inv.parts(), moves, 30, now);
+        double deadValue = 0;
+        for (const auto& d : dead) deadValue += d.stockValue;
+
+        std::string b = "<div class='an-head'><h2>Analytics</h2><span class='mut'><a href='/reports'>Full reports</a> &middot; <a class='btn sm sec noprint' href='/analytics.pdf'>Download PDF</a></span></div><div class='stats'>"
+                        "<div class='stat'><span>Sales today (collected)</span><b>" + php(today) + "</b></div>"
+                        "<div class='stat'><span>This week</span><b>" + php(week) + "</b></div>"
+                        "<div class='stat'><span>This month</span><b>" + php(month) + "</b></div>"
+                        "<div class='stat'><span>Net this month</span><b class='" + (monthNet < 0 ? "minus" : "plus") + "'>" + php(monthNet) + "</b></div>"
+                        "<div class='stat" + std::string(reports::totalReceivable(invoices) > 0 ? " warn" : "") + "'><span>Receivables outstanding</span><b>" + php(reports::totalReceivable(invoices)) + "</b></div>"
+                        "<div class='stat'><span>Idle 30+ days</span><b>" + num(static_cast<long long>(dead.size())) + " <small class='mut'>(" + php(deadValue) + ")</small></b></div></div>";
+
+        b += "<div class='an-grid'>";
+        // Revenue, last 7 days (newest first)
+        double mx = 1;
+        for (const auto& r : day) mx = std::max(mx, r.revenue());
+        b += "<div class='card'><h3>Revenue - last 7 days</h3><table><tbody>";
+        for (size_t i = day.size(); i-- > 0;) b += barRow(h(day[i].label), php(day[i].revenue()), day[i].revenue() / mx * 100);
+        b += "</tbody></table></div>";
+
+        // Top 5 sellers, last 30 days
+        const auto top = reports::topSelling(moves, 30, 5, now);
+        double topMax = 1;
+        for (const auto& t : top) topMax = std::max<double>(topMax, static_cast<double>(t.unitsSold));
+        b += "<div class='card'><h3>Top 5 sellers - last 30 days</h3><table><tbody>";
+        for (const auto& t : top) b += barRow(h(t.name), num(t.unitsSold) + " pcs", static_cast<double>(t.unitsSold) / topMax * 100);
+        if (top.empty()) b += "<tr><td class='mut'>No sales recorded yet.</td></tr>";
+        b += "</tbody></table></div>";
+
+        // Stock value by vehicle system
+        std::map<std::string, std::pair<long long, double>> bySys;
+        for (const inv::Part& p : inv.parts()) { auto& e = bySys[p.category()]; e.first += p.quantity(); e.second += p.stockValue(); }
+        double sysMax = 1;
+        for (const auto& kv : bySys) sysMax = std::max(sysMax, kv.second.second);
+        b += "<div class='card'><h3>Stock value by system</h3><table><tbody>";
+        for (const auto& kv : bySys) b += barRow(h(kv.first) + " <span class='mut'>(" + num(kv.second.first) + " pcs)</span>", php(kv.second.second), kv.second.second / sysMax * 100);
+        if (bySys.empty()) b += "<tr><td class='mut'>No parts yet.</td></tr>";
+        b += "</tbody></table></div>";
+
+        b += "</div>";
+        return b;
+    }
+
+    // ------------------------------------------------------------------ analytics PDF (downloads automatically; tiny built-in PDF writer, no libraries)
+    static std::string pdfEsc(const std::string& s) {
+        std::string o;
+        for (unsigned char ch : s) {
+            if (ch < 32 || ch > 126) o += '?';
+            else if (ch == '(' || ch == ')' || ch == '\\') { o += '\\'; o += static_cast<char>(ch); }
+            else o += static_cast<char>(ch);
+        }
+        return o;
+    }
+    static std::string pad10(size_t v) { std::string s = std::to_string(v); return std::string(10 - std::min<size_t>(10, s.size()), '0') + s; }
+    // Lines starting with '#' are printed in bold. Courier 9 pt, A4, 60 lines per page.
+    static std::string buildPdf(const std::vector<std::string>& lines) {
+        const size_t perPage = 60;
+        const size_t pages = lines.empty() ? 1 : (lines.size() + perPage - 1) / perPage;
+        std::vector<std::string> obj;   // obj[i] = object number i + 1
+        obj.push_back("<< /Type /Catalog /Pages 2 0 R >>");
+        std::string kids;
+        for (size_t p = 0; p < pages; ++p) kids += std::to_string(5 + p * 2) + " 0 R ";
+        obj.push_back("<< /Type /Pages /Kids [" + kids + "] /Count " + std::to_string(pages) + " >>");
+        obj.push_back("<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>");
+        obj.push_back("<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Bold /Encoding /WinAnsiEncoding >>");
+        for (size_t p = 0; p < pages; ++p) {
+            std::string s = "BT\n/F1 9 Tf\n12 TL\n40 806 Td\n";
+            for (size_t i = p * perPage; i < lines.size() && i < (p + 1) * perPage; ++i) {
+                if (!lines[i].empty() && lines[i][0] == '#') s += "/F2 9 Tf\n(" + pdfEsc(lines[i].substr(1)) + ") '\n/F1 9 Tf\n";
+                else s += "(" + pdfEsc(lines[i]) + ") '\n";
+            }
+            s += "ET\nBT\n/F1 8 Tf\n40 28 Td\n(Page " + std::to_string(p + 1) + " of " + std::to_string(pages) + ") Tj\nET\n";
+            obj.push_back("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents " + std::to_string(6 + p * 2) + " 0 R >>");
+            obj.push_back("<< /Length " + std::to_string(s.size()) + " >>\nstream\n" + s + "endstream");
+        }
+        std::string out = "%PDF-1.4\n";
+        std::vector<size_t> off;
+        for (size_t i = 0; i < obj.size(); ++i) {
+            off.push_back(out.size());
+            out += std::to_string(i + 1) + " 0 obj\n" + obj[i] + "\nendobj\n";
+        }
+        const size_t xref = out.size();
+        out += "xref\n0 " + std::to_string(obj.size() + 1) + "\n0000000000 65535 f \n";
+        for (size_t o : off) out += pad10(o) + " 00000 n \n";
+        out += "trailer\n<< /Size " + std::to_string(obj.size() + 1) + " /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+        return out;
+    }
+    static std::string padR(std::string s, size_t w) { if (s.size() > w) s = s.substr(0, w); return s + std::string(w - s.size(), ' '); }
+    static std::string padL(std::string s, size_t w) { if (s.size() > w) s = s.substr(0, w); return std::string(w - s.size(), ' ') + s; }
+
+    void analyticsPdf(Ctx& c) {
+        const std::time_t now = std::time(nullptr);
+        const auto& moves = inv.movements().all();
+        const auto& invoices = inv.invoices().all();
+        std::vector<std::string> L;
+        L.push_back("#" + cfg.shopName + " - Analytics Report");
+        L.push_back("Generated: " + util::formatTime(now, "%A, %B %d, %Y, %I:%M %p") + "   Prepared by: " + c.user());
+        L.push_back("All amounts in PHP.");
+        L.push_back("");
+        long long units = 0;
+        double value = 0;
+        int low = 0;
+        for (const inv::Part& p : inv.parts()) { units += p.quantity(); value += p.stockValue(); low += p.isLowStock(); }
+        L.push_back("#SUMMARY");
+        L.push_back("Parts: " + num(static_cast<long long>(inv.parts().size())) + "    Units in stock: " + num(units) + "    Below minimum: " + num(low));
+        L.push_back("Stock value: " + util::moneyFmt(value) + "    Receivables outstanding: " + util::moneyFmt(reports::totalReceivable(invoices)));
+        L.push_back("");
+        auto period = [&](const std::string& title, reports::Period per, int count) {
+            L.push_back("#" + title);
+            L.push_back(padR("Period", 22) + padL("Parts", 14) + padL("Services", 14) + padL("Revenue", 14) + padL("Expenses", 14) + padL("Net", 14));
+            const auto rows = reports::revenueByPeriod(moves, invoices, inv.payments().all(), per, count, now);
+            for (size_t i = rows.size(); i-- > 0;)
+                L.push_back(padR(rows[i].label, 22) + padL(util::moneyFmt(rows[i].partsRevenue), 14) + padL(util::moneyFmt(rows[i].serviceRevenue), 14) +
+                            padL(util::moneyFmt(rows[i].revenue()), 14) + padL(util::moneyFmt(rows[i].expenses), 14) + padL(util::moneyFmt(rows[i].net()), 14));
+            L.push_back("");
+        };
+        period("REVENUE - LAST 7 DAYS", reports::Period::Daily, 7);
+        period("REVENUE - LAST 8 WEEKS", reports::Period::Weekly, 8);
+        period("REVENUE - LAST 6 MONTHS", reports::Period::Monthly, 6);
+
+        L.push_back("#TOP 10 SELLERS - LAST 30 DAYS");
+        L.push_back(padR("#", 4) + padR("ID", 10) + padR("Part", 44) + padL("Units", 10) + padL("Revenue", 16));
+        int rank = 0;
+        for (const auto& t : reports::topSelling(moves, 30, 10, now))
+            L.push_back(padR(num(++rank), 4) + padR(num(t.partId), 10) + padR(t.name, 44) + padL(num(t.unitsSold), 10) + padL(util::moneyFmt(t.revenue), 16));
+        if (!rank) L.push_back("No sales recorded in this period.");
+        L.push_back("");
+
+        L.push_back("#STOCK VALUE BY SYSTEM");
+        L.push_back(padR("System", 40) + padL("Units", 12) + padL("Stock value", 20));
+        std::map<std::string, std::pair<long long, double>> bySys;
+        for (const inv::Part& p : inv.parts()) { auto& e = bySys[p.category()]; e.first += p.quantity(); e.second += p.stockValue(); }
+        for (const auto& kv : bySys) L.push_back(padR(kv.first, 40) + padL(num(kv.second.first), 12) + padL(util::moneyFmt(kv.second.second), 20));
+        L.push_back("");
+
+        const auto re = reports::reorderList(inv.parts());
+        L.push_back("#REORDER LIST (" + num(static_cast<long long>(re.size())) + " below minimum)");
+        L.push_back(padR("ID", 10) + padR("Part", 44) + padL("In stock", 12) + padL("Minimum", 12) + padL("Order", 10));
+        size_t shown = 0;
+        for (const auto& r : re) {
+            if (++shown > 40) { L.push_back("... and " + num(static_cast<long long>(re.size() - 40)) + " more (see Reports page)"); break; }
+            L.push_back(padR(num(r.part->id()), 10) + padR(r.part->name(), 44) + padL(num(r.part->quantity()), 12) + padL(num(r.part->minStock()), 12) + padL(num(r.suggestedQty), 10));
+        }
+        if (re.empty()) L.push_back("Every part is at or above its minimum.");
+        L.push_back("");
+
+        const auto dead = reports::deadStock(inv.parts(), moves, 30, now);
+        double tied = 0;
+        for (const auto& d : dead) tied += d.stockValue;
+        L.push_back("#DEAD STOCK - NO MOVEMENT FOR 30+ DAYS (" + num(static_cast<long long>(dead.size())) + " parts, " + util::moneyFmt(tied) + " tied up)");
+        L.push_back(padR("ID", 10) + padR("Part", 44) + padL("In stock", 12) + padL("Value", 16) + padL("Days idle", 10));
+        shown = 0;
+        for (const auto& d : dead) {
+            if (++shown > 15) { L.push_back("... and " + num(static_cast<long long>(dead.size() - 15)) + " more (see Reports page)"); break; }
+            L.push_back(padR(num(d.part->id()), 10) + padR(d.part->name(), 44) + padL(num(d.part->quantity()), 12) + padL(util::moneyFmt(d.stockValue), 16) + padL(num(d.daysIdle), 10));
+        }
+        if (dead.empty()) L.push_back("Nothing has been idle that long.");
+
+        audit.record(c.user(), "REPORT_DOWNLOAD", "analytics PDF", c.ip);
+        c.res.set_header("Content-Disposition", "attachment; filename=\"analytics_" + util::formatTime(now, "%Y%m%d_%H%M") + ".pdf\"");
+        c.res.set_content(buildPdf(L), "application/pdf");
+    }
+
+    void dashboard(Ctx& c) {
+        using P = auth::Permission;
+        const auto& parts = inv.parts();
+        long long units = 0;
+        double value = 0;
+        int low = 0;
+        std::set<std::string> systems(inv::standardSystems().begin(), inv::standardSystems().end());
+        for (const inv::Part& p : parts) { units += p.quantity(); value += p.stockValue(); low += p.isLowStock(); systems.insert(p.category()); }
+
+        const std::vector<std::string> models = inv.allModels();
+        const std::string wantModel = util::trim(c.param("model"));
+        const std::time_t clockNow = std::time(nullptr);
+        std::string b = "<div class='page-head'><h1>Inventory</h1><div class='clock-card noprint' id='clock' title='Current date and time'><div class='clk-date' id='clkdate'>" +
+                        h(util::formatTime(clockNow, "%A, %B %d, %Y")) + "</div><div class='clk-time' id='clktime'>" + h(util::formatTime(clockNow, "%I:%M:%S")) +
+                        "<small>" + h(util::formatTime(clockNow, "%p")) + "</small></div></div></div><div class='stats'><div class='stat'><span>Parts</span><b>" + num(static_cast<long long>(parts.size())) + "</b></div>"
+                        "<div class='stat'><span>Units in stock</span><b>" + num(units) + "</b></div>";
+        if (auth::allowed(c.role, P::ViewReports)) b += "<div class='stat'><span>Stock value</span><b>" + php(value) + "</b></div>";
+        const int outN = outOfStockCount();
+        b += std::string("<div class='stat") + (low ? " warn" : "") + "'><span>Below minimum</span><b>" + num(low) + "</b></div>"
+             "<div class='stat" + (outN ? " bad" : "") + "'><span>Out of stock</span><b>" + num(outN) + "</b></div></div>";
+        if (low || outN) {
+            b += std::string("<div class='alert-low noprint") + (outN ? " has-out" : "") + "' role='alert'><span class='alert-ic'>!</span><div class='alert-txt'><b>" +
+                 (low ? num(low) + (low == 1 ? " part is" : " parts are") + " below the reorder level" : std::string("Some parts are out of stock")) + "</b>" +
+                 (outN ? " &middot; <b>" + num(outN) + " out of stock</b>" : std::string()) +
+                 "<div class='mut'>Restock soon so you do not lose sales.</div></div><div class='alert-acts'><a class='btn sm' href='/?low=1'>Show low stock</a>" +
+                 (auth::allowed(c.role, P::ViewReports) ? "<a class='btn sm sec' href='/reports'>Reorder list</a>" : std::string()) + "</div></div>";
+        }
+        if (auth::allowed(c.role, P::ViewReports)) b += analyticsPanel();
+
+        b += "<div class='card'><div class='bar'><input id='q' type='search' placeholder='Search by part number, description, system or vehicle model...' autocomplete='off'>"
+             "<select id='sys'><option value=''>All vehicle systems</option>";
+        for (const std::string& s : systems) b += "<option>" + h(s) + "</option>";
+        b += "</select><select id='model' title='Show only parts that fit this vehicle'><option value=''>All vehicle models</option>";
+        for (const std::string& m : models) b += "<option" + std::string(util::equalsIgnoreCase(m, wantModel) ? " selected" : "") + ">" + h(m) + "</option>";
+        b += "</select><select id='sortsel' title='Sort the list'><option value=''>Sort: default</option>"
+             "<option value='pn:1'>Part Number: A to Z</option><option value='pn:-1'>Part Number: Z to A</option>"
+             "<option value='name:1'>Part Description: A to Z</option><option value='name:-1'>Part Description: Z to A</option>"
+             "<option value='qty:-1'>Stock: most first</option><option value='qty:1'>Stock: least first</option>"
+             "<option value='gap:1'>Most below minimum first</option>"
+             "<option value='price:-1'>Price: high to low</option><option value='price:1'>Price: low to high</option>"
+             "<option value='cat:1'>System: A to Z</option></select>"
+             "<label class='inline mut'><input id='lowonly' type='checkbox'> Low stock only</label><span id='count' class='mut grow'></span>";
+        if (auth::allowed(c.role, P::AddPart)) b += "<a class='btn' href='/add'>+ Add part</a>";
+        b += "</div><table id='inv'><thead><tr><th data-sort='pn'>Part Number</th><th data-sort='name'>Part Description</th><th data-sort='cat'>System</th><th>Fits (vehicle models)</th>"
+             "<th class='n' data-sort='price' data-type='num'>Price</th><th class='n' data-sort='qty' data-type='num'>Stock</th><th class='n' data-sort='min' data-type='num'>Min</th><th>Status</th>" + std::string(auth::allowed(c.role, P::ViewReports) ? "<th class='n'>Cost</th><th class='n'>Margin</th>" : "") + "<th></th></tr></thead><tbody>";
+        for (const inv::Part& p : parts) {
+            b += "<tr" + std::string(p.quantity() == 0 ? " class='low outrow'" : (p.isLowStock() ? " class='low'" : "")) + " data-id='" + num(p.id()) + "' data-pn='" + h(util::toLower(partLabel(p))) + "' data-min='" + num(p.minStock()) + "' data-gap='" + num(p.quantity() - p.minStock()) + "' data-name='" + h(util::toLower(p.name())) +
+                 "' data-cat='" + h(util::toLower(p.category())) + "' data-models='" + h(util::toLower(modelsKey(p))) + "' data-price='" + util::money(p.price()) + "' data-qty='" + num(p.quantity()) +
+                 "' data-low='" + (p.isLowStock() ? "1" : "0") + "'><td>" + h(partLabel(p)) + "</td><td>" + h(p.name()) + "</td><td>" + h(p.category()) +
+                 "</td><td class='fits'>" + (p.modelList().empty() ? std::string("<span class='mut'>-</span>") : h(modelsText(p))) +
+                 "</td><td class='n'>" + php(p.price()) + "</td><td class='n'>" + num(p.quantity()) + "</td><td class='n'>" + num(p.minStock()) + "</td><td>" +
+                 statusTag(p) + "</td>" + sourcingCells(c, p) + "<td class='right' style='white-space:nowrap'>";
+            const std::string id = "?id=" + num(p.id());
+            if (auth::allowed(c.role, P::Sell)) b += "<a class='btn sm' href='/invoice?part=" + util::urlEncode(partLabel(p)) + "'>Sell</a> ";
+            if (auth::allowed(c.role, P::AdjustStock) && !auth::allowed(c.role, P::EditPart)) b += "<a class='btn sm sec' href='/stock" + id + "'>Stock</a> ";
+            if (auth::allowed(c.role, P::EditPart)) b += "<a class='btn sm sec' href='/edit" + id + "'>Edit</a> ";
+            if (auth::allowed(c.role, P::DeletePart)) b += "<a class='btn sm danger' href='/delete" + id + "'>Delete</a>";
+            b += "</td></tr>";
+        }
+        b += "</tbody></table></div>";
+        html(c, layout(c, "Inventory", b));
+    }
+
+    // ------------------------------------------------------------------ suppliers (Phase 2)
+    int readSupplierId(Ctx& c, int keep) {   // 0 = none; unknown / inactive suppliers are ignored unless it is the one already on the part
+        long long v = 0;
+        if (!util::parseInt(c.param("supplier"), 1, 999999, v)) return 0;
+        const sup::Supplier* s = suppliers.find(static_cast<int>(v));
+        return s && (s->active || s->id == keep) ? static_cast<int>(v) : 0;
+    }
+    std::string supplierSelect(int chosen) const {
+        std::string o = "<select name='supplier'><option value=''>- none -</option>";
+        for (const sup::Supplier& s : suppliers.all())
+            if (s.active || s.id == chosen)
+                o += "<option value='" + num(s.id) + "'" + (s.id == chosen ? " selected" : "") + ">" + h(s.name) + (s.active ? "" : " (inactive)") + "</option>";
+        return o + "</select>";
+    }
+    static std::string marginCells(const inv::Part& p) {   // "<td>cost</td><td>profit (margin %)</td>"
+        if (p.costPrice() <= 0) return "<td class='n mut'>n/a</td><td class='n mut'>n/a</td>";
+        const double profit = p.price() - p.costPrice();
+        const double pct = p.price() > 0 ? profit / p.price() * 100.0 : 0.0;
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%.1f%%", pct);
+        return "<td class='n'>" + php(p.costPrice()) + "</td><td class='n'" + std::string(profit < 0 ? " style='color:#b42318;font-weight:700'" : "") + ">" +
+               php(profit) + " <span class='mut'>(" + buf + ")</span></td>";
+    }
+    std::string sourcingCells(Ctx& c, const inv::Part& p) const {   // Admin-only inventory columns: Supplier | Cost | Margin
+        if (!auth::allowed(c.role, auth::Permission::ViewReports)) return "";
+        return marginCells(p);
+    }
+    void suppliersPage(Ctx& c) {
+        const int editId = intParam(c, "edit", 1, 999999, 0), viewId = intParam(c, "view", 1, 999999, 0);
+        const sup::Supplier* ed = suppliers.find(editId);
+        struct St { int parts = 0, withCost = 0; double stockCost = 0, marginSum = 0; };
+        std::map<int, St> st;
+        for (const inv::Part& p : inv.parts()) {
+            St& s = st[p.supplierId()];
+            ++s.parts;
+            s.stockCost += p.costPrice() * p.quantity();
+            if (p.costPrice() > 0 && p.price() > 0) { ++s.withCost; s.marginSum += (p.price() - p.costPrice()) / p.price() * 100.0; }
+        }
+        auto avg = [](const St& s) { char buf[32]; if (!s.withCost) return std::string("n/a"); std::snprintf(buf, sizeof buf, "%.1f%%", s.marginSum / s.withCost); return std::string(buf); };
+        std::string b = "<h1>Suppliers</h1><div class='card'><h2>" + std::string(ed ? "Edit supplier" : "Add supplier") + "</h2><form method='post' action='/suppliers/save'>" + tokenField(c) +
+                        "<input type='hidden' name='id' value='" + num(ed ? ed->id : 0) + "'><div class='grid'>"
+                        "<div><label>Supplier name</label><input name='name' maxlength='60' required value='" + h(ed ? ed->name : "") + "'></div>"
+                        "<div><label>Contact person</label><input name='contact' maxlength='60' value='" + h(ed ? ed->contact : "") + "'></div>"
+                        "<div><label>Phone</label><input name='phone' maxlength='40' value='" + h(ed ? ed->phone : "") + "'></div>"
+                        "<div><label>Address</label><input name='address' maxlength='120' value='" + h(ed ? ed->address : "") + "'></div></div>"
+                        "<label>Notes</label><input name='notes' maxlength='200' style='width:100%' value='" + h(ed ? ed->notes : "") + "'>"
+                        "<p><button type='submit'>" + std::string(ed ? "Save changes" : "Add supplier") + "</button>" + (ed ? " <a class='btn sec' href='/suppliers'>Cancel</a>" : "") + "</p></form></div>";
+        b += "<div class='card'><h2>Parts by supplier</h2><table><thead><tr><th>Supplier</th><th>Contact</th><th>Phone</th><th class='n'>Parts</th><th class='n'>Stock value (at cost)</th>"
+             "<th class='n'>Avg margin</th><th>Status</th><th></th></tr></thead><tbody>";
+        for (const sup::Supplier& s : suppliers.all()) {
+            const St& x = st[s.id];
+            b += "<tr><td><b>" + h(s.name) + "</b></td><td>" + h(s.contact) + "</td><td>" + h(s.phone) + "</td><td class='n'>" + num(x.parts) + "</td><td class='n'>" + php(x.stockCost) +
+                 "</td><td class='n'>" + avg(x) + "</td><td><span class='tag " + (s.active ? "ok'>Active" : "out'>Inactive") + "</span></td><td class='right'>"
+                 "<a class='btn sm sec' href='/suppliers?view=" + num(s.id) + "'>History</a> <a class='btn sm sec' href='/suppliers?edit=" + num(s.id) + "'>Edit</a> "
+                 "<form method='post' action='/suppliers/toggle' style='display:inline'>" + tokenField(c) + "<input type='hidden' name='id' value='" + num(s.id) + "'><input type='hidden' name='on' value='" +
+                 (s.active ? "0" : "1") + "'><button class='sm sec' type='submit'>" + (s.active ? "Deactivate" : "Activate") + "</button></form></td></tr>";
+        }
+        auto none = st.find(0);
+        if (none != st.end()) b += "<tr><td class='mut'>(no supplier recorded)</td><td></td><td></td><td class='n'>" + num(none->second.parts) + "</td><td class='n'>" + php(none->second.stockCost) +
+                                   "</td><td class='n'>" + avg(none->second) + "</td><td></td><td></td></tr>";
+        if (suppliers.all().empty() && none == st.end()) b += "<tr><td colspan='8' class='mut'>No suppliers yet.</td></tr>";
+        b += "</tbody></table></div>";
+        if (const sup::Supplier* v = suppliers.find(viewId)) {
+            b += "<div class='card'><h2>" + h(v->name) + " &middot; parts supplied</h2><table><thead><tr><th>Part Number</th><th>Part Description</th><th class='n'>Stock</th><th class='n'>Retail</th><th class='n'>Cost</th><th class='n'>Profit (margin)</th></tr></thead><tbody>";
+            int shown = 0;
+            for (const inv::Part& p : inv.parts()) {
+                if (p.supplierId() != v->id) continue;
+                ++shown;
+                b += "<tr><td>" + h(partLabel(p)) + "</td><td>" + h(p.name()) + "</td><td class='n'>" + num(p.quantity()) + "</td><td class='n'>" + php(p.price()) + "</td>" + marginCells(p) + "</tr>";
+            }
+            if (!shown) b += "<tr><td colspan='6' class='mut'>No parts are linked to this supplier yet. Pick the supplier in Edit part or when restocking.</td></tr>";
+            b += "</tbody></table></div><div class='card'><h2>Purchase history</h2><table><thead><tr><th>Date</th><th>Part</th><th class='n'>Qty</th><th class='n'>Unit cost</th><th class='n'>Total</th><th>Note</th><th>By</th></tr></thead><tbody>";
+            int n = 0;
+            const auto& all = purchases.all();
+            for (auto it = all.rbegin(); it != all.rend() && n < 100; ++it) {
+                if (it->supplierId != v->id) continue;
+                ++n;
+                const inv::Part* pp = inv.find(it->partId);
+                b += "<tr><td>" + h(it->timestamp) + "</td><td>" + h(pp ? pp->fullName() : "Part " + num(it->partId)) + "</td><td class='n'>" + num(it->qty) + "</td><td class='n'>" + php(it->unitCost) +
+                     "</td><td class='n'>" + php(it->unitCost * it->qty) + "</td><td>" + h(it->ref) + "</td><td>" + h(it->user) + "</td></tr>";
+            }
+            if (!n) b += "<tr><td colspan='7' class='mut'>No purchases recorded yet. They are recorded when you restock a part and pick this supplier.</td></tr>";
+            b += "</tbody></table></div>";
+        }
+        html(c, layout(c, "Suppliers", b));
+    }
+    void doSupplierSave(Ctx& c) {
+        sup::Supplier s;
+        s.name = c.param("name"); s.contact = c.param("contact"); s.phone = c.param("phone"); s.address = c.param("address"); s.notes = c.param("notes");
+        const int id = intParam(c, "id", 1, 999999, 0);
+        int nid = 0;
+        const std::string err = suppliers.save(id, s, nid);
+        if (!err.empty()) return redirect(c, msgUrl(id ? "/suppliers?edit=" + num(id) : std::string("/suppliers"), err, false));
+        audit.record(c.user(), id ? "SUPPLIER_UPDATED" : "SUPPLIER_ADDED", util::oneLine(util::trim(s.name)), c.ip);
+        redirect(c, msgUrl("/suppliers", id ? "Supplier updated." : "Supplier added.", true));
+    }
+    void doSupplierToggle(Ctx& c) {
+        const int id = intParam(c, "id", 1, 999999, 0);
+        const bool on = c.param("on") == "1";
+        const std::string err = suppliers.setActive(id, on);
+        if (!err.empty()) return redirect(c, msgUrl("/suppliers", err, false));
+        audit.record(c.user(), on ? "SUPPLIER_ACTIVATED" : "SUPPLIER_DEACTIVATED", suppliers.nameOf(id), c.ip);
+        redirect(c, msgUrl("/suppliers", on ? "Supplier activated." : "Supplier deactivated (history kept).", true));
+    }
+
+    // ------------------------------------------------------------------ stock: restock / adjust (Staff + Admin)
+    void stockPage(Ctx& c) {
+        const inv::Part* p = inv.find(intParam(c, "id", 1, inv::limits::kMaxId, 0));
+        if (!p) return redirect(c, msgUrl("/", "Part not found.", false));
+        const std::string id = num(p->id());
+        std::string b = "<h1>Stock: " + h(p->fullName()) + "</h1><p class='mut'>Part " + id + " &middot; " + h(p->category()) + " &middot; currently <b>" + num(p->quantity()) +
+                        "</b> in stock (minimum " + num(p->minStock()) + ")</p><div class='grid'><div class='card'><h2>Restock (stock arrives)</h2>"
+                        "<form method='post' action='/stock'>" + tokenField(c) + "<input type='hidden' name='id' value='" + id + "'><input type='hidden' name='action' value='restock'>"
+                        "<label>Quantity received</label><input name='qty' type='number' min='1' required>"
+                        "<label>Supplier (optional - recorded in the purchase history)</label>" + supplierSelect(p->supplierId()) +
+                        "<label>Unit cost paid (&#8369;, optional - used for expense reports)</label><input name='cost' type='number' step='0.01' min='0'>" +
+                        std::string(auth::allowed(c.role, auth::Permission::ViewReports) ? "<label class='inline'><input type='checkbox' name='setcost' value='1'> Use this as the part's cost price (for margin)</label>" : "") +
+                        "<label>Note (optional)</label><input name='note' maxlength='80'><p><button type='submit'>Add stock</button></p></form></div>"
+                        "<div class='card'><h2>Adjust (count correction, damage, loss)</h2><form method='post' action='/stock'>" + tokenField(c) +
+                        "<input type='hidden' name='id' value='" + id + "'><input type='hidden' name='action' value='adjust'>"
+                        "<label>Change (use a minus sign to remove, e.g. -2)</label><input name='qty' type='number' required>"
+                        "<label>Reason</label><input name='note' maxlength='80' required><p><button type='submit'>Apply adjustment</button></p></form></div></div>"
+                        "<p><a class='btn sec' href='/'>Back</a></p>";
+        html(c, layout(c, "Stock", b));
+    }
+    void doStock(Ctx& c) {
+        const int id = intParam(c, "id", 1, inv::limits::kMaxId, 0);
+        long long qty;
+        if (!util::parseInt(c.param("qty"), -inv::limits::kMaxQty, inv::limits::kMaxQty, qty)) return redirect(c, msgUrl("/stock?id=" + num(id), "Enter a whole number.", false));
+        const std::string note = util::trim(c.param("note"));
+        inv::Result r;
+        if (c.param("action") == "restock") {
+            double cost = 0;
+            if (!util::trim(c.param("cost")).empty() && !util::parseDouble(c.param("cost"), 0, inv::limits::kMaxPrice, cost))
+                return redirect(c, msgUrl("/stock?id=" + num(id), "Unit cost is not a valid amount.", false));
+            r = inv.restock(id, static_cast<int>(qty), cost, c.user(), note);
+            if (r.ok) {   // Phase 2: remember who we bought it from
+                const inv::Part* rp = inv.find(id);
+                const int oldSid = rp ? rp->supplierId() : 0;
+                const int sid = readSupplierId(c, oldSid);
+                if (sid > 0) {
+                    sup::Purchase pu;
+                    pu.timestamp = util::nowStamp(); pu.supplierId = sid; pu.partId = id; pu.qty = static_cast<int>(qty); pu.unitCost = cost; pu.ref = note; pu.user = c.user();
+                    purchases.record(pu);
+                    const bool setCost = auth::allowed(c.role, auth::Permission::ViewReports) && c.param("setcost") == "1" && cost > 0;
+                    if (setCost || oldSid == 0) inv.setSourcing(id, sid, setCost ? std::optional<double>(cost) : std::nullopt, c.user());
+                    audit.record(c.user(), "PURCHASE", "Part " + num(id) + " x" + num(qty) + " from " + suppliers.nameOf(sid) + " @ " + util::money(cost), c.ip);
+                }
+            }
+        } else {
+            r = inv.adjust(id, qty, c.user(), note);
+        }
+        redirect(c, r.ok ? msgUrl("/", r.message, true) : msgUrl("/stock?id=" + num(id), r.message, false));
+    }
+
+    // ------------------------------------------------------------------ add / edit / delete part (Admin)
+    std::string systemsDatalist() const {
+        std::set<std::string> s(inv::standardSystems().begin(), inv::standardSystems().end());
+        for (const inv::Part& p : inv.parts()) s.insert(p.category());
+        std::string o = "<datalist id='systems'>";
+        for (const std::string& x : s) o += "<option value='" + h(x) + "'>";
+        return o + "</datalist>";
+    }
+    int nextFreeId() const {
+        int m = 100;
+        for (const inv::Part& p : inv.parts()) m = std::max(m, p.id());
+        return m + 1;
+    }
+    static std::string excelImportCard(const Ctx& c) {
+        return "<div class='card'><h2>Import many parts from Excel</h2><p class='mut'>Choose your <b>.xlsx</b> (or .csv) file and the system reads it and adds the parts for you - no typing. "
+               "Use the same column headings as <a href='/export/inventory.csv'>Download inventory CSV</a> (it works as a template); the first row must be the headings. "
+               "Existing part numbers are updated (<b>Quantity = the new stock level</b>); new ones are added.</p>"
+               "<form method='post' action='/import' id='xlform'>" + tokenField(c) + "<input type='hidden' name='csv' id='xlcsv'>"
+               "<input id='xlfile' type='file' accept='.xlsx,.csv,text/csv'></form></div>";
+    }
+    void addPage(Ctx& c) {
+        std::string b = "<h1>Add part</h1>" + excelImportCard(c) + "<div class='card'><form method='post' action='/add'>" + tokenField(c) + "<div class='grid'>"
+                        "<div><label>Part Number</label><input name='pn' maxlength='40' required placeholder='e.g. 22170434'><input type='hidden' name='id' value='" + num(nextFreeId()) + "'></div>"
+                        "<div><label>Part Description</label><input name='name' maxlength='80' required></div>"
+                        "<div><label>Vehicle system</label><input name='category' list='systems' required></div>"
+                        "<div><label>Price (&#8369;)</label><input name='price' type='number' step='0.01' min='0' required></div>"
+                        "<div><label>Opening stock</label><input name='qty' type='number' min='0' value='0' required></div>"
+                        "<div><label>Minimum stock</label><input name='min' type='number' min='0' value='5' required></div></div>"
+                        "<div class='grid'><div><label>Supplier (optional)</label>" + supplierSelect(0) + "</div><div><label>Cost price (&#8369;, what you pay - optional)</label><input name='cost' type='number' step='0.01' min='0'></div></div>"
+                        "<label>Compatible vehicle models <span class='mut'>(optional, separate with commas)</span></label>"
+                        "<input name='models' maxlength='300' style='width:100%' placeholder='Bajaj RE 4S, Bajaj RE Compact, Bajaj RE Maxima'>" + systemsDatalist() +
+                        "<p><button type='submit'>Save part</button> <a class='btn sec' href='/'>Cancel</a></p></form></div>";
+        html(c, layout(c, "Add part", b));
+    }
+    // Parses the shared part fields; returns "" or an error.
+    std::string readPart(Ctx& c, long long& id, std::string& name, std::string& cat, double& price, long long& qty, long long& mn, bool needIdQty) {
+        name = util::trim(c.param("name")); cat = util::trim(c.param("category"));
+        if (needIdQty && (!util::parseInt(c.param("id"), 1, inv::limits::kMaxId, id) || !util::parseInt(c.param("qty"), 0, inv::limits::kMaxQty, qty)))
+            return "ID and opening stock must be whole numbers in range.";
+        if (!util::parseDouble(c.param("price"), 0, inv::limits::kMaxPrice, price)) return "Price must be a valid amount.";
+        if (!util::parseInt(c.param("min"), 0, inv::limits::kMaxQty, mn)) return "Minimum stock must be a whole number.";
+        return "";
+    }
+    void doAdd(Ctx& c) {
+        long long id = 0, qty = 0, mn = 0;
+        double price = 0;
+        std::string name, cat;
+        std::string err = readPart(c, id, name, cat, price, qty, mn, true);
+        if (err.empty() && c.req.has_param("pn") && util::trim(c.param("pn")).empty()) err = "Part number is required.";   // an old form without the field still works
+        if (err.empty()) {
+            inv::Part part(static_cast<int>(id), name, cat, price, static_cast<int>(qty), static_cast<int>(mn));
+            part.setCompatibleModels(util::oneLine(util::trim(c.param("models"))));
+            part.setPartNumber(util::oneLine(util::trim(c.param("pn"))));
+            part.setSupplierId(readSupplierId(c, 0));
+            { double cv = 0; if (parseMoneyText(c.param("cost"), cv)) part.setCostPrice(cv); }
+            const inv::Result r = inv.addPart(part, c.user());
+            if (r.ok) return redirect(c, msgUrl("/", "Part " + part.partNumber() + " added.", true));
+            err = r.message;
+        }
+        redirect(c, msgUrl("/add", err, false));
+    }
+    // Restock / Adjust cards, shown on the Edit page (Admin) so the Stock button can leave the row.
+    std::string stockCards(Ctx& c, const inv::Part& p) {
+        if (!auth::allowed(c.role, auth::Permission::AdjustStock)) return std::string();
+        const std::string id = num(p.id());
+        return "<div class='grid'><div class='card'><h2>Restock (stock arrives)</h2>"
+               "<form method='post' action='/stock'>" + tokenField(c) + "<input type='hidden' name='id' value='" + id + "'><input type='hidden' name='action' value='restock'>"
+               "<label>Quantity received</label><input name='qty' type='number' min='1' required>"
+               "<label>Supplier (optional - recorded in the purchase history)</label>" + supplierSelect(p.supplierId()) +
+               "<label>Unit cost paid (&#8369;, optional - used for expense reports)</label><input name='cost' type='number' step='0.01' min='0'>" +
+               std::string(auth::allowed(c.role, auth::Permission::ViewReports) ? "<label class='inline'><input type='checkbox' name='setcost' value='1'> Use this as the part's cost price (for margin)</label>" : "") +
+               "<label>Note (optional)</label><input name='note' maxlength='80'><p><button type='submit'>Add stock</button></p></form></div>"
+               "<div class='card'><h2>Adjust (count correction, damage, loss)</h2><form method='post' action='/stock'>" + tokenField(c) +
+               "<input type='hidden' name='id' value='" + id + "'><input type='hidden' name='action' value='adjust'>"
+               "<label>Change (use a minus sign to remove, e.g. -2)</label><input name='qty' type='number' required>"
+               "<label>Reason</label><input name='note' maxlength='80' required><p><button type='submit'>Apply adjustment</button></p></form></div></div>";
+    }
+    void editPage(Ctx& c) {
+        const inv::Part* p = inv.find(intParam(c, "id", 1, inv::limits::kMaxId, 0));
+        if (!p) return redirect(c, msgUrl("/", "Part not found.", false));
+        std::string b = "<h1>Edit part " + h(partLabel(*p)) + "</h1><div class='card'><form method='post' action='/edit'>" + tokenField(c) +
+                        "<input type='hidden' name='id' value='" + num(p->id()) + "'><div class='grid'><div><label>Part Number</label><input name='pn' maxlength='40' value='" + h(p->partNumber()) + "' required></div><div><label>Part Description</label><input name='name' maxlength='80' value='" + h(p->name()) + "' required></div>"
+                        "<div><label>Vehicle system</label><input name='category' list='systems' value='" + h(p->category()) + "' required></div>"
+                        "<div><label>Price (&#8369;)</label><input name='price' type='number' step='0.01' min='0' value='" + util::money(p->price()) + "' required></div>"
+                        "<div><label>Minimum stock</label><input name='min' type='number' min='0' value='" + num(p->minStock()) + "' required></div></div>"
+                        "<div class='grid'><div><label>Supplier</label>" + supplierSelect(p->supplierId()) + "</div><div><label>Cost price (&#8369;, what you pay the supplier)</label><input name='cost' type='number' step='0.01' min='0' value='" + (p->costPrice() > 0 ? util::money(p->costPrice()) : std::string()) + "'></div></div>"
+                        "<label>Compatible vehicle models <span class='mut'>(separate with commas)</span></label>"
+                        "<input name='models' maxlength='300' style='width:100%' value='" + h(p->compatibleModels()) + "' placeholder='Bajaj RE 4S, Bajaj RE Compact, Bajaj RE Maxima'>" + systemsDatalist() +
+                        "<p class='mut'>Current stock is " + num(p->quantity()) + ". Change it with <b>Restock / Adjust</b> below so the movement is logged.</p>"
+                        "<p><button type='submit'>Save changes</button> <a class='btn sec' href='/'>Cancel</a></p></form></div>" + stockCards(c, *p);
+        html(c, layout(c, "Edit part", b));
+    }
+    void doEdit(Ctx& c) {
+        const int id = intParam(c, "id", 1, inv::limits::kMaxId, 0);
+        const inv::Part* cur = inv.find(id);
+        if (!cur) return redirect(c, msgUrl("/", "Part not found.", false));
+        const double oldPrice = cur->price();
+        const std::string oldName = cur->fullName(), oldModels = cur->compatibleModels();
+        long long dummy = 0, mn = 0;
+        double price = 0;
+        std::string name, cat;
+        std::string err = readPart(c, dummy, name, cat, price, dummy, mn, false);
+        if (err.empty()) {
+            std::optional<std::string> models;   // a request without the field (old form) leaves the models alone
+            if (c.req.has_param("models")) models = c.param("models");
+            std::optional<std::string> pnew;
+            if (c.req.has_param("pn")) pnew = c.param("pn");
+            const inv::Result r = inv.updatePart(id, name, cat, price, static_cast<int>(mn), c.user(), models, pnew);
+            if (r.ok) {
+                if (models && inv.find(id) && inv.find(id)->compatibleModels() != oldModels)
+                    audit.record(c.user(), "PART_MODELS_CHANGED", "Part " + num(id) + " " + oldName + ": [" + oldModels + "] -> [" + inv.find(id)->compatibleModels() + "]", c.ip);
+                if (c.req.has_param("supplier") || c.req.has_param("cost")) {   // Phase 2: supplier + cost price
+                    const inv::Part* np = inv.find(id);
+                    const int oldSid = np ? np->supplierId() : 0;
+                    const double oldCost = np ? np->costPrice() : 0.0;
+                    const int sid = c.req.has_param("supplier") ? readSupplierId(c, oldSid) : oldSid;
+                    std::optional<double> newCost;
+                    double cv = 0;
+                    if (c.req.has_param("cost")) {
+                        if (util::trim(c.param("cost")).empty()) newCost = 0.0;
+                        else if (parseMoneyText(c.param("cost"), cv)) newCost = cv;
+                    }
+                    if ((sid != oldSid || (newCost && *newCost != oldCost)) && inv.setSourcing(id, sid, newCost, c.user()).ok)
+                        audit.record(c.user(), "PART_SOURCING_CHANGED", "Part " + num(id) + " " + oldName + ": supplier " + suppliers.nameOf(oldSid) + " -> " + suppliers.nameOf(sid) +
+                                     ", cost " + util::money(oldCost) + " -> " + util::money(newCost ? *newCost : oldCost), c.ip);
+                }
+                if (price != oldPrice)
+                    audit.record(c.user(), "PRICE_CHANGE", "Part " + num(id) + " " + oldName + ": " + util::money(oldPrice) + " -> " + util::money(price), c.ip);
+                return redirect(c, msgUrl("/", "Part " + partLabelById(id) + " updated.", true));
+            }
+            err = r.message;
+        }
+        redirect(c, msgUrl("/edit?id=" + num(id), err, false));
+    }
+    void deletePage(Ctx& c) {
+        const inv::Part* p = inv.find(intParam(c, "id", 1, inv::limits::kMaxId, 0));
+        if (!p) return redirect(c, msgUrl("/", "Part not found.", false));
+        std::string b = "<h1>Delete part?</h1><div class='card'><p>You are about to delete <b>" + h(p->fullName()) + "</b> with <b>" + num(p->quantity()) +
+                        "</b> units in stock. The removal is recorded in the movement log and audit trail.</p><form method='post' action='/delete'>" + tokenField(c) +
+                        "<input type='hidden' name='id' value='" + num(p->id()) + "'><button class='danger' type='submit'>Yes, delete</button> <a class='btn sec' href='/'>Cancel</a></form></div>";
+        html(c, layout(c, "Delete part", b));
+    }
+    void doDelete(Ctx& c) {
+        const int id = intParam(c, "id", 1, inv::limits::kMaxId, 0);
+        const inv::Part* p = inv.find(id);
+        if (!p) return redirect(c, msgUrl("/", "Part not found.", false));
+        const std::string desc = "Part " + num(id) + " " + p->fullName() + " (stock " + num(p->quantity()) + ")";
+        const inv::Result r = inv.removePart(id, c.user());
+        if (r.ok) audit.record(c.user(), "RECORD_DELETED", desc, c.ip);
+        redirect(c, msgUrl("/", r.ok ? "Part deleted." : r.message, r.ok));
+    }
+
+    // ------------------------------------------------------------------ Phase 3: customers & vehicles
+    static std::string customerLabel(const crm::Customer& k) { return k.phone.empty() ? k.name : k.name + " - " + k.phone; }
+    std::string vehicleLabel(const crm::Vehicle& v) const {
+        const crm::Customer* o = people.findCustomer(v.customerId);
+        return v.plate + (v.model.empty() ? "" : " - " + v.model) + (o ? " (" + o->name + ")" : "");
+    }
+    static std::string archivedTag(bool a) { return a ? " <span class='tag out'>Archived</span>" : ""; }
+    static std::string val(Ctx& c, const char* name, const std::string& dflt) { return c.req.has_param(name) ? c.param(name) : dflt; }
+    static std::string idLink(const char* path, int id, const std::string& text) { return "<a href='" + std::string(path) + "?id=" + num(id) + "'>" + text + "</a>"; }
+    const crm::Customer* customerParam(Ctx& c, const char* name = "id") const {
+        long long id = 0;
+        return util::parseInt(c.param(name), 1, 999999, id) ? people.findCustomer(static_cast<int>(id)) : nullptr;
+    }
+    const crm::Vehicle* vehicleParam(Ctx& c, const char* name = "id") const {
+        long long id = 0;
+        return util::parseInt(c.param(name), 1, 999999, id) ? people.findVehicle(static_cast<int>(id)) : nullptr;
+    }
+    // Link to the customer record when exactly one record has this name (used on the Receivables page, which groups by name).
+    std::string customerNameLink(const std::string& name) const {
+        const auto m = people.findByName(name);
+        return m.size() == 1 ? idLink("/customer", m[0]->id, h(name)) : h(name);
+    }
+    static std::string historyTable(const std::vector<crm::HistoryRow>& rows, const crm::Registry& reg, bool showVehicle, bool canPay) {
+        std::string b = "<div class='card'><table><thead><tr><th>Date</th><th>Invoice</th>" + std::string(showVehicle ? "<th>Vehicle</th>" : "") +
+                        "<th>Items</th><th class='n'>Total</th><th class='n'>Balance</th><th>Status</th><th></th></tr></thead><tbody>";
+        for (const crm::HistoryRow& r : rows) {
+            const crm::Vehicle* v = r.vehicleId ? reg.findVehicle(r.vehicleId) : nullptr;
+            b += "<tr><td>" + h(r.timestamp) + "</td><td>" + h(r.ref) + (r.linked ? "" : " <span class='mut' title='Old invoice typed as free text; matched to this customer by name'>(by name)</span>") + "</td>" +
+                 (showVehicle ? "<td>" + (v ? idLink("/vehicle", v->id, h(v->plate)) : std::string("<span class='mut'>-</span>")) + "</td>" : std::string()) +
+                 "<td>" + h(r.summary) + "</td><td class='n'>" + php(r.total) + "</td><td class='n'>" + (r.balance > 0 ? "<b class='minus'>" + php(r.balance) + "</b>" : php(0)) + "</td><td>" + statusTag(r.status) +
+                 "</td><td class='right'>" + (canPay && r.balance > 0 ? "<a class='btn sm' href='/payment?no=" + util::urlEncode(r.ref) + "'>Record payment</a> " : std::string()) +
+                 "<a class='btn sm sec' href='/invoice?no=" + util::urlEncode(r.ref) + "'>View</a></td></tr>";
+        }
+        if (rows.empty()) b += "<tr><td colspan='" + std::string(showVehicle ? "8" : "7") + "' class='mut'>No invoices yet.</td></tr>";
+        return b + "</tbody></table></div>";
+    }
+
+    // Turns what the cashier typed / picked on the New sale form into (name, customer id, vehicle id). "" = ok, otherwise the reason.
+    // Typed free text that matches no customer record stays free text exactly as before (id 0). Hidden ids only disambiguate the text.
+    std::string resolveParty(Ctx& c, std::string& name, int& cid, int& vid) const {
+        name.clear(); cid = vid = 0;
+        const std::string ctext = util::trim(c.param("customer")), vtext = util::trim(c.param("vehicle"));
+        const crm::Customer* k = nullptr;
+        const crm::Vehicle* v = nullptr;
+        long long idv = 0;
+        if (!ctext.empty()) {
+            if (util::parseInt(c.param("customer_id"), 1, 999999, idv))
+                if (const crm::Customer* x = people.findCustomer(static_cast<int>(idv)))
+                    if (util::equalsIgnoreCase(ctext, customerLabel(*x)) || util::equalsIgnoreCase(ctext, x->name)) k = x;
+            if (!k) {
+                std::vector<const crm::Customer*> hits;
+                for (const crm::Customer& x : people.customers()) if (util::equalsIgnoreCase(ctext, customerLabel(x))) hits.push_back(&x);
+                if (hits.empty()) hits = people.findByName(ctext);
+                if (hits.size() > 1) return "More than one customer is called \"" + ctext + "\" - pick one from the suggestions (they show the phone number).";
+                if (hits.size() == 1) k = hits[0];
+            }
+        }
+        if (!vtext.empty()) {
+            if (util::parseInt(c.param("vehicle_id"), 1, 999999, idv))
+                if (const crm::Vehicle* x = people.findVehicle(static_cast<int>(idv)))
+                    if (util::equalsIgnoreCase(vtext, vehicleLabel(*x)) || crm::normalizePlate(vtext) == x->plate) v = x;
+            if (!v) v = people.findByPlate(vtext);
+            if (!v) {   // "PLATE - Model (Owner)" as offered by the suggestion list
+                size_t cut = vtext.find(" - ");
+                if (cut == std::string::npos) cut = vtext.find(" (");
+                if (cut != std::string::npos) v = people.findByPlate(vtext.substr(0, cut));
+            }
+            if (!v) return "Vehicle \"" + vtext + "\" is not in the customer records. Add it first (Customers > open the customer > Add vehicle) or clear the Vehicle box.";
+            const crm::Customer* owner = people.findCustomer(v->customerId);
+            if (!owner) return "Vehicle " + v->plate + " has no owner record.";
+            if (v->archived) return "Vehicle " + v->plate + " is archived. Restore it first.";
+            if (k && k->id != owner->id) return "Vehicle " + v->plate + " belongs to " + owner->name + ", not " + k->name + ".";
+            if (!k) {
+                if (!ctext.empty()) return "Vehicle " + v->plate + " belongs to the saved customer " + owner->name + ". Pick that customer or clear the Customer box.";
+                k = owner;   // only a plate was given: the owner is the customer
+            }
+        }
+        if (k && k->archived) return "Customer " + k->name + " is archived. Restore the customer first (Customers page) or sell without a customer record.";
+        if (k) { name = k->name; cid = k->id; } else name = ctext;
+        if (v) vid = v->id;
+        return "";
+    }
+
+    void customersPage(Ctx& c) {
+        const std::string q = util::trim(c.param("q"));
+        const bool showArchived = c.param("archived") == "1";
+        const auto& all = inv.invoices().all();
+        const auto balances = crm::balancesByCustomer(all, people);
+        std::vector<crm::SearchHit> hits;
+        size_t hiddenArchived = 0;
+        for (crm::SearchHit& hit : people.search(q)) {
+            if (hit.customer->archived && !showArchived) { ++hiddenArchived; continue; }
+            hits.push_back(std::move(hit));
+        }
+        std::string b = "<h1>Customers</h1><div class='card'><form class='bar' method='get' action='/customers'><input id='cq' name='q' type='search' autocomplete='off' autofocus placeholder='Search by name, phone or plate number' value='" + h(q) +
+                        "'><label class='inline'><input type='checkbox' name='archived' value='1'" + std::string(showArchived ? " checked" : "") + "> Show archived</label><button type='submit'>Search</button>"
+                        "<a class='btn sec' href='/customers'>Clear</a><span class='grow'></span><a class='btn' href='/customer/edit'>+ Add customer</a></form>"
+                        "<table><thead><tr><th>Customer</th><th>Phone</th><th>Vehicles</th><th class='n'>Outstanding balance</th><th></th></tr></thead><tbody>";
+        for (const crm::SearchHit& hit : hits) {
+            const crm::Customer& k = *hit.customer;
+            std::string plates;
+            for (const crm::Vehicle* v : people.vehiclesOf(k.id)) {
+                const bool matched = std::find(hit.plateMatches.begin(), hit.plateMatches.end(), v) != hit.plateMatches.end();
+                plates += std::string(plates.empty() ? "" : ", ") + "<a href='/vehicle?id=" + num(v->id) + "'>" + (matched ? "<b>" + h(v->plate) + "</b>" : h(v->plate)) + "</a>" + (v->archived ? " <span class='mut'>(archived)</span>" : "");
+            }
+            auto bi = balances.find(k.id);
+            const double owed = bi == balances.end() ? 0.0 : bi->second.balance;
+            b += "<tr><td>" + idLink("/customer", k.id, "<b>" + h(k.name) + "</b>") + archivedTag(k.archived) + (!hit.plateMatches.empty() ? " <span class='mut'>plate match</span>" : "") + "</td><td>" + h(k.phone) + "</td><td>" +
+                 (plates.empty() ? "<span class='mut'>none</span>" : plates) + "</td><td class='n'>" + (owed > 0 ? "<b class='minus'>" + php(owed) + "</b>" : php(0)) +
+                 "</td><td class='right'><a class='btn sm sec' href='/customer?id=" + num(k.id) + "'>Open</a></td></tr>";
+        }
+        if (hits.empty()) b += "<tr><td colspan='5' class='mut'>" + std::string(q.empty() ? "No customers yet - add the first one." : "Nobody matches \"" + h(q) + "\".") + "</td></tr>";
+        b += "</tbody></table>";
+        if (hiddenArchived) b += "<p class='mut'>" + num(static_cast<long long>(hiddenArchived)) + " archived customer(s) also match - tick <i>Show archived</i> to see them.</p>";
+        html(c, layout(c, "Customers", b + "</div>"));
+    }
+
+    void customerPage(Ctx& c) {
+        const crm::Customer* k = customerParam(c);
+        if (!k) return redirect(c, msgUrl("/customers", "Customer not found.", false));
+        const auto& all = inv.invoices().all();
+        const auto hist = crm::customerHistory(all, people, *k);
+        const crm::Balance bal = crm::customerBalance(all, people, *k);
+        const auto cars = people.vehiclesOf(k->id);
+        const bool admin = auth::allowed(c.role, auth::Permission::ArchiveCustomers);
+        const bool canPay = auth::allowed(c.role, auth::Permission::Receivables);
+        const bool hasHist = crm::customerHasHistory(all, k->id);
+        std::string b = "<p><a href='/customers'>&larr; All customers</a></p><h1>" + h(k->name) + archivedTag(k->archived) + "</h1>"
+                        "<div class='stats'><div class='stat" + std::string(bal.balance > 0 ? " warn" : "") + "'><span>Outstanding balance</span><b>" + php(bal.balance) + "</b></div>"
+                        "<div class='stat'><span>Open invoices</span><b>" + num(bal.openInvoices) + "</b></div><div class='stat'><span>Invoices</span><b>" + num(static_cast<long long>(hist.size())) + "</b></div>"
+                        "<div class='stat'><span>Vehicles</span><b>" + num(static_cast<long long>(cars.size())) + "</b></div></div>"
+                        "<div class='card'><h2>Customer info</h2><table class='kv'><tr><td>Phone</td><td>" + h(k->phone) + "</td></tr><tr><td>Address</td><td>" + h(k->address) + "</td></tr><tr><td>Notes</td><td>" + h(k->notes) + "</td></tr></table><p>";
+        b += "<a class='btn' href='/customer/edit?id=" + num(k->id) + "'>Edit customer</a> ";
+        if (!k->archived) b += "<a class='btn' href='/invoice?customer=" + util::urlEncode(customerLabel(*k)) + "'>New sale</a> <a class='btn sec' href='/vehicle/edit?customer=" + num(k->id) + "'>+ Add vehicle</a> ";
+        if (admin) {
+            b += "<form class='inline' method='post' action='/customer/archive' data-confirm='" + h(k->archived ? "Restore this customer?" : "Archive this customer? They stay in all history but disappear from the sale form.") + "'>" + tokenField(c) +
+                 "<input type='hidden' name='id' value='" + num(k->id) + "'><input type='hidden' name='on' value='" + (k->archived ? "0" : "1") + "'><button class='sec' type='submit'>" + (k->archived ? "Restore" : "Archive") + "</button></form> ";
+            if (!hasHist && cars.empty())
+                b += "<form class='inline' method='post' action='/customer/delete' data-confirm='Delete this customer permanently? (They have no history.)'>" + tokenField(c) + "<input type='hidden' name='id' value='" + num(k->id) + "'><button class='danger' type='submit'>Delete</button></form>";
+        }
+        b += "</p></div><h2>Vehicles</h2><div class='card'><table><thead><tr><th>Plate</th><th>Model</th><th>Year</th><th>Color</th><th>Notes</th><th class='n'>Invoices</th><th></th></tr></thead><tbody>";
+        for (const crm::Vehicle* v : cars) {
+            int n = 0;
+            for (const inv::Invoice& i : all) if (i.vehicleId == v->id) ++n;
+            b += "<tr><td><b>" + h(v->plate) + "</b>" + archivedTag(v->archived) + "</td><td>" + h(v->model) + "</td><td>" + (v->year ? num(v->year) : std::string()) + "</td><td>" + h(v->color) + "</td><td>" + h(v->notes) +
+                 "</td><td class='n'>" + num(n) + "</td><td class='right'><a class='btn sm' href='/vehicle?id=" + num(v->id) + "'>History</a> <a class='btn sm sec' href='/vehicle/edit?id=" + num(v->id) + "'>Edit</a></td></tr>";
+        }
+        if (cars.empty()) b += "<tr><td colspan='7' class='mut'>No vehicles recorded.</td></tr>";
+        b += "</tbody></table></div><h2>Invoice history</h2>" + historyTable(hist, people, true, canPay);
+        html(c, layout(c, k->name, b));
+    }
+
+    void customerEditPage(Ctx& c) {
+        const crm::Customer* k = nullptr;
+        if (!c.param("id").empty() && !(k = customerParam(c))) return redirect(c, msgUrl("/customers", "Customer not found.", false));
+        std::string b = "<h1>" + std::string(k ? "Edit customer" : "Add customer") + "</h1><div class='card'><form method='post' action='/customer/save'>" + tokenField(c) +
+                        "<input type='hidden' name='id' value='" + (k ? num(k->id) : "0") + "'><input type='hidden' name='from' value='" + h(c.param("from")) + "'>"
+                        "<label>Name (required)</label><input name='name' maxlength='60' required autofocus value='" + h(val(c, "name", k ? k->name : "")) + "'>"
+                        "<label>Phone</label><input name='phone' maxlength='30' inputmode='tel' value='" + h(val(c, "phone", k ? k->phone : "")) + "'>"
+                        "<label>Address</label><input name='address' maxlength='120' value='" + h(val(c, "address", k ? k->address : "")) + "'>"
+                        "<label>Notes</label><input name='notes' maxlength='200' value='" + h(val(c, "notes", k ? k->notes : "")) + "'>"
+                        "<p><button type='submit'>Save customer</button> <a class='btn sec' href='" + (k ? "/customer?id=" + num(k->id) : std::string("/customers")) + "'>Cancel</a></p></form></div>";
+        html(c, layout(c, k ? "Edit customer" : "Add customer", b));
+    }
+
+    void doCustomerSave(Ctx& c) {
+        const crm::Customer* old = nullptr;
+        long long idv = 0;
+        const bool adding = !util::parseInt(c.param("id"), 1, 999999, idv);
+        if (!adding && !(old = people.findCustomer(static_cast<int>(idv)))) return redirect(c, msgUrl("/customers", "Customer not found.", false));
+        crm::Customer in;
+        in.name = c.param("name"); in.phone = c.param("phone"); in.address = c.param("address"); in.notes = c.param("notes");
+        int newId = 0;
+        const std::string err = people.saveCustomer(adding ? 0 : static_cast<int>(idv), in, newId);
+        if (!err.empty()) {
+            const std::string back = "/customer/edit?id=" + (adding ? std::string() : num(idv)) + "&from=" + util::urlEncode(c.param("from")) + "&name=" + util::urlEncode(c.param("name")) + "&phone=" + util::urlEncode(c.param("phone")) +
+                                     "&address=" + util::urlEncode(c.param("address")) + "&notes=" + util::urlEncode(c.param("notes"));
+            return redirect(c, msgUrl(back, err, false));
+        }
+        const crm::Customer* k = people.findCustomer(newId);
+        audit.record(c.user(), adding ? "CUSTOMER_ADDED" : "CUSTOMER_UPDATED", "#" + num(newId) + " " + (k ? k->name : std::string()) + (k && !k->phone.empty() ? " " + k->phone : std::string()), c.ip);
+        if (c.param("from") == "sale" && k) return redirect(c, "/invoice?customer=" + util::urlEncode(customerLabel(*k)));
+        redirect(c, msgUrl("/customer?id=" + num(newId), adding ? "Customer added." : "Customer saved.", true));
+    }
+
+    void doCustomerArchive(Ctx& c) {
+        const crm::Customer* k = customerParam(c);
+        if (!k) return redirect(c, msgUrl("/customers", "Customer not found.", false));
+        const bool on = c.param("on") == "1";
+        const std::string name = k->name, err = people.setCustomerArchived(k->id, on);
+        if (err.empty()) audit.record(c.user(), on ? "CUSTOMER_ARCHIVED" : "CUSTOMER_RESTORED", "#" + c.param("id") + " " + name, c.ip);
+        redirect(c, msgUrl("/customer?id=" + c.param("id"), err.empty() ? (on ? "Customer archived." : "Customer restored.") : err, err.empty()));
+    }
+
+    void doCustomerDelete(Ctx& c) {
+        const crm::Customer* k = customerParam(c);
+        if (!k) return redirect(c, msgUrl("/customers", "Customer not found.", false));
+        const std::string name = k->name, id = c.param("id");
+        const std::string err = people.removeCustomer(k->id, crm::customerHasHistory(inv.invoices().all(), k->id));
+        if (!err.empty()) return redirect(c, msgUrl("/customer?id=" + id, err, false));
+        audit.record(c.user(), "CUSTOMER_DELETED", "#" + id + " " + name, c.ip);
+        redirect(c, msgUrl("/customers", "Customer deleted.", true));
+    }
+
+    void vehiclePage(Ctx& c) {
+        const crm::Vehicle* v = vehicleParam(c);
+        if (!v && c.param("id").empty() && !c.param("plate").empty()) {   // /vehicle?plate=abc 123
+            if (const crm::Vehicle* p = people.findByPlate(c.param("plate"))) return redirect(c, "/vehicle?id=" + num(p->id));
+            return redirect(c, msgUrl("/customers?q=" + util::urlEncode(c.param("plate")), "No vehicle with that plate.", false));
+        }
+        if (!v) return redirect(c, msgUrl("/customers", "Vehicle not found.", false));
+        const crm::Customer* owner = people.findCustomer(v->customerId);
+        const auto& all = inv.invoices().all();
+        const auto hist = crm::vehicleHistory(all, v->id);   // Phase 4: job orders get merged into this list
+        double spent = 0, owed = 0;
+        for (const crm::HistoryRow& r : hist) { spent = util::round2(spent + r.total); owed = util::round2(owed + r.balance); }
+        const bool admin = auth::allowed(c.role, auth::Permission::ArchiveCustomers);
+        std::string b = "<p>" + std::string(owner ? idLink("/customer", owner->id, "&larr; " + h(owner->name)) : std::string("<a href='/customers'>&larr; Customers</a>")) + "</p><h1>" + h(v->plate) + archivedTag(v->archived) + "</h1>"
+                        "<div class='stats'><div class='stat'><span>Invoices</span><b>" + num(static_cast<long long>(hist.size())) + "</b></div><div class='stat'><span>Total billed</span><b>" + php(spent) + "</b></div>"
+                        "<div class='stat" + std::string(owed > 0 ? " warn" : "") + "'><span>Unpaid</span><b>" + php(owed) + "</b></div></div>"
+                        "<div class='card'><h2>Vehicle info</h2><table class='kv'><tr><td>Owner</td><td>" + (owner ? idLink("/customer", owner->id, h(owner->name)) : std::string()) + "</td></tr><tr><td>Model</td><td>" + h(v->model) + "</td></tr>"
+                        "<tr><td>Year</td><td>" + (v->year ? num(v->year) : std::string()) + "</td></tr><tr><td>Color</td><td>" + h(v->color) + "</td></tr><tr><td>Notes</td><td>" + h(v->notes) + "</td></tr></table><p>"
+                        "<a class='btn' href='/vehicle/edit?id=" + num(v->id) + "'>Edit vehicle</a> ";
+        if (!v->archived && owner && !owner->archived) b += "<a class='btn' href='/invoice?customer=" + util::urlEncode(customerLabel(*owner)) + "&vehicle=" + util::urlEncode(v->plate) + "'>New sale</a> ";
+        if (admin) {
+            b += "<form class='inline' method='post' action='/vehicle/archive' data-confirm='" + h(v->archived ? "Restore this vehicle?" : "Archive this vehicle? Its history stays.") + "'>" + tokenField(c) +
+                 "<input type='hidden' name='id' value='" + num(v->id) + "'><input type='hidden' name='on' value='" + (v->archived ? "0" : "1") + "'><button class='sec' type='submit'>" + (v->archived ? "Restore" : "Archive") + "</button></form> ";
+            if (hist.empty())
+                b += "<form class='inline' method='post' action='/vehicle/delete' data-confirm='Delete this vehicle permanently? (It has no history.)'>" + tokenField(c) + "<input type='hidden' name='id' value='" + num(v->id) + "'><button class='danger' type='submit'>Delete</button></form>";
+        }
+        b += "</p></div><h2>History (newest first)</h2>" + historyTable(hist, people, false, auth::allowed(c.role, auth::Permission::Receivables));
+        html(c, layout(c, v->plate, b));
+    }
+
+    void vehicleEditPage(Ctx& c) {
+        const crm::Vehicle* v = nullptr;
+        if (!c.param("id").empty() && !(v = vehicleParam(c))) return redirect(c, msgUrl("/customers", "Vehicle not found.", false));
+        const crm::Customer* owner = v ? people.findCustomer(v->customerId) : customerParam(c, "customer");
+        if (!owner) return redirect(c, msgUrl("/customers", "Open a customer first, then use Add vehicle.", false));
+        std::string b = "<h1>" + std::string(v ? "Edit vehicle" : "Add vehicle") + " - " + h(owner->name) + "</h1><div class='card'><form method='post' action='/vehicle/save'>" + tokenField(c) +
+                        "<input type='hidden' name='id' value='" + (v ? num(v->id) : "0") + "'><input type='hidden' name='customer_id' value='" + num(owner->id) + "'><input type='hidden' name='from' value='" + h(c.param("from")) + "'>"
+                        "<label>Plate number (required) <span class='mut'>- saved in capitals without spaces; each plate can only be registered once</span></label><input name='plate' maxlength='16' required autofocus value='" + h(val(c, "plate", v ? v->plate : "")) + "'>"
+                        "<div class='grid'><div><label>Model</label><input name='model' maxlength='60' value='" + h(val(c, "model", v ? v->model : "")) + "'></div>"
+                        "<div><label>Year</label><input name='year' type='number' min='1900' max='2200' value='" + h(val(c, "year", v && v->year ? num(v->year) : "")) + "'></div>"
+                        "<div><label>Color</label><input name='color' maxlength='30' value='" + h(val(c, "color", v ? v->color : "")) + "'></div></div>"
+                        "<label>Notes</label><input name='notes' maxlength='200' value='" + h(val(c, "notes", v ? v->notes : "")) + "'>"
+                        "<p><button type='submit'>Save vehicle</button> <a class='btn sec' href='/customer?id=" + num(owner->id) + "'>Cancel</a></p></form></div>";
+        html(c, layout(c, v ? "Edit vehicle" : "Add vehicle", b));
+    }
+
+    void doVehicleSave(Ctx& c) {
+        const crm::Vehicle* old = nullptr;
+        long long idv = 0;
+        const bool adding = !util::parseInt(c.param("id"), 1, 999999, idv);
+        if (!adding && !(old = people.findVehicle(static_cast<int>(idv)))) return redirect(c, msgUrl("/customers", "Vehicle not found.", false));
+        crm::Vehicle in;
+        long long owner = 0, year = 0;
+        util::parseInt(c.param("customer_id"), 1, 999999, owner);
+        in.customerId = static_cast<int>(owner);
+        in.plate = c.param("plate"); in.model = c.param("model"); in.color = c.param("color"); in.notes = c.param("notes");
+        const std::string yt = util::trim(c.param("year"));
+        std::string err;
+        if (!yt.empty()) { if (util::parseInt(yt, 1, 9999, year)) in.year = static_cast<int>(year); else err = "Year must be a number (or blank)."; }
+        int newId = 0;
+        if (err.empty()) err = people.saveVehicle(adding ? 0 : static_cast<int>(idv), in, newId);
+        if (!err.empty()) {
+            const std::string back = "/vehicle/edit?" + std::string(adding ? "customer=" + c.param("customer_id") : "id=" + num(idv)) + "&from=" + util::urlEncode(c.param("from")) + "&plate=" + util::urlEncode(c.param("plate")) +
+                                     "&model=" + util::urlEncode(c.param("model")) + "&year=" + util::urlEncode(c.param("year")) + "&color=" + util::urlEncode(c.param("color")) + "&notes=" + util::urlEncode(c.param("notes"));
+            return redirect(c, msgUrl(back, err, false));
+        }
+        const crm::Vehicle* v = people.findVehicle(newId);
+        audit.record(c.user(), adding ? "VEHICLE_ADDED" : "VEHICLE_UPDATED", "#" + num(newId) + " " + (v ? v->plate : std::string()) + " customer #" + (v ? num(v->customerId) : std::string()), c.ip);
+        if (c.param("from") == "sale" && v) {
+            const crm::Customer* k = people.findCustomer(v->customerId);
+            return redirect(c, "/invoice?customer=" + util::urlEncode(k ? customerLabel(*k) : std::string()) + "&vehicle=" + util::urlEncode(v->plate));
+        }
+        redirect(c, msgUrl("/vehicle?id=" + num(newId), adding ? "Vehicle added." : "Vehicle saved.", true));
+    }
+
+    void doVehicleArchive(Ctx& c) {
+        const crm::Vehicle* v = vehicleParam(c);
+        if (!v) return redirect(c, msgUrl("/customers", "Vehicle not found.", false));
+        const bool on = c.param("on") == "1";
+        const std::string plate = v->plate, err = people.setVehicleArchived(v->id, on);
+        if (err.empty()) audit.record(c.user(), on ? "VEHICLE_ARCHIVED" : "VEHICLE_RESTORED", "#" + c.param("id") + " " + plate, c.ip);
+        redirect(c, msgUrl("/vehicle?id=" + c.param("id"), err.empty() ? (on ? "Vehicle archived." : "Vehicle restored.") : err, err.empty()));
+    }
+
+    void doVehicleDelete(Ctx& c) {
+        const crm::Vehicle* v = vehicleParam(c);
+        if (!v) return redirect(c, msgUrl("/customers", "Vehicle not found.", false));
+        const std::string plate = v->plate, id = c.param("id"), back = "/customer?id=" + num(v->customerId);
+        const std::string err = people.removeVehicle(v->id, crm::vehicleHasHistory(inv.invoices().all(), v->id));
+        if (!err.empty()) return redirect(c, msgUrl("/vehicle?id=" + id, err, false));
+        audit.record(c.user(), "VEHICLE_DELETED", "#" + id + " " + plate, c.ip);
+        redirect(c, msgUrl(back, "Vehicle deleted.", true));
+    }
+
+    // ------------------------------------------------------------------ invoices / receipts
+    static constexpr int kPartRows = 60, kStartPartRows = 8, kSvcRows = 4;   // kPartRows = most part rows one invoice accepts
+
+    void invoicePage(Ctx& c) {
+        const std::string no = c.param("no");
+        if (!no.empty()) return receipt(c, no);
+        std::string b = "<h1>New sale / invoice</h1><div class='card'><form method='post' action='/invoice' id='sale-form' data-draft-user='" + h(c.user()) + "'>" + tokenField(c) +
+                        "<label>Customer <span class='mut'>(pick a saved customer or just type a name - a name is required for a credit sale)</span></label><input id='cust-in' name='customer' list='custs' maxlength='120' autocomplete='off' placeholder='Walk-in customer' value='" + h(c.param("customer")) + "'>"
+                        "<input type='hidden' id='cust-id' name='customer_id' value=''>" + customersDatalist() +
+                        "<label>Vehicle plate <span class='mut'>(optional - pick one of the customer's saved vehicles)</span></label><input id='veh-in' name='vehicle' list='vehs' maxlength='120' autocomplete='off' placeholder='e.g. ABC 1234' value='" + h(c.param("vehicle")) + "'>"
+                        "<input type='hidden' id='veh-id' name='vehicle_id' value=''>" + vehiclesDatalist() +
+                        "<p class='mut'><a href='/customer/edit?from=sale'>+ New customer</a> &middot; <a href='/customers'>Find a customer / plate</a></p>" +
+                        "<h2>Parts <span class='mut'>(type or pick a part ID - the catalogue price is applied)</span></h2><table><thead><tr><th>Part number</th><th>Quantity</th><th class='n'>Price</th><th class='n'>Amount</th></tr></thead><tbody id='part-rows'>";
+        const std::string pre = c.param("part");
+        int shownRows = kStartPartRows;   // rows beyond the first 8 are kept if a failed submit sent them back
+        for (int i = kStartPartRows + 1; i <= kPartRows; ++i)
+            if (!c.param("p_id_" + num(i)).empty() || !c.param("p_qty_" + num(i)).empty()) shownRows = i;
+        for (int i = 1; i <= kPartRows; ++i) {
+            std::string id = c.param("p_id_" + num(i)), qty = c.param("p_qty_" + num(i));
+            if (i > shownRows) break;
+            if (i == 1 && id.empty() && !pre.empty()) { id = pre; if (const inv::Part* pp = resolvePart(pre)) id = partLabel(*pp); qty = "1"; }
+            b += "<tr><td><input name='p_id_" + num(i) + "' list='plist' value='" + h(id) + "'></td><td><input name='p_qty_" + num(i) + "' type='number' min='1' value='" + h(qty) + "'></td><td class='n price-cell'></td><td class='n amount-cell'></td></tr>";
+        }
+        b += "</tbody></table><p class='right'><b>Parts total: <span id='parts-total'>&#8369;0.00</span></b></p><p><button type='button' class='sec' id='add-part-row' data-max='" + num(kPartRows) + "'>+ Add 5 more rows</button></p><datalist id='plist'>";
+        for (const inv::Part& p : inv.parts())
+            b += "<option value='" + h(partLabel(p)) + "' data-id='" + num(p.id()) + "' data-price='" + util::money(p.price()) + "'>" + h(p.fullName()) + " - &#8369;" + util::moneyFmt(p.price()) + " (" + num(p.quantity()) + " in stock)</option>";
+        b += "</datalist><h2>Services <span class='mut'>(labour, repairs - optional)</span></h2><table><thead><tr><th>Description</th><th>Price (&#8369;)</th></tr></thead><tbody id='svc-rows'>";
+        for (int i = 1; i <= kSvcRows; ++i)
+            b += "<tr><td><input name='s_desc_" + num(i) + "' maxlength='100' value='" + h(c.param("s_desc_" + num(i))) + "'></td>" +
+                 "<td><input name='s_price_" + num(i) + "' type='number' step='0.01' min='0' value='" + h(c.param("s_price_" + num(i))) + "'></td></tr>";
+        b += "</tbody></table><p class='right'><b>Services total: <span id='svc-total'>&#8369;0.00</span></b></p><h2>Payment</h2><div class='grid'><div><label>Payment type</label><select name='pay_type' id='pay-type'><option value='full'>Paid in full</option><option value='credit'" + std::string(c.param("pay_type") == "credit" ? " selected" : "") + ">Credit sale (pay later)</option></select></div><div><label id='amt-label'>Amount paid now (&#8369;) - leave blank if paid in full</label>"
+             "<input name='amount_paid' inputmode='decimal' autocomplete='off' placeholder='full amount' value='" + h(c.param("amount_paid")) + "'></div>"
+             "<div><label>Payment method</label>" + methodSelect(c.param("method")) + "</div>"
+             "<div><label>Received by (optional - leave blank for " + h(c.user()) + ")</label><input name='received_by' maxlength='40' autocomplete='off' value='" + h(c.param("received_by")) + "'></div></div>"
+             "<p class='mut'>Credit sale: type what the customer pays now (0 if nothing). The remaining balance is tracked under <b>Accounts Receivable</b> and needs a customer name. Sales figures only count money actually received.</p>"
+             "<p><button type='submit'>Record sale &amp; create receipt</button> <a class='btn sec' href='/' id='sale-cancel'>Cancel</a></p></form></div>";
+        html(c, layout(c, "New sale", b));
+    }
+
+    void doInvoice(Ctx& c) {
+        auto back = [&](const std::string& msg) {  // keep what was typed
+            std::string q = "/invoice?customer=" + util::urlEncode(c.param("customer")) + "&amount_paid=" + util::urlEncode(c.param("amount_paid")) +
+                            "&method=" + util::urlEncode(c.param("method")) + "&received_by=" + util::urlEncode(c.param("received_by")) + "&pay_type=" + util::urlEncode(c.param("pay_type")) + "&vehicle=" + util::urlEncode(c.param("vehicle"));
+            for (int i = 1; i <= kPartRows; ++i) q += "&p_id_" + num(i) + "=" + util::urlEncode(c.param("p_id_" + num(i))) + "&p_qty_" + num(i) + "=" + util::urlEncode(c.param("p_qty_" + num(i)));
+            for (int i = 1; i <= kSvcRows; ++i)
+                q += "&s_desc_" + num(i) + "=" + util::urlEncode(c.param("s_desc_" + num(i))) + "&s_qty_" + num(i) + "=" + util::urlEncode(c.param("s_qty_" + num(i))) +
+                     "&s_price_" + num(i) + "=" + util::urlEncode(c.param("s_price_" + num(i)));
+            redirect(c, msgUrl(q, msg, false));
+        };
+        std::vector<inv::InvoiceLine> lines;
+        for (int i = 1; i <= kPartRows; ++i) {
+            const std::string ids = util::trim(c.param("p_id_" + num(i)));
+            if (ids.empty()) continue;
+            long long qty;
+            const inv::Part* rp = resolvePart(ids);
+            if (!rp || !util::parseInt(c.param("p_qty_" + num(i)), 1, inv::limits::kMaxQty, qty))
+                return back("Part row " + num(i) + ": enter a valid Part ID (that exists) and a quantity of at least 1.");
+            inv::InvoiceLine l;
+            for (const inv::InvoiceLine& x : lines) if (x.partId == rp->id()) return back("Part row " + num(i) + ": that part is already in this sale - increase its quantity instead.");
+            l.kind = inv::InvoiceLine::Kind::Part; l.partId = rp->id(); l.qty = static_cast<int>(qty);
+            lines.push_back(l);
+        }
+        for (int i = 1; i <= kSvcRows; ++i) {
+            const std::string desc = util::trim(c.param("s_desc_" + num(i))), pr = util::trim(c.param("s_price_" + num(i)));
+            if (desc.empty() && pr.empty()) continue;
+            long long qty = 1;
+            double price;
+            if (!util::trim(c.param("s_qty_" + num(i))).empty() && !util::parseInt(c.param("s_qty_" + num(i)), 1, inv::limits::kMaxQty, qty))
+                return back("Service row " + num(i) + ": quantity must be at least 1.");
+            if (!util::parseDouble(pr, 0, inv::limits::kMaxPrice, price)) return back("Service row " + num(i) + ": enter a valid price.");
+            inv::InvoiceLine l;
+            l.kind = inv::InvoiceLine::Kind::Service; l.description = desc; l.qty = static_cast<int>(qty); l.unitPrice = price;
+            lines.push_back(l);
+        }
+        double paid = -1.0;   // blank = paid in full
+        if (!util::trim(c.param("amount_paid")).empty() && !parseMoneyText(c.param("amount_paid"), paid)) return back("Amount paid must be a valid amount (or leave it blank).");
+        std::string partyName;
+        int partyCustomer = 0, partyVehicle = 0;
+        const std::string partyErr = resolveParty(c, partyName, partyCustomer, partyVehicle);
+        if (!partyErr.empty()) return back(partyErr);
+        const std::string recvBy = util::oneLine(util::trim(c.param("received_by")));
+        if (recvBy.size() > 40) return back("Received by is too long (max 40 characters).");
+        const bool onCredit = c.param("pay_type") == "credit";
+        if (onCredit && partyName.empty()) return back("A credit sale needs a customer name - type one or pick a saved customer.");
+        if (onCredit && util::trim(c.param("amount_paid")).empty()) paid = 0.0;
+        // A credit sale to a typed name with no customer record yet: save the person as a customer first.
+        int autoCustomer = 0;
+        if (onCredit && partyCustomer == 0 && !util::equalsIgnoreCase(partyName, "Walk-in customer")) {
+            crm::Customer nk;
+            nk.name = partyName; nk.notes = "Auto-added from a credit sale";
+            int nid = 0;
+            if (people.saveCustomer(0, nk, nid).empty()) {
+                if (const crm::Customer* made = people.findCustomer(nid)) { partyName = made->name; partyCustomer = nid; autoCustomer = nid; }
+            }
+        }
+        const inv::CheckoutResult r = inv.checkout(partyName, lines, c.user(), paid, c.param("method").empty() ? "Cash" : c.param("method"), partyCustomer, partyVehicle, recvBy);
+        if (!r.ok) {
+            if (autoCustomer) people.removeCustomer(autoCustomer, false);
+            return back(r.message);
+        }
+        if (autoCustomer) audit.record(c.user(), "CUSTOMER_ADDED", "#" + num(autoCustomer) + " " + partyName + " (auto, from credit sale " + r.invoiceNumber + ")", c.ip);
+        if (r.balance > 0) {
+            const inv::Invoice* v = inv.invoices().find(r.invoiceNumber);
+            audit.record(c.user(), "CREDIT_SALE", r.invoiceNumber + " " + (v ? v->customer : std::string()) + ": total " + util::money(r.paid + r.balance) + ", paid " + util::money(r.paid) +
+                                                   ", balance " + util::money(r.balance), c.ip);
+        }
+        redirect(c, "/invoice?no=" + util::urlEncode(r.invoiceNumber));
+    }
+
+    void receipt(Ctx& c, const std::string& no) {
+        const inv::Invoice* v = inv.invoices().find(no);
+        if (!v) return redirect(c, msgUrl("/invoices", "Invoice not found.", false));
+        const crm::Customer* rk = v->customerId ? people.findCustomer(v->customerId) : nullptr;
+        const crm::Vehicle* rv = v->vehicleId ? people.findVehicle(v->vehicleId) : nullptr;
+        std::string vehicleLine;
+        if (rv) vehicleLine = "<br><b>Vehicle:</b> " + h(rv->plate) + (rv->model.empty() ? "" : " - " + h(rv->model)) + (rv->year ? " (" + num(rv->year) + ")" : "");
+        std::string b = "<p class='noprint'><button data-print>&#128424; Print receipt</button> <a class='btn sec' href='/invoice'>New sale</a> <a class='btn sec' href='/invoices'>All invoices</a>" +
+                        (rk ? " <a class='btn sec' href='/customer?id=" + num(rk->id) + "'>Customer record</a>" : std::string()) + (rv ? " <a class='btn sec' href='/vehicle?id=" + num(rv->id) + "'>Vehicle history</a>" : std::string()) +
+                        (v->balance() > 0 && auth::allowed(c.role, auth::Permission::Receivables) ? " <a class='btn' href='/payment?no=" + util::urlEncode(v->number) + "'>Record payment</a>" : std::string()) + "</p>"
+                        "<div class='receipt'><img class='doc-logo' src='/static/logo.png' alt=''><h1>" + h(cfg.shopName) + "</h1><div class='sub'>Official receipt</div><div class='meta'><div><b>Invoice:</b> " + h(v->number) +
+                        "<br><b>Customer:</b> " + h(v->customer) + vehicleLine + "</div><div class='right'><b>Date:</b> " + h(v->timestamp.substr(0, 10)) + "<br><b>Time:</b> " + h(v->timestamp.size() > 11 ? v->timestamp.substr(11) : "") +
+                        "<br><b>Served by:</b> " + h(v->user) + "</div></div><table><thead><tr><th>Item</th><th>Type</th><th class='n'>Qty</th><th class='n'>Unit price</th><th class='n'>Amount</th></tr></thead><tbody>";
+        for (const inv::InvoiceLine& l : v->lines)
+            b += "<tr><td>" + h(l.description) + (l.kind == inv::InvoiceLine::Kind::Part && !carriesLabel(l.description, l.partId) ? " <span class='mut'>#" + h(partLabelById(l.partId)) + "</span>" : "") + "</td><td>" +
+                 (l.kind == inv::InvoiceLine::Kind::Part ? "Part" : "Service") + "</td><td class='n'>" + num(l.qty) + "</td><td class='n'>" + php(l.unitPrice) + "</td><td class='n'>" + php(l.total()) + "</td></tr>";
+        b += "</tbody><tfoot><tr><td colspan='4' class='n'>TOTAL</td><td class='n'>" + php(v->total()) + "</td></tr>";
+        if (v->status() != inv::PayStatus::Paid)
+            b += "<tr class='sub'><td colspan='4' class='n'>Paid to date</td><td class='n'>" + php(v->amountPaid) + "</td></tr>"
+                 "<tr><td colspan='4' class='n'>BALANCE DUE</td><td class='n minus'>" + php(v->balance()) + "</td></tr>";
+        b += "</tfoot></table><p>Payment status: " + statusTag(v->status()) + "</p>";
+        const auto pays = inv.payments().forInvoice(v->number);
+        if (!pays.empty()) {
+            b += "<h2>Payments received</h2><table><thead><tr><th>Date</th><th>Method</th><th>Received by</th><th>Note</th><th class='n'>Amount</th><th class='n'>Balance after</th></tr></thead><tbody>";
+            for (const inv::Payment* p : pays)
+                b += "<tr><td>" + h(p->timestamp) + "</td><td>" + h(p->method) + "</td><td>" + h(p->user) +
+                     (auth::allowed(c.role, auth::Permission::Receivables) ? " <span class='noprint'><a href='/payment-edit?no=" + util::urlEncode(v->number) + "&amp;i=" + num(p - inv.payments().all().data()) + "'>edit</a></span>" : std::string()) +
+                     "</td><td>" + h(p->note) + "</td><td class='n'>" + php(p->amount) + "</td><td class='n'>" + php(p->balanceAfter) + "</td></tr>";
+            b += "</tbody></table>";
+        }
+        b += "</div>";
+        html(c, layout(c, "Receipt " + no, b));
+    }
+
+    void invoiceList(Ctx& c) {
+        const std::string want = util::toLower(c.param("status"));   // "", paid, partial, unpaid
+        auto tab = [&](const std::string& key, const std::string& text) {
+            return "<a class='btn sm" + std::string(want == key ? "" : " sec") + "' href='/invoices" + (key.empty() ? "" : "?status=" + key) + "'>" + text + "</a> ";
+        };
+        std::string b = "<h1>Invoices</h1><p>" + tab("", "All") + tab("unpaid", "Unpaid") + tab("partial", "Partial") + tab("paid", "Paid") + "</p>"
+                        "<div class='card'><table><thead><tr><th>Invoice</th><th>Date</th><th>Customer</th><th>Vehicle</th><th>Served by</th><th class='n'>Total</th><th class='n'>Paid</th><th class='n'>Balance</th><th>Status</th><th></th></tr></thead><tbody>";
+        const auto& all = inv.invoices().all();
+        int shown = 0;
+        for (size_t i = all.size(); i-- > 0 && shown < 300;) {
+            const inv::Invoice& v = all[i];
+            if (!want.empty() && util::toLower(inv::payStatusName(v.status())) != want) continue;
+            ++shown;
+            b += "<tr><td>" + h(v.number) + "</td><td>" + h(v.timestamp) + "</td><td>" + (v.customerId && people.findCustomer(v.customerId) ? idLink("/customer", v.customerId, h(v.customer)) : h(v.customer)) + "</td><td>" +
+                 (v.vehicleId && people.findVehicle(v.vehicleId) ? idLink("/vehicle", v.vehicleId, h(people.findVehicle(v.vehicleId)->plate)) : std::string()) + "</td><td>" + h(v.user) + "</td><td class='n'>" + php(v.total()) +
+                 "</td><td class='n'>" + php(v.amountPaid) + "</td><td class='n'>" + (v.balance() > 0 ? "<b class='minus'>" + php(v.balance()) + "</b>" : php(0)) + "</td><td>" + statusTag(v.status()) +
+                 "</td><td class='right'>" + (v.balance() > 0 ? "<a class='btn sm' href='/payment?no=" + util::urlEncode(v.number) + "'>Record payment</a> " : std::string()) +
+                 "<a class='btn sm sec' href='/invoice?no=" + util::urlEncode(v.number) + "'>View / print</a></td></tr>";
+        }
+        if (!shown) b += "<tr><td colspan='10' class='mut'>" + std::string(all.empty() ? "No invoices yet." : "No invoices with that status.") + "</td></tr>";
+        html(c, layout(c, "Invoices", b + "</tbody></table></div>"));
+    }
+
+    // ------------------------------------------------------------------ accounts receivable (Staff + Admin)
+    void receivablesPage(Ctx& c) {
+        const std::time_t now = std::time(nullptr);
+        const auto& all = inv.invoices().all();
+        const auto debtors = reports::receivablesByCustomer(all, now);
+        const std::string only = reports::customerKey(c.param("customer"));
+        std::string shownName;
+        for (const auto& d : debtors) if (reports::customerKey(d.customer) == only) shownName = d.customer;
+
+        std::string b = "<h1>Accounts Receivable</h1><div class='stats'><div class='stat" + std::string(debtors.empty() ? "" : " warn") + "'><span>Total outstanding</span><b>" + php(reports::totalReceivable(all)) + "</b></div>"
+                        "<div class='stat'><span>Customers with a balance</span><b>" + num(static_cast<long long>(debtors.size())) + "</b></div>"
+                        "<div class='stat'><span>Open invoices</span><b>" + num(reports::openInvoiceCount(all)) + "</b></div></div>";
+
+        b += "<h2>Customer balances</h2><div class='card'><table><thead><tr><th>Customer</th><th class='n'>Open invoices</th><th class='n'>Billed</th><th class='n'>Paid</th><th class='n'>Balance</th><th>Oldest unpaid</th><th></th></tr></thead><tbody>";
+        for (const auto& d : debtors)
+            b += "<tr><td><b>" + customerNameLink(d.customer) + "</b></td><td class='n'>" + num(d.openInvoices) + "</td><td class='n'>" + php(d.billed) + "</td><td class='n'>" + php(d.paid) +
+                 "</td><td class='n'><b class='minus'>" + php(d.balance) + "</b></td><td>" + h(d.oldestDate) + " <span class='mut'>(" + num(d.oldestDays) + " day" + (d.oldestDays == 1 ? "" : "s") + ")</span></td>"
+                 "<td class='right'>" + (people.findByName(d.customer).empty() && d.customer != "Walk-in customer" ? "<a class='btn sm' href='/customer/edit?name=" + util::urlEncode(d.customer) + "'>+ Save as customer</a> " : std::string()) + "<a class='btn sm sec' href='/receivables?customer=" + util::urlEncode(d.customer) + "'>View invoices</a></td></tr>";
+        if (debtors.empty()) b += "<tr><td colspan='7' class='mut'>Nobody owes the shop anything right now.</td></tr>";
+        b += "</tbody></table></div>";
+
+        b += "<h2>" + (shownName.empty() ? std::string("Open invoices") : "Open invoices - " + h(shownName)) + "</h2>";
+        if (!shownName.empty()) b += "<p><a class='btn sm sec' href='/receivables'>Show all customers</a></p>";
+        b += "<div class='card'><table><thead><tr><th>Invoice</th><th>Date</th><th>Customer</th><th class='n'>Total</th><th class='n'>Paid</th><th class='n'>Balance</th><th>Status</th><th></th></tr></thead><tbody>";
+        int shown = 0;
+        for (size_t i = all.size(); i-- > 0 && shown < 300;) {   // newest first
+            const inv::Invoice& v = all[i];
+            if (v.balance() <= 0 || (!shownName.empty() && reports::customerKey(v.customer) != only)) continue;
+            ++shown;
+            b += "<tr><td>" + h(v.number) + "</td><td>" + h(v.timestamp.substr(0, 10)) + "</td><td>" + h(v.customer) + "</td><td class='n'>" + php(v.total()) + "</td><td class='n'>" + php(v.amountPaid) +
+                 "</td><td class='n'><b class='minus'>" + php(v.balance()) + "</b></td><td>" + statusTag(v.status()) + "</td><td class='right'><a class='btn sm' href='/payment?no=" + util::urlEncode(v.number) +
+                 "'>Record payment</a> <a class='btn sm sec' href='/invoice?no=" + util::urlEncode(v.number) + "'>View</a></td></tr>";
+        }
+        if (!shown) b += "<tr><td colspan='8' class='mut'>No open invoices.</td></tr>";
+        html(c, layout(c, "Receivables", b + "</tbody></table></div>"));
+    }
+
+    void paymentPage(Ctx& c) {
+        const std::string no = c.param("no");
+        const inv::Invoice* v = inv.invoices().find(no);
+        if (!v) return redirect(c, msgUrl("/receivables", "Invoice not found.", false));
+        if (v->balance() <= 0) return redirect(c, msgUrl("/invoice?no=" + util::urlEncode(no), "That invoice is already fully paid.", true));
+        std::string b = "<h1>Record payment - " + h(v->number) + "</h1><div class='grid'><div class='card'><h2>" + h(v->customer) + "</h2>"
+                        "<table class='kv'><tr><td>Invoice date</td><td>" + h(v->timestamp.substr(0, 10)) + "</td></tr><tr><td>Invoice total</td><td class='n'>" + php(v->total()) + "</td></tr>"
+                        "<tr><td>Paid so far</td><td class='n'>" + php(v->amountPaid) + "</td></tr><tr><td><b>Balance owed</b></td><td class='n'><b class='minus'>" + php(v->balance()) + "</b></td></tr>"
+                        "<tr><td>Status</td><td class='n'>" + statusTag(v->status()) + "</td></tr></table>"
+                        "<p><a href='/invoice?no=" + util::urlEncode(v->number) + "'>View invoice</a></p></div>"
+                        "<div class='card'><h2>Payment received</h2><form method='post' action='/payment'>" + tokenField(c) + "<input type='hidden' name='no' value='" + h(v->number) + "'>"
+                        "<input type='hidden' name='balance' value='" + util::money(v->balance()) + "'>"
+                        "<label>Amount (&#8369;) - the full balance is pre-filled; type less for a partial / installment payment</label>"
+                        "<input name='amount' inputmode='decimal' autocomplete='off' value='" + util::money(v->balance()) + "' required>"
+                        "<label>Payment method</label>" + methodSelect(c.param("method")) +
+                        "<label>Received by (optional - leave blank for " + h(c.user()) + ")</label><input name='received_by' maxlength='40' autocomplete='off'>" +
+                        "<label>Note (optional, e.g. reference no.)</label><input name='note' maxlength='80'>"
+                        "<p><button type='submit'>Save payment</button> <a class='btn sec' href='/receivables'>Cancel</a></p></form></div></div>";
+        const auto pays = inv.payments().forInvoice(v->number);
+        if (!pays.empty()) {
+            b += "<h2>Payments so far</h2><div class='card'><table><thead><tr><th>Date</th><th>Method</th><th>Received by</th><th>Note</th><th class='n'>Amount</th></tr></thead><tbody>";
+            for (const inv::Payment* p : pays)
+                b += "<tr><td>" + h(p->timestamp) + "</td><td>" + h(p->method) + "</td><td>" + h(p->user) + "</td><td>" + h(p->note) + "</td><td class='n'>" + php(p->amount) + "</td></tr>";
+            b += "</tbody></table></div>";
+        }
+        html(c, layout(c, "Record payment", b));
+    }
+
+    bool findPayment(Ctx& c, std::string& no, long long& i) {
+        no = c.param("no");
+        const auto& all = inv.payments().all();
+        return util::parseInt(c.param("i"), 0, 1000000000, i) && static_cast<size_t>(i) < all.size() && all[static_cast<size_t>(i)].invoiceNo == no;
+    }
+
+    void paymentEditPage(Ctx& c) {
+        std::string no; long long i = -1;
+        if (!findPayment(c, no, i)) return redirect(c, msgUrl("/invoices", "Payment not found.", false));
+        const inv::Payment& p = inv.payments().all()[static_cast<size_t>(i)];
+        std::string b = "<h1>Edit payment - " + h(no) + "</h1><div class='card'><table class='kv'>"
+                        "<tr><td>Date</td><td>" + h(p.timestamp) + "</td></tr><tr><td>Method</td><td>" + h(p.method) + "</td></tr>"
+                        "<tr><td>Amount</td><td class='n'>" + php(p.amount) + "</td></tr></table>"
+                        "<form method='post' action='/payment-edit'>" + tokenField(c) + "<input type='hidden' name='no' value='" + h(no) + "'><input type='hidden' name='i' value='" + num(i) + "'>"
+                        "<label>Received by</label><input name='received_by' maxlength='40' autocomplete='off' value='" + h(p.user) + "' required>"
+                        "<p><button type='submit'>Save</button> <a class='btn sec' href='/invoice?no=" + util::urlEncode(no) + "'>Cancel</a></p></form></div>";
+        html(c, layout(c, "Edit payment", b));
+    }
+
+    void doPaymentEdit(Ctx& c) {
+        std::string no; long long i = -1;
+        if (!findPayment(c, no, i)) return redirect(c, msgUrl("/invoices", "Payment not found.", false));
+        const std::string again = "/payment-edit?no=" + util::urlEncode(no) + "&i=" + num(i);
+        const std::string who = util::oneLine(util::trim(c.param("received_by")));
+        if (who.empty()) return redirect(c, msgUrl(again, "Enter who received the payment.", false));
+        if (who.size() > 40) return redirect(c, msgUrl(again, "Received by is too long (max 40 characters).", false));
+        const std::string old = inv.payments().all()[static_cast<size_t>(i)].user;
+        if (!inv.setPaymentReceivedBy(static_cast<size_t>(i), who)) return redirect(c, msgUrl(again, "Could not write payments.csv - check disk space/permissions.", false));
+        audit.record(c.user(), "PAYMENT_EDITED", no + " received by: " + old + " -> " + who, c.ip);
+        redirect(c, msgUrl("/invoice?no=" + util::urlEncode(no), "Received by updated.", true));
+    }
+
+    void doPayment(Ctx& c) {
+        const std::string no = c.param("no");
+        const std::string back = "/payment?no=" + util::urlEncode(no);
+        double amount = 0, expected = -1.0;
+        if (!parseMoneyText(c.param("amount"), amount)) return redirect(c, msgUrl(back, "Enter the payment amount as a number.", false));
+        if (!c.param("balance").empty() && !util::parseDouble(c.param("balance"), 0, inv::limits::kMaxPrice, expected)) expected = -1.0;
+        const std::string recvBy = util::oneLine(util::trim(c.param("received_by")));
+        if (recvBy.size() > 40) return redirect(c, msgUrl(back, "Received by is too long (max 40 characters).", false));
+        const inv::PaymentResult r = inv.recordPayment(no, amount, c.param("method"), c.param("note"), c.user(), expected, recvBy);
+        if (!r.ok) return redirect(c, msgUrl(inv.invoices().find(no) && inv.invoices().find(no)->balance() > 0 ? back : "/receivables", r.message, false));
+        const std::string note = util::trim(c.param("note"));
+        audit.record(c.user(), "PAYMENT_RECORDED", no + " " + r.customer + ": " + util::money(r.applied) + " via " + inv::canonicalMethod(c.param("method")) + ", balance " + util::money(r.balance) + " (" +
+                                                       inv::payStatusName(r.status) + ")" + (note.empty() ? "" : " - " + util::oneLine(note)), c.ip);
+        redirect(c, msgUrl("/invoice?no=" + util::urlEncode(no), r.message, true));
+    }
+
+    // ------------------------------------------------------------------ end-of-day cashier summary (Staff + Admin)
+    void cashReportPage(Ctx& c) {
+        const std::string today = util::formatTime(std::time(nullptr), "%Y-%m-%d");
+        std::string date = util::trim(c.param("date")), warn;
+        if (date.empty()) date = today;
+        else if (!reports::validDate(date)) { warn = "<div class='flash err noprint'>That is not a valid date - showing today.</div>"; date = today; }
+        const reports::DailyCashReport r = reports::dailyCashReport(inv.invoices().all(), inv.payments().all(), date);
+
+        double cash = 0;
+        for (const auto& m : r.byMethod) if (m.method == "Cash") cash = m.amount;
+        auto row = [](const std::string& label, const std::string& value, bool bold = false, bool indent = false) {
+            return "<tr><td" + std::string(indent ? " class='indent'" : "") + ">" + (bold ? "<b>" + label + "</b>" : label) + "</td><td class='n'>" + (bold ? "<b>" + value + "</b>" : value) + "</td></tr>";
+        };
+
+        std::string b = warn + "<form method='get' action='/cash-report' class='bar noprint'><label class='inline'>Report date</label><input type='date' name='date' value='" + h(date) + "' max='" + h(today) + "'>"
+                        "<button class='sm sec' type='submit'>Show</button>" + (date != today ? " <a class='btn sm sec' href='/cash-report'>Today</a>" : std::string()) +
+                        " <button type='button' data-print>&#128424; Print report</button></form>"
+                        "<div class='report'><img class='doc-logo' src='/static/logo.png' alt=''><h1>" + h(cfg.shopName) + "</h1><div class='sub'>Daily cash report &middot; register close-out</div>"
+                        "<div class='meta'><div><b>Date:</b> " + h(date) + "</div><div class='right'><b>Printed:</b> " + h(util::nowStamp()) + "<br><b>By:</b> " + h(c.user()) + "</div></div>"
+                        "<div class='cols'><div><h2>Sales</h2><table class='kv'>" +
+                        row("Invoices issued", num(r.invoiceCount)) +
+                        row("Paid in full", num(r.paidCount), false, true) + row("Partial payment", num(r.partialCount), false, true) + row("Unpaid (all credit)", num(r.unpaidCount), false, true) +
+                        row("Parts sales", php(r.partsSales), false, true) + row("Service / labour sales", php(r.serviceSales), false, true) +
+                        row("Gross sales", php(r.grossSales), true) + "</table></div>"
+                        "<div><h2>Money collected</h2><table class='kv'>" +
+                        row("Net collected today (all methods)", php(r.collected), true) +
+                        row("on today's invoices", php(r.collectedOnToday), false, true) + row("on earlier credit invoices (collections)", php(r.collectedOnOlder), false, true) +
+                        row("Credit given today (unpaid at close)", php(r.creditExtended)) +
+                        row("All unpaid credit sales, every customer", php(r.outstandingNow), true) +
+                        row(num(r.customersOwing) + " customer(s) still owe the shop (as of now)", "", false, true) + "</table></div></div>"
+                        "<h2>Payment method breakdown</h2><table><thead><tr><th>Method</th><th class='n'>Payments</th><th class='n'>Amount</th></tr></thead><tbody>";
+        int count = 0;
+        for (const auto& m : r.byMethod) { b += "<tr><td>" + h(m.method) + "</td><td class='n'>" + num(m.count) + "</td><td class='n'>" + php(m.amount) + "</td></tr>"; count += m.count; }
+        if (r.byMethod.empty()) b += "<tr><td colspan='3' class='mut'>No payments were received on this date.</td></tr>";
+        else b += "<tr class='tot'><td>Total</td><td class='n'>" + num(count) + "</td><td class='n'>" + php(r.collected) + "</td></tr>";
+        b += "</tbody></table>"
+             "<h2>Cash drawer</h2><table class='kv'>" + row("Expected cash in drawer (Cash payments only)", php(cash), true) +
+             "<tr><td>Counted cash</td><td class='n line'>&nbsp;</td></tr><tr><td>Over / short</td><td class='n line'>&nbsp;</td></tr></table>"
+             "<h2>Invoices issued</h2><table><thead><tr><th>Invoice</th><th>Time</th><th>Customer</th><th class='n'>Total</th><th class='n'>Balance now</th><th>Status now</th></tr></thead><tbody>";
+        for (const inv::Invoice* v : r.invoices)
+            b += "<tr><td>" + h(v->number) + "</td><td>" + h(v->timestamp.size() > 11 ? v->timestamp.substr(11) : "") + "</td><td>" + h(v->customer) + "</td><td class='n'>" + php(v->total()) + "</td><td class='n'>" +
+                 php(v->balance()) + "</td><td>" + statusTag(v->status()) + "</td></tr>";
+        if (r.invoices.empty()) b += "<tr><td colspan='6' class='mut'>No invoices on this date.</td></tr>";
+        b += "</tbody></table><h2>Payments received</h2><table><thead><tr><th>Time</th><th>Invoice</th><th>Method</th><th>Received by</th><th class='n'>Amount</th></tr></thead><tbody>";
+        for (const inv::Payment* p : r.payments)
+            b += "<tr><td>" + h(p->timestamp.size() > 11 ? p->timestamp.substr(11) : "") + "</td><td>" + h(p->invoiceNo) + "</td><td>" + h(p->method) + "</td><td>" + h(p->user) + "</td><td class='n'>" + php(p->amount) + "</td></tr>";
+        if (r.payments.empty()) b += "<tr><td colspan='5' class='mut'>No payments on this date.</td></tr>";
+        b += "</tbody></table><div class='sigs'><div>Prepared by (cashier)</div><div>Checked by (owner / manager)</div></div></div>";
+        html(c, layout(c, "Daily cash report", b));
+    }
+
+    // ------------------------------------------------------------------ reports (Admin)
+    static std::string periodTable(const std::string& title, const std::vector<reports::PeriodTotals>& rows) {
+        double mx = 1;
+        for (const auto& r : rows) mx = std::max(mx, r.revenue());
+        std::string b = "<h2>" + h(title) + "</h2><div class='card'><table><thead><tr><th>Period</th><th class='n'>Parts</th><th class='n'>Services</th><th class='n'>Revenue</th><th></th><th class='n'>Expenses</th><th class='n'>Net</th></tr></thead><tbody>";
+        for (size_t i = rows.size(); i-- > 0;) {  // newest first
+            const auto& r = rows[i];
+            b += "<tr><td>" + h(r.label) + "</td><td class='n'>" + php(r.partsRevenue) + "</td><td class='n'>" + php(r.serviceRevenue) + "</td><td class='n'><b>" + php(r.revenue()) +
+                 "</b></td><td style='width:90px'><div class='meter'><i style='width:" + util::money(r.revenue() / mx * 100) + "%'></i></div></td><td class='n'>" + php(r.expenses) +
+                 "</td><td class='n " + (r.net() < 0 ? "minus" : "plus") + "'>" + php(r.net()) + "</td></tr>";
+        }
+        return b + "</tbody></table></div>";
+    }
+
+    void reportsPage(Ctx& c) {
+        const std::time_t now = std::time(nullptr);
+        const int days = intParam(c, "days", 0, 3650, 30), idle = intParam(c, "idle", 1, 3650, 30);
+        const auto& moves = inv.movements().all();
+        std::string b = "<h1>Business reports</h1><p class='mut'>Generated " + h(util::formatTime(now, "%A, %B %d, %Y, %I:%M %p")) + "</p><p class='mut'>Revenue = money actually received (payments, on the day they were received): a credit sale only counts as the customer pays it. Expenses = RESTOCK movements at the unit cost entered when stock arrived"
+                        " (restocks with no cost entered count as 0: " + num(reports::restocksWithoutCost(moves)) + " so far).</p>";
+        b += periodTable("Daily (last 14 days)", reports::revenueByPeriod(moves, inv.invoices().all(), inv.payments().all(), reports::Period::Daily, 14, now));
+        b += periodTable("Weekly (last 8 weeks, Monday start)", reports::revenueByPeriod(moves, inv.invoices().all(), inv.payments().all(), reports::Period::Weekly, 8, now));
+        b += periodTable("Monthly (last 12 months)", reports::revenueByPeriod(moves, inv.invoices().all(), inv.payments().all(), reports::Period::Monthly, 12, now));
+
+        b += "<h2>Top-selling / fast-moving parts</h2><div class='card'><form method='get' action='/reports' class='bar'><input type='hidden' name='idle' value='" + num(idle) + "'><label class='inline'>Window</label><select name='days'>";
+        for (int d : {7, 30, 90, 365, 0}) b += "<option value='" + num(d) + "'" + (d == days ? " selected" : "") + ">" + (d ? "Last " + num(d) + " days" : std::string("All time")) + "</option>";
+        b += "</select><button class='sm sec' type='submit'>Update</button></form><table><thead><tr><th>#</th><th>Part number</th><th>Part</th><th class='n'>Units sold</th><th class='n'>Units/day</th><th class='n'>Sales</th><th class='n'>Revenue</th></tr></thead><tbody>";
+        int rank = 0;
+        for (const auto& t : reports::topSelling(moves, days, 15, now))
+            b += "<tr><td>" + num(++rank) + "</td><td>" + h(partLabelById(t.partId)) + "</td><td>" + h(t.name) + "</td><td class='n'>" + num(t.unitsSold) + "</td><td class='n'>" + (days ? util::money(t.unitsPerDay) : "-") +
+                 "</td><td class='n'>" + num(t.saleCount) + "</td><td class='n'>" + php(t.revenue) + "</td></tr>";
+        if (!rank) b += "<tr><td colspan='7' class='mut'>No sales recorded in this window.</td></tr>";
+        b += "</tbody></table></div>";
+
+        b += "<h2>Dead stock</h2><div class='card'><form method='get' action='/reports' class='bar'><input type='hidden' name='days' value='" + num(days) + "'><label class='inline'>No movement for at least</label>"
+             "<input name='idle' type='number' min='1' value='" + num(idle) + "' style='width:90px'> days <button class='sm sec' type='submit'>Update</button></form><table><thead><tr><th>Part number</th><th>Part</th><th>System</th><th class='n'>In stock</th><th class='n'>Value tied up</th><th>Last movement</th><th class='n'>Days idle</th></tr></thead><tbody>";
+        double tied = 0;
+        const auto dead = reports::deadStock(inv.parts(), moves, idle, now);
+        for (const auto& d : dead) {
+            tied += d.stockValue;
+            b += "<tr><td>" + h(partLabel(*d.part)) + "</td><td>" + h(d.part->fullName()) + "</td><td>" + h(d.part->category()) + "</td><td class='n'>" + num(d.part->quantity()) + "</td><td class='n'>" + php(d.stockValue) +
+                 "</td><td>" + h(d.lastMovement) + "</td><td class='n'>" + num(d.daysIdle) + "</td></tr>";
+        }
+        if (dead.empty()) b += "<tr><td colspan='7' class='mut'>Nothing has been idle that long. (Idle time is counted from each part's last logged movement.)</td></tr>";
+        else b += "<tr><td colspan='4'><b>Total tied up</b></td><td class='n'><b>" + php(tied) + "</b></td><td colspan='2'></td></tr>";
+        b += "</tbody></table></div>";
+
+        b += "<h2>Reorder list</h2><div class='card'><p class='noprint'><button class='sm' data-print>&#128424; Print</button></p><table><thead><tr><th>Part number</th><th>Part</th><th>System</th><th class='n'>In stock</th><th class='n'>Minimum</th><th class='n'>Suggested order</th></tr></thead><tbody>";
+        const auto re = reports::reorderList(inv.parts());
+        for (const auto& r : re)
+            b += "<tr><td>" + h(partLabel(*r.part)) + "</td><td>" + h(r.part->fullName()) + "</td><td>" + h(r.part->category()) + "</td><td class='n'>" + num(r.part->quantity()) + "</td><td class='n'>" +
+                 num(r.part->minStock()) + "</td><td class='n'><b>" + num(r.suggestedQty) + "</b></td></tr>";
+        if (re.empty()) b += "<tr><td colspan='6' class='mut'>Every part is at or above its minimum.</td></tr>";
+        b += "</tbody></table><p class='mut'>Suggested order = minimum stock &minus; current stock (brings the part back up to its minimum).</p></div>";
+        html(c, layout(c, "Reports", b));
+    }
+
+    void movementsPage(Ctx& c) {
+        std::string b = "<h1>Stock movement log</h1><p><a class='btn sec' href='/export/movements.csv'>Download CSV</a> <span class='mut'>Newest 500 shown.</span></p><div class='card'><table><thead><tr><th>Time</th><th>User</th><th>Part</th><th>Action</th>"
+                        "<th class='n'>Change</th><th class='n'>Stock after</th><th class='n'>Unit price/cost</th><th>Ref</th></tr></thead><tbody>";
+        for (const inv::Movement* m : inv.movements().recent(500))
+            b += "<tr><td>" + h(m->timestamp) + "</td><td>" + h(m->user) + "</td><td>" + (carriesLabel(m->partName, m->partId) ? std::string() : h(partLabelById(m->partId)) + " ") + h(m->partName) + "</td><td>" + inv::moveName(m->type) + "</td><td class='n " +
+                 (m->qtyChanged < 0 ? "minus'>" : "plus'>+") + num(m->qtyChanged) + "</td><td class='n'>" + num(m->resultingStock) + "</td><td class='n'>" + util::money(m->unitPrice) + "</td><td>" + h(m->ref) + "</td></tr>";
+        html(c, layout(c, "Movements", b + "</tbody></table></div>"));
+    }
+
+    void auditPage(Ctx& c) {
+        std::string b = "<h1>Audit trail</h1><div class='card'><table><thead><tr><th>Time</th><th>User</th><th>Event</th><th>Details</th><th>IP</th></tr></thead><tbody>";
+        for (const auth::AuditEntry* e : audit.recent(500))
+            b += "<tr><td>" + h(e->timestamp) + "</td><td>" + h(e->user) + "</td><td>" + h(e->event) + "</td><td>" + h(e->details) + "</td><td>" + h(e->ip) + "</td></tr>";
+        html(c, layout(c, "Audit", b + "</tbody></table></div>"));
+    }
+
+    // ------------------------------------------------------------------ import / export / backup
+    void renderData(Ctx& c, const std::string& resultHtml) {
+        std::string b = "<h1>Data &amp; backups</h1>" + resultHtml +
+                        "<div class='grid'><div class='card'><h2>Export (opens in Excel)</h2><p><a class='btn' href='/export/inventory.csv'>Download inventory CSV</a></p><p><a class='btn' href='/export/movements.csv'>Download movement log CSV</a></p></div>"
+                        "<div class='card'><h2>Backup</h2><p class='mut'>Copies every CSV file into the <code>backups</code> folder with a timestamp. This also runs automatically each time the program starts.</p>"
+                        "<form method='post' action='/backup'>" + tokenField(c) + "<button type='submit'>Back up now</button></form></div></div>"
+                        "<div class='card'><h2>Import / update stock from CSV</h2><p class='mut'>Columns: <code>ID, Name, System, Price, Quantity, MinStock</code> plus an optional <code>UnitCost</code> (header row recommended; the inventory export works as a template). "
+                        "<b>Quantity is the new stock level.</b> Known IDs are updated (blank cells keep the current value); unknown IDs are added and need a name, system and price.</p>"
+                        "<form method='post' action='/import'>" + tokenField(c) + "<p><input id='csvfile' type='file' accept='.csv,text/csv'></p>"
+                        "<textarea id='csvtext' name='csv' rows='10' style='width:100%' placeholder='...or paste CSV text here' required></textarea><p><button type='submit'>Import</button></p></form></div>";
+        html(c, layout(c, "Data & backups", b));
+    }
+    void dataPage(Ctx& c) { renderData(c, ""); }
+
+    void exportInventory(Ctx& c) { csv(c, "inventory_" + util::formatTime(std::time(nullptr), "%Y%m%d") + ".csv", inv.partsCsv()); }
+    void exportMovements(Ctx& c) { csv(c, "movements_" + util::formatTime(std::time(nullptr), "%Y%m%d") + ".csv", inv.movementsCsv()); }
+
+    void doImport(Ctx& c) {
+        const inv::ImportSummary s = inv.importCsv(c.param("csv"), c.user());
+        for (const inv::PriceChange& p : s.priceChanges)
+            audit.record(c.user(), "PRICE_CHANGE", "Part " + num(p.partId) + " " + p.name + ": " + util::money(p.oldPrice) + " -> " + util::money(p.newPrice) + " (csv import)", c.ip);
+        audit.record(c.user(), "IMPORT", "added " + num(s.added) + ", updated " + num(s.updated) + ", skipped " + num(s.skipped), c.ip);
+        std::string r = std::string("<div class='flash ") + (s.skipped == 0 && s.problems.empty() ? "ok" : "err") + "'><b>Import finished:</b> " + num(s.added) + " added, " + num(s.updated) + " updated, " +
+                        num(s.unchanged) + " unchanged, " + num(s.skipped) + " skipped.";
+        if (!s.problems.empty()) { r += "<ul>"; for (const auto& p : s.problems) r += "<li>" + h(p) + "</li>"; r += "</ul>"; }
+        renderData(c, r + "</div>");
+    }
+    void doBackup(Ctx& c) {
+        const inv::BackupSummary b = inv.backupAll();
+        audit.record(c.user(), "BACKUP", num(b.copied) + " file(s) copied to " + b.directory, c.ip);
+        redirect(c, b.problems.empty() ? msgUrl("/data", num(b.copied) + " file(s) copied to the backups folder.", true) : msgUrl("/data", "Backup problem: " + b.problems.front(), false));
+    }
+
+    // ------------------------------------------------------------------ user management (Admin) + own account
+    void usersPage(Ctx& c) {
+        std::string b = "<h1>Users</h1><div class='card'><table><thead><tr><th>Username</th><th>Role</th><th>Recovery</th><th>Change role</th><th>Reset password</th><th></th></tr></thead><tbody>";
+        for (const auth::UserInfo& u : users.users()) {
+            const bool self = util::equalsIgnoreCase(u.username, c.user());
+            const std::string nm = "<input type='hidden' name='username' value='" + h(u.username) + "'>";
+            b += "<tr><td>" + h(u.username) + (self ? " <span class='mut'>(you)</span>" : "") + "</td><td><span class='tag " + (u.role == auth::Role::Admin ? "adm" : "stf") + "'>" + auth::roleName(u.role) + "</span></td><td>" +
+                 (u.hasRecovery ? "set" : "-") + "</td><td>";
+            if (!self) b += "<form method='post' action='/users/role'>" + tokenField(c) + nm + "<select name='role'><option>Staff</option><option" + std::string(u.role == auth::Role::Admin ? " selected" : "") +
+                            ">Admin</option></select> <button class='sm sec' type='submit'>Set</button></form>";
+            b += "</td><td><form method='post' action='/users/reset'>" + tokenField(c) + nm + "<input name='password' type='password' placeholder='new password' minlength='8' required> <button class='sm sec' type='submit'>Reset</button></form></td><td>";
+            if (!self) b += "<form method='post' action='/users/delete' data-confirm='Delete user " + h(u.username) + "?'>" + tokenField(c) + nm + "<button class='sm danger' type='submit'>Delete</button></form>";
+            b += "</td></tr>";
+        }
+        b += "</tbody></table></div><h2>Add user</h2><div class='card'><form method='post' action='/users/add'>" + tokenField(c) + "<div class='grid'><div><label>Username</label><input name='username' required></div>"
+             "<div><label>Password (min 8)</label><input name='password' type='password' minlength='8' required></div><div><label>Role</label><select name='role'><option>Staff</option><option>Admin</option></select></div></div>"
+             "<p class='mut'>Staff: sell, view inventory, adjust stock. Admin: everything, including prices, deletion, reports, backups and users.</p><p><button type='submit'>Create user</button></p></form></div>";
+        html(c, layout(c, "Users", b));
+    }
+    void doUserAdd(Ctx& c) {
+        const auto role = auth::parseRole(c.param("role"));
+        if (!role) return redirect(c, msgUrl("/users", "Choose a role.", false));
+        const std::string err = users.addUser(util::trim(c.param("username")), c.param("password"), *role);
+        if (err.empty()) audit.record(c.user(), "USER_CREATED", util::trim(c.param("username")) + " as " + auth::roleName(*role), c.ip);
+        redirect(c, msgUrl("/users", err.empty() ? "User created." : err, err.empty()));
+    }
+    void doUserRole(Ctx& c) {
+        const std::string name = users.canonicalName(c.param("username"));
+        const auto role = auth::parseRole(c.param("role"));
+        if (name.empty() || !role || util::equalsIgnoreCase(name, c.user())) return redirect(c, msgUrl("/users", "You cannot change that account's role.", false));
+        const std::string err = users.setRole(name, *role);
+        if (err.empty()) audit.record(c.user(), "ROLE_CHANGED", name + " -> " + auth::roleName(*role), c.ip);
+        redirect(c, msgUrl("/users", err.empty() ? "Role updated." : err, err.empty()));
+    }
+    void doUserReset(Ctx& c) {
+        const std::string name = users.canonicalName(c.param("username"));
+        std::string err = name.empty() ? "User not found." : users.resetPassword(name, c.param("password"));
+        if (err.empty()) {
+            std::string token;
+            sessionFor(c.req, &token);
+            dropUserSessions(name, util::equalsIgnoreCase(name, c.user()) ? token : std::string());  // keep my own session
+            audit.record(c.user(), "PASSWORD_RESET", "password reset for " + name, c.ip);
+        }
+        redirect(c, msgUrl("/users", err.empty() ? "Password reset for " + name + "." : err, err.empty()));
+    }
+    void doUserDelete(Ctx& c) {
+        const std::string name = users.canonicalName(c.param("username"));
+        if (name.empty() || util::equalsIgnoreCase(name, c.user())) return redirect(c, msgUrl("/users", "You cannot delete that account.", false));
+        const std::string err = users.removeUser(name);
+        if (err.empty()) { dropUserSessions(name); audit.record(c.user(), "USER_DELETED", name, c.ip); }
+        redirect(c, msgUrl("/users", err.empty() ? "User deleted." : err, err.empty()));
+    }
+    void accountPage(Ctx& c) {
+        std::string b = "<h1>My account</h1><div class='card'><p>Signed in as <b>" + h(c.user()) + "</b> (" + auth::roleName(c.role) + ").</p><form method='post' action='/account/password'>" + tokenField(c) +
+                        "<label>Current password</label><input name='current' type='password' required autocomplete='current-password'><label>New password (min 8)</label><input name='password' type='password' minlength='8' required autocomplete='new-password'>"
+                        "<p><button type='submit'>Change password</button></p></form></div>";
+        html(c, layout(c, "My account", b));
+    }
+    void doAccountPassword(Ctx& c) {
+        const std::string err = users.changePassword(c.user(), c.param("current"), c.param("password"));
+        if (err.empty()) {
+            std::string token;
+            sessionFor(c.req, &token);
+            dropUserSessions(c.user(), token);  // sign out other devices
+            audit.record(c.user(), "PASSWORD_CHANGED", "own password", c.ip);
+        }
+        redirect(c, msgUrl("/account", err.empty() ? "Password changed." : err, err.empty()));
+    }
+};
+
+// ============================================================================ WebApp
+WebApp::WebApp(inv::Inventory& i, auth::Authenticator& u, auth::AuditLog& a, Config cfg) : impl_(new Impl(i, u, a, std::move(cfg))) {}
+WebApp::~WebApp() = default;
+
+bool WebApp::run() {
+    std::cout << "RE Parts Tracker running at http://" << (impl_->cfg.host == "0.0.0.0" ? "localhost" : impl_->cfg.host) << ':' << impl_->cfg.port << "  (Ctrl+C to stop)\n";
+    return impl_->svr.listen(impl_->cfg.host.c_str(), impl_->cfg.port);
+}
+
+}  // namespace web

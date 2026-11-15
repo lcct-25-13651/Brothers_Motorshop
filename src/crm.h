@@ -367,7 +367,7 @@ inline bool customerHasHistory(const std::vector<inv::Invoice>& invoices, int cu
 
 struct Balance { double balance = 0; int openInvoices = 0; };
 
-// Utang of one customer = open invoices linked to the record, PLUS old free-text invoices (customer_id blank) whose name
+// Outstanding balance of one customer = open invoices linked to the record, PLUS old free-text invoices (customer_id blank) whose name
 // is the same as this customer's - but only when that name belongs to exactly one customer record, so nobody is
 // charged for a namesake's debt. This keeps the figure equal to the Receivables page, which groups by name.
 inline bool nameIsUnique(const Registry& reg, const Customer& k) { return reg.findByName(k.name).size() == 1; }

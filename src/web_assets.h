@@ -105,6 +105,8 @@ body.auth .flash::before{flex:none;width:1.25rem;height:1.25rem;border-radius:50
 body.auth .flash.err{background:#fef2f2;border-color:#fecaca;color:#991b1b}body.auth .flash.err::before{content:"!";background:#dc2626}
 body.auth .flash.ok{background:#f0fdf4;border-color:#bbf7d0;color:#166534}body.auth .flash.ok::before{content:"\2713";background:#16a34a}
 body.auth .auth-foot{margin:1.1rem 0 0;text-align:center;font-size:.78rem;color:#94a3b8}
+body.auth label.pw-show{display:flex;align-items:center;gap:.5rem;margin:.7rem 0 0;font-weight:500;cursor:pointer;color:var(--a-mut)}
+body.auth label.pw-show input{width:auto;margin:0;padding:0;box-shadow:none}
 /* animated background: drifting glow orbs + faint dot grid + floating specks */
 body.auth::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
 background-image:radial-gradient(rgba(148,163,184,.14) 1px,transparent 1px);background-size:28px 28px;
@@ -128,14 +130,14 @@ body.auth .auth-wrap{position:relative;z-index:1}
 @media (max-width:480px){body.auth{padding:1rem;align-items:flex-start;padding-top:8vh}body.auth .auth-card{padding:1.5rem 1.25rem 1.25rem}}
 @media (prefers-reduced-motion:reduce){body.auth .auth-card,body.auth .auth-logo,body.auth .auth-logo::before,body.auth .auth-logo::after,body.auth .gear,body.auth .gear-sm,body.auth .bg-orb,body.auth .bg-gear{animation:none!important}body.auth *{transition:none!important}}
 /* ---- login: shop artwork as the background on the left, sign-in box on the right ---- */
-body.auth{background:#3f8fd2 url(/static/login-bg.jpg) left center/cover no-repeat fixed;justify-content:flex-end;
+body.auth{background:#3f8fd2 url(/static/login-bg.jpg?v=2) left center/cover no-repeat fixed;justify-content:flex-end;
 padding:1.5rem clamp(1.2rem,6vw,7rem)}
 body.auth::before,body.auth .bg-orb{display:none}
 body.auth .auth-card{background:rgba(255,255,255,.94);border:1px solid rgba(255,255,255,.9);border-radius:20px;
 box-shadow:0 28px 56px -14px rgba(5,30,80,.65),0 8px 18px -6px rgba(5,30,80,.4);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
 body.auth .auth-logo{box-shadow:0 8px 18px -4px rgba(23,64,127,.45)}
 body.auth .auth-foot{color:#eaf3ff;text-shadow:0 1px 3px rgba(5,30,80,.7)}
-@media (max-width:899px){body.auth{justify-content:center;background:linear-gradient(rgba(10,40,90,.2),rgba(10,40,90,.2)),#3f8fd2 url(/static/login-bg.jpg) 36% center/cover no-repeat fixed}}
+@media (max-width:899px){body.auth{justify-content:center;background:linear-gradient(rgba(10,40,90,.2),rgba(10,40,90,.2)),#3f8fd2 url(/static/login-bg.jpg?v=2) 36% center/cover no-repeat fixed}}
 /* ---- login: 3D effects (tilted slab card, swinging logo, tumbling gears, raised buttons) ---- */
 body.auth .auth-wrap{perspective:1500px}
 body.auth .auth-card{transform:rotateY(-6deg) rotateX(2deg);transition:transform .6s cubic-bezier(.2,.8,.2,1);
@@ -586,8 +588,75 @@ inline constexpr const char* kJs = R"JS(
     }
     var addBtn = document.getElementById('add-part-row');
     if (addBtn) addBtn.addEventListener('click', recalc);
+
+    // ---- new sale: the order being typed is kept while the cashier visits other pages and comes back (per browser tab, per user) ----
+    var saleForm = document.getElementById('sale-form');
+    if (saleForm) {
+      var draftKey = 'sale-draft', draftUser = saleForm.getAttribute('data-draft-user') || '', store = null;
+      try { store = window.sessionStorage; store.getItem(draftKey); } catch (e) { store = null; }
+      var draftFields = function () {
+        return Array.prototype.filter.call(saleForm.elements, function (el) {
+          return el.name && el.type !== 'hidden' && el.type !== 'submit' && el.type !== 'button' && el.tagName !== 'BUTTON';
+        });
+      };
+      var hasTyped = function () {   // any text / number box with something in it (the two drop-downs always have a value)
+        return draftFields().some(function (el) { return el.tagName !== 'SELECT' && el.value.trim() !== ''; });
+      };
+      var saveDraft = function () {
+        if (!store) return;
+        try {
+          if (!hasTyped()) { store.removeItem(draftKey); return; }
+          var d = { user: draftUser, v: {} };
+          draftFields().forEach(function (el) { d.v[el.name] = el.value; });
+          store.setItem(draftKey, JSON.stringify(d));
+        } catch (e) { /* storage full or blocked: the order just is not remembered */ }
+      };
+      var clearDraft = function () { try { if (store) store.removeItem(draftKey); } catch (e) { } };
+      // Arriving from Inventory's Sell button (?part=...): the server put that part in row 1. It must be ADDED to the saved order, not replace it.
+      var fromInventory = !!(new URLSearchParams(window.location.search).get('part') && !new URLSearchParams(window.location.search).get('msg')), prefill = null;
+      if (fromInventory) { var r1 = saleParts.rows[0].querySelectorAll('input'); prefill = { id: r1[0].value, qty: r1[1].value || '1' }; }
+      if (store && (prefill || !hasTyped())) {   // a blank form: bring the saved order back (a form the server re-filled after an error wins)
+        try {
+          var raw = store.getItem(draftKey), saved = raw ? JSON.parse(raw) : null;
+          if (saved && saved.user === draftUser && saved.v) {
+            var maxRow = 0;
+            Object.keys(saved.v).forEach(function (k) { var m = /^p_id_([0-9]+)$/.exec(k); if (m) maxRow = Math.max(maxRow, parseInt(m[1], 10)); });
+            for (var guard = 0; addBtn && !addBtn.disabled && saleParts.rows.length < maxRow && guard < 20; guard++) addBtn.click();
+            draftFields().forEach(function (el) { if (saved.v[el.name] !== undefined) el.value = saved.v[el.name]; });
+            if (cin) cin.dispatchEvent(new Event('input'));
+            if (vin) vin.dispatchEvent(new Event('input'));
+            if (payType) payType.dispatchEvent(new Event('change'));
+            if (prefill && prefill.id) {   // put the newly chosen part in its own row (or add to its quantity if it is already there)
+              var want = idOf[prefill.id.trim().toLowerCase()], rowsNow = function () { return saleParts.rows; }, hit = null, empty = null, i;
+              for (i = 0; i < rowsNow().length; i++) {
+                var ci = rowsNow()[i].querySelectorAll('input'), cur = ci[0].value.trim().toLowerCase();
+                if (cur !== '' && idOf[cur] === want) { hit = ci; break; }
+                if (cur === '' && !empty) empty = ci;
+              }
+              if (!hit && !empty && addBtn && !addBtn.disabled) { addBtn.click(); empty = rowsNow()[rowsNow().length - 5].querySelectorAll('input'); }
+              if (hit) hit[1].value = String((parseInt(hit[1].value, 10) || 0) + (parseInt(prefill.qty, 10) || 1));
+              else if (empty) { empty[0].value = prefill.id; empty[1].value = prefill.qty; }
+            }
+          }
+        } catch (e) { clearDraft(); }
+      }
+      if (fromInventory && window.history && window.history.replaceState) window.history.replaceState(null, '', window.location.pathname);   // a refresh must not add the part again
+      saleForm.addEventListener('input', saveDraft);
+      saleForm.addEventListener('change', saveDraft);
+      saleForm.addEventListener('submit', clearDraft);   // a failed submit comes back pre-filled and is saved again on load
+      var cancelSale = document.getElementById('sale-cancel');
+      if (cancelSale) cancelSale.addEventListener('click', clearDraft);
+      saveDraft();
+    }
     recalc();
   }
+  // ---- show / hide password: a checkbox with data-toggle-pw="<id of the password box>" ----
+  Array.prototype.forEach.call(document.querySelectorAll('input[data-toggle-pw]'), function (cb) {
+    var target = document.getElementById(cb.getAttribute('data-toggle-pw'));
+    if (!target) return;
+    cb.checked = false;
+    cb.addEventListener('change', function () { target.type = cb.checked ? 'text' : 'password'; });
+  });
   // ---- print buttons and confirm dialogs (no inline handlers: the CSP forbids them) ----
   Array.prototype.forEach.call(document.querySelectorAll('[data-print]'), function (b) {
     b.addEventListener('click', function () { window.print(); });

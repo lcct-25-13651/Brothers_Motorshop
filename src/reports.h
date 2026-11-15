@@ -33,6 +33,11 @@ struct PeriodTotals {
 // Oldest -> newest, always `count` buckets ending with the current period (empty ones are zero).
 std::vector<PeriodTotals> revenueByPeriod(const std::vector<inv::Movement>& moves, const std::vector<inv::Invoice>& invoices,
                                           Period period, int count, std::time_t now);
+// Same buckets, but SALES REVENUE COUNTS ONLY MONEY ACTUALLY RECEIVED: each payment (payments.csv) is added on the day it was
+// received, split into parts / service revenue in proportion to the invoice it paid. A credit sale therefore does not raise
+// the sales figures until (and only as far as) the customer pays. Expenses are unchanged (RESTOCK movements).
+std::vector<PeriodTotals> revenueByPeriod(const std::vector<inv::Movement>& moves, const std::vector<inv::Invoice>& invoices,
+                                          const std::vector<inv::Payment>& payments, Period period, int count, std::time_t now);
 int restocksWithoutCost(const std::vector<inv::Movement>& moves);  // excluded from expenses (cost unknown)
 
 // ---- Dead stock ----
@@ -52,7 +57,7 @@ struct ReorderItem {
 };
 std::vector<ReorderItem> reorderList(const std::vector<inv::Part>& parts);  // most short first
 
-// ---- Receivables ("utang") ----
+// ---- Accounts receivable ----
 struct CustomerBalance {
     std::string customer;
     int openInvoices = 0;
@@ -76,7 +81,7 @@ struct DailyCashReport {
     double partsSales = 0, serviceSales = 0;
     double collected = 0;                   // every payment received that day = net cash collected
     double collectedOnToday = 0;            // ...of which on invoices made that same day
-    double collectedOnOlder = 0;            // ...of which on earlier credit invoices (utang payments)
+    double collectedOnOlder = 0;            // ...of which on earlier credit invoices (collections)
     double creditExtended = 0;              // unpaid part of that day's invoices at close of day
     double outstandingNow = 0;              // all customers' open balances right now (not date dependent)
     int customersOwing = 0;
@@ -87,5 +92,38 @@ struct DailyCashReport {
 // Valid "YYYY-MM-DD" -> true.
 bool validDate(const std::string& date);
 DailyCashReport dailyCashReport(const std::vector<inv::Invoice>& invoices, const std::vector<inv::Payment>& payments, const std::string& date);
+
+// ---- Custom date-range sales report ----
+// Dates are "YYYY-MM-DD" (local time), both ends inclusive.
+struct DaySales {
+    std::string date;
+    int invoiceCount = 0;
+    double grossSales = 0;      // invoices created that day
+    double collected = 0;       // payments received that day
+};
+struct RangeSalesReport {
+    std::string from, to;
+    int dayCount = 0;
+    int invoiceCount = 0;
+    int paidCount = 0, partialCount = 0, unpaidCount = 0;   // status of those invoices RIGHT NOW
+    double grossSales = 0, partsSales = 0, serviceSales = 0;  // invoices created in the range
+    double collected = 0;                // every payment received in the range
+    double collectedOnRange = 0;         // ...of which on invoices created inside the range
+    double collectedOnOlder = 0;         // ...of which on invoices created before the range (collections)
+    double stillOwing = 0;               // unpaid balance RIGHT NOW on invoices created in the range
+    double expenses = 0;                 // RESTOCK movements x unit cost inside the range
+    double net() const { return collected - expenses; }
+    std::vector<DaySales> byDay;         // every day of the range, oldest first (empty days included)
+    std::vector<MethodTotal> byMethod;   // payments by method, biggest first
+    std::vector<const inv::Invoice*> invoices;   // oldest first
+    std::vector<const inv::Payment*> payments;   // oldest first
+};
+constexpr int kMaxRangeDays = 1100;   // about 3 years
+// Both dates must be valid (see validDate) and from <= to; otherwise an empty report is returned. Range is capped by the caller.
+RangeSalesReport salesRangeReport(const std::vector<inv::Invoice>& invoices, const std::vector<inv::Payment>& payments,
+                                  const std::vector<inv::Movement>& moves, const std::string& from, const std::string& to);
+std::string addDays(const std::string& date, int days);   // "2026-11-30" + 1 -> "2026-12-01"; "" if date invalid
+int daysBetween(const std::string& from, const std::string& to);   // to - from (negative if to is earlier); 0 if invalid
+int weekdayOf(const std::string& date);                     // 0 = Sunday ... 6 = Saturday; -1 if invalid
 
 }  // namespace reports

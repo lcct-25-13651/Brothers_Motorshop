@@ -121,7 +121,7 @@ struct InvoiceLine {
     double total() const { return qty * unitPrice; }
 };
 
-// ---------------------------------------------------------------- Payments (credit sales / "utang")
+// ---------------------------------------------------------------- Payments (credit sales / accounts receivable)
 enum class PayStatus { Paid, Partial, Unpaid };
 const char* payStatusName(PayStatus s);
 
@@ -259,7 +259,7 @@ public:
     Result applyStock(const std::vector<StockDelta>& deltas, MoveType type, const std::string& actor, const std::string& ref);
 
     // A sale = invoice. Part lines use the catalogue price (callers cannot override it).
-    // amountPaid < 0 means "paid in full". Less than the total makes it a credit sale (utang): a named customer is
+    // amountPaid < 0 means "paid in full". Less than the total makes it a credit sale: a named customer is
     // then required. Whatever is paid now is logged in payments.csv with `method`.
     // Phase 3: customerId / vehicleId (0 = none) are stored on the invoice as given; the caller has already checked they exist.
     CheckoutResult checkout(const std::string& customer, const std::vector<InvoiceLine>& lines, const std::string& actor,

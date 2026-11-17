@@ -14,31 +14,6 @@ constexpr int kHashRounds = 20000;
 constexpr size_t kMinPassword = 8, kMaxPassword = 128;
 }  // namespace
 
-// ---------------------------------------------------------------- roles / RBAC
-const char* roleName(Role r) { return r == Role::Admin ? "Admin" : "Staff"; }
-
-std::optional<Role> parseRole(const std::string& s) {
-    if (util::equalsIgnoreCase(s, "admin")) return Role::Admin;
-    if (util::equalsIgnoreCase(s, "staff")) return Role::Staff;
-    return std::nullopt;
-}
-
-bool allowed(Role role, Permission p) {
-    if (role == Role::Admin) return true;
-    switch (p) {  // Staff: sell, view inventory, adjust stock, take payments on credit, close the register - nothing else.
-        case Permission::ViewInventory:
-        case Permission::Sell:
-        case Permission::AdjustStock:
-        case Permission::Receivables:
-        case Permission::CashReport:
-        case Permission::Customers:
-        case Permission::Jobs:            // Phase 4: the whole floor works with job orders
-            return true;
-        default:
-            return false;
-    }
-}
-
 // ---------------------------------------------------------------- hashing (SHA-256, no external library)
 Digest sha256(const std::string& message) {
     static const std::uint32_t k[64] = {
@@ -144,9 +119,11 @@ bool constantTimeEquals(const std::string& a, const std::string& b) {
 }
 
 // ---------------------------------------------------------------- Authenticator
-// users.csv:  username,salt,hash,role,recoverySalt,recoveryHash,question
-// The older 6-column file (username,salt,hash,recSalt,recHash,question) still loads; its
-// accounts become Admin and are rewritten in the new format on the next save.
+// users.csv:  username,salt,hash,owner,recoverySalt,recoveryHash,question
+// The system has a single account: the Business Owner. The 4th column is a fixed marker ("Admin") kept only so
+// that existing users.csv files stay readable. Rows from older versions that belong to any other kind of
+// account are ignored on load, and only the first account is kept (so a leftover extra account can't log in).
+// The older 6-column file (username,salt,hash,recSalt,recHash,question) still loads.
 Authenticator::Authenticator(std::string file) : file_(std::move(file)) { load(); }
 
 std::string Authenticator::normAnswer(const std::string& s) { return util::toLower(util::trim(s)); }
@@ -160,24 +137,11 @@ Credential* Authenticator::findMutable(const std::string& u) {
     return nullptr;
 }
 
-std::vector<UserInfo> Authenticator::users() const {
-    std::vector<UserInfo> out;
-    for (const Credential& c : users_) out.push_back({c.username, c.role, !c.recHash.empty()});
-    return out;
-}
-std::optional<Role> Authenticator::roleOf(const std::string& u) const {
-    const Credential* c = find(u);
-    if (!c) return std::nullopt;
-    return c->role;
-}
+bool Authenticator::exists(const std::string& u) const { return find(u) != nullptr; }
 std::string Authenticator::canonicalName(const std::string& u) const {
     const Credential* c = find(u);
     return c ? c->username : std::string();
 }
-int Authenticator::adminCount() const {
-    return static_cast<int>(std::count_if(users_.begin(), users_.end(), [](const Credential& c) { return c.role == Role::Admin; }));
-}
-
 std::string Authenticator::checkUsername(const std::string& n) {
     if (n.size() < 3 || n.size() > 32) return "Username must be 3 to 32 characters.";
     for (unsigned char c : n)
@@ -202,7 +166,6 @@ std::string Authenticator::initialSetup(const std::string& username, const std::
     if (a == util::toLower(util::trim(password))) return "The recovery answer must differ from the password.";
     Credential c;
     c.username = username;
-    c.role = Role::Admin;
     c.salt = randomSalt(c.username);
     c.hash = hashPassword(c.salt, password);
     c.recQuestion = util::oneLine(q);
@@ -213,50 +176,13 @@ std::string Authenticator::initialSetup(const std::string& username, const std::
     return "";
 }
 
-std::optional<std::pair<std::string, Role>> Authenticator::login(const std::string& username, const std::string& password) const {
+std::optional<std::string> Authenticator::login(const std::string& username, const std::string& password) const {
     const Credential* f = find(username);
     const std::string salt = f ? f->salt : std::string("RE-PT:no-such-user");
     const std::string computed = hashPassword(salt, password);  // same work either way (no user enumeration)
     const bool ok = constantTimeEquals(computed, f ? f->hash : std::string(64, '0')) && f != nullptr;
     if (!ok) return std::nullopt;
-    return std::make_pair(f->username, f->role);
-}
-
-std::string Authenticator::addUser(const std::string& username, const std::string& password, Role role) {
-    std::string err = checkUsername(username);
-    if (err.empty()) err = checkPassword(password);
-    if (!err.empty()) return err;
-    if (find(username)) return "That username is already taken.";
-    Credential c;
-    c.username = username;
-    c.role = role;
-    c.salt = randomSalt(username);
-    c.hash = hashPassword(c.salt, password);
-    users_.push_back(c);
-    if (!save()) { users_.pop_back(); return "Could not save " + file_ + "."; }
-    return "";
-}
-
-std::string Authenticator::setRole(const std::string& username, Role role) {
-    Credential* c = findMutable(username);
-    if (!c) return "User not found.";
-    if (c->role == role) return "";
-    if (c->role == Role::Admin && adminCount() <= 1) return "There must be at least one Admin.";
-    const Role old = c->role;
-    c->role = role;
-    if (!save()) { c->role = old; return "Could not save " + file_ + "."; }
-    return "";
-}
-
-std::string Authenticator::removeUser(const std::string& username) {
-    Credential* c = findMutable(username);
-    if (!c) return "User not found.";
-    if (c->role == Role::Admin && adminCount() <= 1) return "You cannot delete the last Admin.";
-    const std::vector<Credential> backup = users_;
-    users_.erase(std::remove_if(users_.begin(), users_.end(),
-                                [&](const Credential& x) { return util::equalsIgnoreCase(x.username, username); }), users_.end());
-    if (!save()) { users_ = backup; return "Could not save " + file_ + "."; }
-    return "";
+    return f->username;
 }
 
 std::string Authenticator::resetPassword(const std::string& username, const std::string& newPassword) {
@@ -309,7 +235,7 @@ std::string Authenticator::recoverPassword(const std::string& username, const st
 bool Authenticator::save() {
     std::string out;
     for (const Credential& c : users_)
-        out += util::csvEscape(c.username) + ',' + c.salt + ',' + c.hash + ',' + roleName(c.role) + ',' + c.recSalt + ',' + c.recHash + ',' +
+        out += util::csvEscape(c.username) + ',' + c.salt + ',' + c.hash + ',' + "Admin" + ',' + c.recSalt + ',' + c.recHash + ',' +
                util::csvEscape(c.recQuestion) + '\n';
     if (!util::writeFileAtomic(file_, out)) return false;
     std::error_code ec;  // best effort: owner-only (honoured on Linux/macOS)
@@ -322,13 +248,13 @@ void Authenticator::load() {
     const auto rows = util::readCsvFile(file_);
     for (const auto& f : rows) {
         if (f.size() < 3 || f[0].empty() || f[2].size() != 64 || find(f[0])) continue;
+        if (!users_.empty()) break;                        // single-owner system: only one account is ever used
         Credential c;
         c.username = f[0]; c.salt = f[1]; c.hash = f[2];
-        if (f.size() >= 7 && parseRole(f[3])) {            // current format
-            c.role = *parseRole(f[3]);
+        if (f.size() >= 7 && (util::equalsIgnoreCase(f[3], "admin") || util::equalsIgnoreCase(f[3], "staff"))) {  // current format
+            if (!util::equalsIgnoreCase(f[3], "admin")) continue;   // a leftover non-owner account: ignore it
             if (f[5].size() == 64) { c.recSalt = f[4]; c.recHash = f[5]; c.recQuestion = f[6]; }
-        } else {                                           // legacy: single admin account
-            c.role = Role::Admin;
+        } else {                                           // legacy: single account
             if (f.size() >= 6 && f[4].size() == 64) { c.recSalt = f[3]; c.recHash = f[4]; c.recQuestion = f[5]; }
         }
         users_.push_back(c);

@@ -29,12 +29,11 @@ namespace api {
 struct Credentials {
     std::string user;   // "" = nobody
     std::string ip;
-    auth::Role role = auth::Role::Staff;
 };
 
 // Returns true when the request may continue. On false the callee has already written a
-// 401 (not signed in) or 403 (role / CSRF) JSON response and the handler must stop.
-using Authorize = std::function<bool(const httplib::Request&, httplib::Response&, auth::Permission need, Credentials& out)>;
+// 401 (not signed in) or 403 (CSRF) JSON response and the handler must stop.
+using Authorize = std::function<bool(const httplib::Request&, httplib::Response&, Credentials& out)>;
 
 struct Deps {
     inv::Inventory* inv = nullptr;

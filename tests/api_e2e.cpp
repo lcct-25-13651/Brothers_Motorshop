@@ -32,26 +32,23 @@ namespace {
 struct FakeSession {
     bool loggedIn = true;
     std::string user = "boss";
-    auth::Role role = auth::Role::Admin;
     std::string csrf = "csrftokencsrftokencsrftokencsrftokencsrftokencsrftokencsrftokencsrf";
     bool sendCsrf = true;
 
     api::Authorize fn() {
-        return [this](const httplib::Request& req, httplib::Response& res, auth::Permission need, api::Credentials& out) -> bool {
+        return [this](const httplib::Request& req, httplib::Response& res, api::Credentials& out) -> bool {
             auto deny = [&res](int status, const std::string& error) {
                 res.status = status;
                 res.set_content(json::obj({{"ok", json::boolean(false)}, {"error", json::str(error)}}), "application/json");
                 return false;
             };
             if (!loggedIn) return deny(401, "Not signed in.");
-            if (!auth::allowed(role, need)) return deny(403, "Your role is not allowed to do that.");
             if (req.method != "GET" && req.method != "OPTIONS") {
                 const std::string header = req.get_header_value("X-CSRF-Token");
                 const std::string given = !header.empty() ? header : req.get_param_value("csrf");
                 if (!sendCsrf || given != csrf) return deny(403, "Security token missing or expired.");
             }
             out.user = user;
-            out.role = role;
             out.ip = req.remote_addr;
             return true;
         };
@@ -323,15 +320,8 @@ int main() {
         CHECK(parse(r.body).find("count")->asInt() == 1);
     }
 
-    // ---------------------------------------------------------------- roles, CSRF, CORS
+    // ---------------------------------------------------------------- CSRF, CORS
     {
-        sess.role = auth::Role::Staff;
-        CHECK(svr.call("GET", "/api/services").status == 200);
-        CHECK(svr.call("POST", "/api/services", {}, "", R"({"name":"Wash"})", csrfHeader).status == 403);
-        CHECK(svr.call("POST", "/api/services/1/active", {}, "", R"({"active":"0"})", csrfHeader).status == 403);
-        CHECK(svr.call("POST", "/api/jobs", {{"complaint", "x"}}, "", "", csrfHeader).status == 201);   // jobs are for everyone
-        sess.role = auth::Role::Admin;
-
         sess.sendCsrf = false;                                     // a cross-site form post
         CHECK(svr.call("POST", "/api/jobs", {{"complaint", "x"}}, "", "", csrfHeader).status == 403);
         CHECK(svr.call("POST", "/api/jobs", {{"complaint", "x"}, {"csrf", "wrong"}}).status == 403);

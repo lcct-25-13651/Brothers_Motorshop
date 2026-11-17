@@ -1,6 +1,7 @@
 // inventory.h - parts catalogue, CRUD, stock movements (movements.csv), invoices + payments (invoices.csv, payments.csv),
 // CSV import/export, backups.
 #pragma once
+#include <cmath>
 #include <map>
 #include <optional>
 #include <string>
@@ -14,6 +15,12 @@ constexpr int kMaxQty = 999999;
 constexpr double kMaxPrice = 9999999.99;
 }  // namespace limits
 
+// ---------------------------------------------------------------- selling price rule
+// The selling price is never typed in: it is always the purchase price (cost_price, what the shop pays to get the
+// item) plus a 20 % markup:  selling_price = cost_price * 1.20, rounded to whole centavos.
+constexpr double kMarkupFactor = 1.20;
+inline double sellingPriceFor(double costPrice) { return std::round(costPrice * kMarkupFactor * 100.0) / 100.0; }
+
 // ---------------------------------------------------------------- Part
 class Part {
 public:
@@ -24,10 +31,10 @@ public:
     int id() const { return id_; }
     const std::string& name() const { return name_; }
     const std::string& category() const { return category_; }
-    double price() const { return price_; }
+    double price() const { return price_; }                             // the SELLING price
     int quantity() const { return quantity_; }
     int minStock() const { return minStock_; }
-    double costPrice() const { return costPrice_; }                     // what one unit costs the shop (0 = unknown)
+    double costPrice() const { return costPrice_; }                     // the PURCHASE price: what the shop pays to get one unit (0 = unknown)
     const std::string& compatibleModels() const { return compatibleModels_; }
     int supplierId() const { return supplierId_; }                      // 0 = no supplier recorded
     // "PART-NO - NAME": the complete label (part number first, then description) used wherever a part is shown or recorded by name,
@@ -39,14 +46,17 @@ public:
     std::vector<std::string> modelList() const;
     bool fitsModel(const std::string& model) const;   // case-insensitive exact match on one listed model
     bool isLowStock() const { return quantity_ < minStock_; }
+    bool isOutOfStock() const { return quantity_ <= 0; }                // stock == 0: nothing can be ordered / sold / issued
     double stockValue() const { return price_ * quantity_; }
 
     void setName(const std::string& v) { name_ = v; }
     void setCategory(const std::string& v) { category_ = v; }
     void setPrice(double v) { price_ = v; }
-    void setQuantity(int v) { quantity_ = v; }
+    void setQuantity(int v) { quantity_ = v < 0 ? 0 : v; }               // stock never goes below 0: an item that runs out sits at exactly 0
     void setMinStock(int v) { minStock_ = v; }
-    void setCostPrice(double v) { costPrice_ = v; }
+    void setCostPrice(double v) { costPrice_ = v; }                     // stores only (used when loading files)
+    // Entering / changing the purchase price: stores it AND sets selling_price = cost_price * 1.20.
+    void setCostPriceAndMarkup(double v) { costPrice_ = std::round(v * 100.0) / 100.0; price_ = sellingPriceFor(costPrice_); }
     void setCompatibleModels(const std::string& v) { compatibleModels_ = v; }
     void setPartNumber(const std::string& v) { partNumber_ = v; }
     void setSupplierId(int v) { supplierId_ = v; }
@@ -66,6 +76,11 @@ private:
     std::string partNumber_;
     int supplierId_ = 0;
 };
+
+// The one error shown whenever someone tries to order / sell / issue a part whose stock is 0.
+inline std::string outOfStockMessage(const Part& p) {
+    return "OUT OF STOCK: \"" + p.fullName() + "\" has 0 units in stock, so it cannot be ordered. Restock it first.";
+}
 
 // Vehicle systems offered in drop-downs (data may contain others; they are listed too).
 const std::vector<std::string>& standardSystems();
@@ -267,8 +282,8 @@ public:
                             const std::string& receivedBy = "");
 
     // Logs a payment against an open invoice: updates invoices.csv (amount_paid / payment_status) and payments.csv.
-    // expectedBalance (>= 0) is the balance the cashier was looking at; if it has changed meanwhile (double click,
-    // another cashier) the payment is refused instead of being applied twice. Pass -1 to skip that check.
+    // expectedBalance (>= 0) is the balance the owner was looking at; if it has changed meanwhile (double click,
+    // another open tab) the payment is refused instead of being applied twice. Pass -1 to skip that check.
     PaymentResult recordPayment(const std::string& invoiceNo, double amount, const std::string& method, const std::string& note,
                                 const std::string& actor, double expectedBalance = -1.0, const std::string& receivedBy = "");
 

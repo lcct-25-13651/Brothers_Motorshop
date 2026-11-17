@@ -59,6 +59,7 @@ const char* codeFor(int status) {
 int statusFor(const std::string& message) {
     if (message.find("does not exist") != std::string::npos) return 404;
     if (message.find("Not enough stock") != std::string::npos) return 409;
+    if (message.find("OUT OF STOCK") != std::string::npos) return 409;
     if (message.find("cannot go from") != std::string::npos) return 409;
     if (message.find("no longer be") != std::string::npos) return 409;
     if (message.find("is final") != std::string::npos) return 409;
@@ -221,9 +222,9 @@ std::string partJson(const inv::Part& p) {
 void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize) {
     using Body = std::function<void(const httplib::Request&, httplib::Response&, const Deps&, const Credentials&, const json::Value&)>;
 
-    // Every route: common headers -> CORS -> session/role/CSRF gate -> parse the JSON body -> run `fn`.
-    auto add = [&svr, deps, authorize](const char* method, const std::string& pattern, auth::Permission need, Body fn) {
-        auto handler = [deps, authorize, need, fn](const httplib::Request& req, httplib::Response& res) {
+    // Every route: common headers -> CORS -> session/CSRF gate -> parse the JSON body -> run `fn`.
+    auto add = [&svr, deps, authorize](const char* method, const std::string& pattern, Body fn) {
+        auto handler = [deps, authorize, fn](const httplib::Request& req, httplib::Response& res) {
             commonHeaders(res);
             if (!deps.corsOrigin.empty()) {
                 const std::string origin = req.get_header_value("Origin");
@@ -238,7 +239,7 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
             std::unique_lock<std::mutex> lock;
             if (deps.dataLock) lock = std::unique_lock<std::mutex>(*deps.dataLock);
             Credentials cred;
-            if (!authorize(req, res, need, cred)) return;
+            if (!authorize(req, res, cred)) return;
             json::Value body;
             if (!req.body.empty()) {
                 if (auto parsed = json::parse(req.body)) body = *parsed;
@@ -271,10 +272,8 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
         });
     };
 
-    using P = auth::Permission;
-
     // ---------------------------------------------------------------- GET /api/jobs - the job list
-    add("GET", "/api/jobs", P::Jobs, [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials&,
+    add("GET", "/api/jobs", [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials&,
                                         const json::Value&) {
         jobs::JobFilter f;
         const std::string status = req.get_param_value("status");
@@ -315,7 +314,7 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
     });
 
     // ---------------------------------------------------------------- POST /api/jobs - open a job
-    add("POST", "/api/jobs", P::Jobs, [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials& cred,
+    add("POST", "/api/jobs", [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials& cred,
                                          const json::Value& body) {
         jobs::CreateJob in;
         in.customerId = intField(field(req, body, "customer_id"), 0);
@@ -345,7 +344,7 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
     });
 
     // ---------------------------------------------------------------- GET /api/jobs/<no>
-    add("GET", "/api/jobs/([^/]+)", P::Jobs, [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials&,
+    add("GET", "/api/jobs/([^/]+)", [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials&,
                                                 const json::Value&) {
         const std::string no = util::trim(req.matches[1].str());
         const auto j = deps.jobs->get(no);
@@ -361,7 +360,7 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
     });
 
     // ---------------------------------------------------------------- POST /api/jobs/<no> - edit details
-    add("POST", "/api/jobs/([^/]+)", P::Jobs, [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials& cred,
+    add("POST", "/api/jobs/([^/]+)", [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials& cred,
                                                  const json::Value& body) {
         const std::string no = util::trim(req.matches[1].str());
         const auto current = deps.jobs->get(no);
@@ -408,7 +407,7 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
     });
 
     // ---------------------------------------------------------------- POST /api/jobs/<no>/status
-    add("POST", "/api/jobs/([^/]+)/status", P::Jobs, [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
+    add("POST", "/api/jobs/([^/]+)/status", [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
                                                         const Credentials& cred, const json::Value& body) {
         const std::string no = util::trim(req.matches[1].str());
         const std::string want = field(req, body, "status");
@@ -431,7 +430,7 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
     });
 
     // ---------------------------------------------------------------- POST /api/jobs/<no>/mechanic
-    add("POST", "/api/jobs/([^/]+)/mechanic", P::Jobs, [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
+    add("POST", "/api/jobs/([^/]+)/mechanic", [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
                                                           const Credentials& cred, const json::Value& body) {
         const std::string no = util::trim(req.matches[1].str());
         const auto r = deps.jobs->assignMechanic(no, field(req, body, "mechanic"), cred.user);
@@ -447,7 +446,7 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
     });
 
     // ---------------------------------------------------------------- POST /api/jobs/<no>/cancel
-    add("POST", "/api/jobs/([^/]+)/cancel", P::Jobs, [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
+    add("POST", "/api/jobs/([^/]+)/cancel", [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
                                                         const Credentials& cred, const json::Value& body) {
         const std::string no = util::trim(req.matches[1].str());
         const auto r = deps.jobs->cancelJob(no, field(req, body, "reason"), cred.user);
@@ -463,7 +462,7 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
     });
 
     // ---------------------------------------------------------------- GET /api/jobs/<no>/lines
-    add("GET", "/api/jobs/([^/]+)/lines", P::Jobs, [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
+    add("GET", "/api/jobs/([^/]+)/lines", [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
                                                       const Credentials&, const json::Value&) {
         const std::string no = util::trim(req.matches[1].str());
         const auto r = deps.jobs->lines(no);
@@ -481,7 +480,7 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
 
     // ---------------------------------------------------------------- POST /api/jobs/<no>/lines - add
     // A Part line takes the units off the shelf there and then; a Labour line only carries a fee.
-    add("POST", "/api/jobs/([^/]+)/lines", P::Jobs, [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
+    add("POST", "/api/jobs/([^/]+)/lines", [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
                                                        const Credentials& cred, const json::Value& body) {
         const std::string no = util::trim(req.matches[1].str());
         const std::string kindText = field(req, body, "kind");
@@ -549,12 +548,12 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
                         {"lines", linesArray(r.lines, deps)},
                         {"totals", totalsJson(r.totals)}}));
     };
-    add("DELETE", "/api/jobs/([^/]+)/lines/([0-9]+)", P::Jobs, removeLine);
+    add("DELETE", "/api/jobs/([^/]+)/lines/([0-9]+)", removeLine);
     // Same thing over POST, for clients that cannot send a DELETE (plain HTML forms).
-    add("POST", "/api/jobs/([^/]+)/lines/([0-9]+)/delete", P::Jobs, removeLine);
+    add("POST", "/api/jobs/([^/]+)/lines/([0-9]+)/delete", removeLine);
 
     // ---------------------------------------------------------------- GET /api/jobs/<no>/card - print
-    add("GET", "/api/jobs/([^/]+)/card", P::Jobs, [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
+    add("GET", "/api/jobs/([^/]+)/card", [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
                                                      const Credentials&, const json::Value&) {
         const std::string no = util::trim(req.matches[1].str());
         const auto c = deps.jobs->card(no);
@@ -579,7 +578,7 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
     });
 
     // ---------------------------------------------------------------- GET /api/jobs/<no>/history
-    add("GET", "/api/jobs/([^/]+)/history", P::Jobs, [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
+    add("GET", "/api/jobs/([^/]+)/history", [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
                                                         const Credentials&, const json::Value&) {
         const std::string no = util::trim(req.matches[1].str());
         if (!deps.jobs->get(no)) {
@@ -600,7 +599,7 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
     });
 
     // ---------------------------------------------------------------- GET /api/services
-    add("GET", "/api/services", P::Jobs, [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials&,
+    add("GET", "/api/services", [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials&,
                                             const json::Value&) {
         const bool all = req.get_param_value("all") == "1" || req.get_param_value("all") == "true";
         std::vector<std::string> items;
@@ -612,8 +611,8 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
                         {"services", json::arr(items)}}));
     });
 
-    // ---------------------------------------------------------------- POST /api/services (Admin)
-    add("POST", "/api/services", P::ServiceCatalog, [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
+    // ---------------------------------------------------------------- POST /api/services
+    add("POST", "/api/services", [](const httplib::Request& req, httplib::Response& res, const Deps& deps,
                                                        const Credentials& cred, const json::Value& body) {
         jobs::ServiceItem s;
         const int id = intField(field(req, body, "id"), 0);
@@ -634,8 +633,8 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
                         {"service", saved ? serviceJson(*saved) : ""}}));
     });
 
-    // ---------------------------------------------------------------- POST /api/services/<id>/active (Admin)
-    add("POST", "/api/services/([0-9]+)/active", P::ServiceCatalog, [](const httplib::Request& req, httplib::Response& res,
+    // ---------------------------------------------------------------- POST /api/services/<id>/active
+    add("POST", "/api/services/([0-9]+)/active", [](const httplib::Request& req, httplib::Response& res,
                                                                       const Deps& deps, const Credentials& cred, const json::Value& body) {
         const int id = intField(util::trim(req.matches[1].str()), 0);
         const std::string v = field(req, body, "active");
@@ -650,7 +649,7 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
     });
 
     // ---------------------------------------------------------------- GET /api/vehicles - plates for the job form
-    add("GET", "/api/vehicles", P::Customers, [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials&,
+    add("GET", "/api/vehicles", [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials&,
                                                  const json::Value&) {
         const std::string q = util::toLower(util::trim(req.get_param_value("q")));
         const int limit = std::max(1, std::min(intField(req.get_param_value("limit"), 200), 1000));
@@ -679,7 +678,7 @@ void registerRoutes(httplib::Server& svr, const Deps& deps, Authorize authorize)
     });
 
     // ---------------------------------------------------------------- GET /api/parts - picker for lines
-    add("GET", "/api/parts", P::ViewInventory, [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials&,
+    add("GET", "/api/parts", [](const httplib::Request& req, httplib::Response& res, const Deps& deps, const Credentials&,
                                                   const json::Value&) {
         const std::string q = util::toLower(util::trim(req.get_param_value("q")));
         const int limit = std::max(1, std::min(intField(req.get_param_value("limit"), 50), 500));

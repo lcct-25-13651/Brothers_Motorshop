@@ -81,7 +81,7 @@ void ServiceCatalog::open(const std::string& dataDir) {
     std::error_code ec;
     const bool fresh = !fs::exists(file_, ec);
     if (fresh) {
-        seedDefaults();   // Change Oil / Brake Pad Replacement / Engine Overhaul - the Admin edits them
+        seedDefaults();   // Change Oil / Brake Pad Replacement / Engine Overhaul - the owner edits them
         return;
     }
     if (skipped > 0) {
@@ -629,6 +629,7 @@ LineResult JobBook::addLine(const std::string& jobNo, const AddLine& in, const s
         if (!p) return LineResult::fail("Part " + std::to_string(in.partId) + " does not exist.");
         if (in.quantity < 1 || in.quantity > inv::limits::kMaxQty)
             return LineResult::fail("Quantity must be 1 to " + std::to_string(inv::limits::kMaxQty) + ".");
+        if (p->isOutOfStock()) return LineResult::fail(inv::outOfStockMessage(*p));   // strict: stock == 0 -> cannot be added to a job order
         if (in.quantity > p->quantity())
             return LineResult::fail("Not enough stock for \"" + p->fullName() + "\": " + std::to_string(p->quantity()) + " available, " +
                                     std::to_string(in.quantity) + " requested.");
@@ -833,7 +834,7 @@ int JobBook::issuedFor(const std::string& jobNo, int partId) const {
     return issuedForLocked(jobNo, partId);
 }
 
-// ---------------------------------------------------------------- service catalogue (Admin)
+// ---------------------------------------------------------------- service catalogue
 std::string JobBook::saveService(int id, ServiceItem in, int& newId, const std::string& actor) {
     std::lock_guard<std::mutex> lock(mtx_);
     const std::string err = services_.save(id, in, newId);

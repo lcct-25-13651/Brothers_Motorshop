@@ -23,28 +23,31 @@ int main() {
     fs::create_directories(dir);
     const std::string d = dir.string();
 
-    // ---- auth / RBAC ----
+    // ---- auth: single owner account ----
     {
         auth::Authenticator a((dir / "users.csv").string());
         CHECK(!a.isConfigured());
         CHECK(a.initialSetup("owner", "correct-horse", "First pet name?", "fluffy-the-cat").empty());
         CHECK(a.login("OWNER", "correct-horse").has_value());
+        CHECK(*a.login("OWNER", "correct-horse") == "owner");
         CHECK(!a.login("owner", "wrong-password").has_value());
-        CHECK(a.addUser("juan", "staffpass1", auth::Role::Staff).empty());
-        CHECK(!a.addUser("juan", "staffpass1", auth::Role::Staff).empty());  // duplicate
-        CHECK(!a.removeUser("owner").empty());                               // last admin
-        CHECK(!a.setRole("owner", auth::Role::Staff).empty());
+        CHECK(!a.initialSetup("second", "another-pass1", "First pet name?", "fluffy-the-cat").empty());  // only one account ever
         auth::Authenticator reload((dir / "users.csv").string());            // persisted + salted
-        CHECK(reload.users().size() == 2);
-        CHECK(reload.login("juan", "staffpass1")->second == auth::Role::Staff);
-        CHECK(auth::allowed(auth::Role::Staff, auth::Permission::Sell));
-        CHECK(auth::allowed(auth::Role::Staff, auth::Permission::AdjustStock));
-        CHECK(!auth::allowed(auth::Role::Staff, auth::Permission::DeletePart));
-        CHECK(!auth::allowed(auth::Role::Staff, auth::Permission::EditPart));
-        CHECK(!auth::allowed(auth::Role::Staff, auth::Permission::ViewReports));
-        CHECK(auth::allowed(auth::Role::Admin, auth::Permission::ManageUsers));
-        CHECK(reload.resetPassword("juan", "newpass123").empty());
-        CHECK(!reload.login("juan", "staffpass1").has_value());
+        CHECK(reload.isConfigured() && reload.exists("owner") && !reload.exists("juan"));
+        CHECK(reload.changePassword("owner", "correct-horse", "newpass123").empty());
+        CHECK(!reload.login("owner", "correct-horse").has_value());
+        CHECK(reload.login("owner", "newpass123").has_value());
+        // a leftover Staff row from an older version's users.csv is ignored: it cannot log in
+        {
+            const std::string salt = auth::randomSalt("juan");
+            std::ofstream f((dir / "users_old.csv").string());
+            f << "juan," << salt << ',' << auth::hashPassword(salt, "staffpass1") << ",Staff,,,\n";
+            const std::string osalt = auth::randomSalt("boss");
+            f << "boss," << osalt << ',' << auth::hashPassword(osalt, "bosspass12") << ",Admin,,,\n";
+        }
+        auth::Authenticator old((dir / "users_old.csv").string());
+        CHECK(!old.exists("juan") && !old.login("juan", "staffpass1").has_value());
+        CHECK(old.login("boss", "bosspass12").has_value());
         CHECK(reload.recoverPassword("owner", "  Fluffy-The-Cat ", "another-pass1").empty());
         auth::LoginThrottle th;
         for (int i = 0; i < 5; ++i) th.fail("k");
@@ -466,6 +469,37 @@ int main() {
             fs::remove_all(pd);
         }
         fs::remove_all(cd);
+    }
+
+    // ================= selling price = purchase price (cost_price) * 1.20, automatic =================
+    {
+        CHECK(inv::sellingPriceFor(100.0) == 120.0 && inv::sellingPriceFor(99.99) == 119.99 && inv::sellingPriceFor(0.0) == 0.0);
+        CHECK(inv::sellingPriceFor(33.33) == 40.0);   // 39.996 -> whole centavos
+        // addPart: a purchase price overrides whatever selling price was passed in
+        inv::Part ap(3001, "Clutch Plate", "Transmission", 1.0, 5, 1);
+        ap.setCostPrice(250.0);
+        CHECK(in.addPart(ap, "owner").ok);
+        CHECK(in.find(3001)->costPrice() == 250.0 && in.find(3001)->price() == 300.0);
+        // updating the purchase price recomputes the selling price (and survives a reload)
+        CHECK(in.setSourcing(3001, 0, 400.0, "owner").ok);
+        CHECK(in.find(3001)->costPrice() == 400.0 && in.find(3001)->price() == 480.0);
+        { inv::Inventory again(d); CHECK(again.find(3001) && again.find(3001)->price() == 480.0 && again.find(3001)->costPrice() == 400.0); }
+        // supplier-only change (no purchase price given) leaves both prices alone
+        CHECK(in.setSourcing(3001, 0, std::nullopt, "owner").ok && in.find(3001)->price() == 480.0);
+        // clearing the purchase price (0) keeps the selling price as it was
+        CHECK(in.setSourcing(3001, 0, 0.0, "owner").ok && in.find(3001)->costPrice() == 0.0 && in.find(3001)->price() == 480.0);
+        // too large: purchase price * 1.20 would exceed the maximum selling price
+        CHECK(!in.setSourcing(3001, 0, 9000000.0, "owner").ok && in.find(3001)->price() == 480.0 && in.find(3001)->costPrice() == 0.0);
+        // a part without a purchase price (older data) keeps its stored selling price
+        inv::Part legacy(3002, "Old Part", "Engine", 77.5, 1, 1);
+        CHECK(in.addPart(legacy, "owner").ok && in.find(3002)->price() == 77.5);
+        // CSV import: a PurchasePrice column sets the selling price; an unchanged purchase price does not touch it
+        auto imp2 = in.importCsv("id,name,system,price,quantity,purchase_price\n3003,Spring,Chassis,1,4,200\n3002,,,,1,\n", "owner");
+        CHECK(imp2.problems.empty() && in.find(3003) && in.find(3003)->costPrice() == 200.0 && in.find(3003)->price() == 240.0);
+        auto imp3 = in.importCsv("id,price,quantity,purchase_price\n3003,999,4,200\n", "owner");   // same purchase price: stays as it was
+        CHECK(in.find(3003)->price() == 999.0 && imp3.problems.empty());
+        auto imp4 = in.importCsv("id,price,quantity,purchase_price\n3003,999,4,300\n", "owner");   // changed purchase price: selling price follows
+        CHECK(in.find(3003)->price() == 360.0 && in.find(3003)->costPrice() == 300.0 && imp4.problems.empty());
     }
 
     CHECK(in.removePart(106, "owner").ok);

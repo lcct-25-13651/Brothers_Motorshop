@@ -71,7 +71,7 @@ double totalReceivable(const std::vector<inv::Invoice>& invoices);
 int openInvoiceCount(const std::vector<inv::Invoice>& invoices);
 std::string customerKey(const std::string& name);   // grouping key (lower-case, single spaces)
 
-// ---- End-of-day cashier summary ----
+// ---- End-of-day cash summary ----
 struct MethodTotal { std::string method; int count = 0; double amount = 0; };
 struct DailyCashReport {
     std::string date;                       // YYYY-MM-DD

@@ -159,7 +159,10 @@ inline constexpr const char* kJobsScript = R"JS(
     var next = (x.allowed_next || []).map(function (s) {
       return "<button class='btn " + (s === 'Cancelled' ? 'danger' : '') + "' data-status='" + esc(s) + "'>" + esc(s) + "</button>"; }).join(' ');
     var partOpts = parts.map(function (p) {
-      return "<option value='" + p.id + "'>" + esc(p.name) + " (" + p.stock + " in stock, " + php(p.price) + ")</option>"; }).join('');
+      return p.stock > 0
+        ? "<option value='" + p.id + "' data-stock='" + p.stock + "'>" + esc(p.name) + " (" + p.stock + " in stock, " + php(p.price) + ")</option>"
+        : "<option value='" + p.id + "' data-stock='0' disabled>" + esc(p.name) + " - OUT OF STOCK</option>"; }).join('');
+    var anyInStock = parts.some(function (p) { return p.stock > 0; });
     var svcOpts = services.map(function (s) {
       return "<option value='" + s.id + "'>" + esc(s.name) + " - " + php(s.default_labor_fee) + "</option>"; }).join('');
 
@@ -187,7 +190,8 @@ inline constexpr const char* kJobsScript = R"JS(
        "<h3>Add a line</h3><div class='row'>" +
         "<div style='flex:2'><label for='a_part'>Part</label><select id='a_part'>" + partOpts + "</select></div>" +
         "<div style='flex:0 4rem'><label for='a_qty'>Qty</label><input id='a_qty' type='number' min='1' value='1' style='width:4.5rem'></div>" +
-        "<div class='noprint' style='flex:0'><button class='btn' id='addpart'>Add part</button></div></div>" +
+        "<div class='noprint' style='flex:0'><button class='btn' id='addpart'" + (anyInStock ? '' : ' disabled') + ">Add part</button></div></div>" +
+        (anyInStock ? '' : "<p class='mut' style='color:#b00020'>OUT OF STOCK: every part has 0 units, so ordering parts is disabled until stock is added.</p>") +
         "<div class='row'>" +
         "<div style='flex:2'><label for='a_svc'>Labour</label><select id='a_svc'>" + svcOpts + "</select></div>" +
         "<div style='flex:1'><label for='a_fee'>Fee</label><input id='a_fee' type='number' step='0.01' placeholder='default'></div>" +
@@ -220,6 +224,10 @@ inline constexpr const char* kJobsScript = R"JS(
     });
     var addpart = document.getElementById('addpart');
     if (addpart) addpart.onclick = function () {
+      var sel = document.getElementById('a_part'), opt = sel.options[sel.selectedIndex];
+      var stock = opt ? Number(opt.getAttribute('data-stock')) : 0, want = Number(document.getElementById('a_qty').value);
+      if (!opt || !(stock > 0)) { toast('OUT OF STOCK: this part has 0 units and cannot be ordered.', true); return; }
+      if (want > stock) { toast('Not enough stock: only ' + stock + ' in stock, ' + want + ' requested.', true); return; }
       api('/api/jobs/' + encodeURIComponent(x.job_no) + '/lines', {method: 'POST', body: JSON.stringify({
         kind: 'Part', part_id: Number(document.getElementById('a_part').value), quantity: Number(document.getElementById('a_qty').value)
       })}).then(function (r) { toast(r.message); open(x.job_no); }).catch(function (e) { toast(e.message, true); });

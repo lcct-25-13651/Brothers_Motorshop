@@ -43,7 +43,7 @@ struct ServiceItem {
     bool scheduled() const { return intervalMonths > 0 || intervalKm > 0; }
 };
 
-// The catalogue is edited by an Admin (labour fees + reminder intervals) and is what pre-fills a
+// The catalogue is edited by the owner (labour fees + reminder intervals) and is what pre-fills a
 // labour line on a job order. Header-only-friendly, same shape as sup::SupplierBook.
 class ServiceCatalog {
 public:
@@ -261,7 +261,7 @@ public:
     LineResult addLine(const std::string& jobNo, const AddLine& in, const std::string& actor);
     LineResult removeLine(const std::string& jobNo, int lineNo, const std::string& actor);
 
-    // ---- service catalogue (Admin)
+    // ---- service catalogue
     std::string saveService(int id, ServiceItem in, int& newId, const std::string& actor);
     std::string setServiceActive(int id, bool on, const std::string& actor);
 

@@ -53,7 +53,6 @@ struct Ctx {
     const httplib::Request& req;
     httplib::Response& res;
     Session* sess = nullptr;                // null on public pages
-    auth::Role role = auth::Role::Staff;
     std::string ip;
     Ctx(const httplib::Request& rq, httplib::Response& rs) : req(rq), res(rs) {}
     std::string param(const std::string& k) const { return req.get_param_value(k); }
@@ -164,9 +163,9 @@ struct WebApp::Impl {
     // ------------------------------------------------------------------ routing + gatekeeping
     using Fn = void (Impl::*)(Ctx&);
 
-    // perm == nullopt  -> any logged-in user.   pub == true -> no login needed.
-    void add(const char* method, const std::string& path, Fn fn, std::optional<auth::Permission> perm = std::nullopt, bool pub = false) {
-        auto handler = [this, fn, perm, pub, path](const httplib::Request& req, httplib::Response& res) {
+    // pub == false -> the signed-in owner only.   pub == true -> no login needed.
+    void add(const char* method, const std::string& path, Fn fn, bool pub = false) {
+        auto handler = [this, fn, pub, path](const httplib::Request& req, httplib::Response& res) {
             std::lock_guard<std::mutex> lock(mtx);
             res.set_header("X-Content-Type-Options", "nosniff");
             res.set_header("Referrer-Policy", "same-origin");
@@ -187,18 +186,12 @@ struct WebApp::Impl {
             } else if (!pub) {
                 std::string token;
                 c.sess = sessionForRequest(req, &token);
-                const auto role = c.sess ? users.roleOf(c.sess->user) : std::nullopt;
-                if (!c.sess || !role) {
-                    if (c.sess) sessions.erase(token);  // account was deleted meanwhile
+                if (!c.sess || !users.exists(c.sess->user)) {
+                    if (c.sess) sessions.erase(token);  // account no longer exists
                     // Just logged in (?welcome=1) and already anonymous again: say why instead of
                     // silently bouncing back to a bare login form.
                     if (req.has_param("welcome")) return redirect(c, "/login?nocookie=1");
                     return redirect(c, "/login");
-                }
-                c.role = *role;
-                if (perm && !auth::allowed(c.role, *perm)) {
-                    audit.record(c.user(), "ACCESS_DENIED", std::string(req.method) + " " + req.path, c.ip);
-                    return forbidden(c, "Your role (" + std::string(auth::roleName(c.role)) + ") is not allowed to do that.");
                 }
                 if (req.method == "POST" && !auth::constantTimeEquals(c.param("csrf"), c.sess->csrf)) {
                     return forbidden(c, "Security token missing or expired. Go back, reload the page and try again.");
@@ -210,76 +203,70 @@ struct WebApp::Impl {
     }
 
     void routes() {
-        using P = auth::Permission;
-        add("GET", "/static/app.css", &Impl::cssFile, std::nullopt, true);
-        add("GET", "/static/app.js", &Impl::jsFile, std::nullopt, true);
-        add("GET", "/static/logo.png", &Impl::logoFile, std::nullopt, true);
-        add("GET", "/static/login-bg.jpg", &Impl::loginBgFile, std::nullopt, true);
-        add("GET", "/static/re.jpg", &Impl::reFile, std::nullopt, true);
-        add("GET", "/login", &Impl::loginPage, std::nullopt, true);
-        add("POST", "/login", &Impl::doLogin, std::nullopt, true);
-        add("GET", "/setup", &Impl::setupPage, std::nullopt, true);
-        add("POST", "/setup", &Impl::doSetup, std::nullopt, true);
-        add("GET", "/forgot", &Impl::forgotPage, std::nullopt, true);
-        add("POST", "/forgot", &Impl::doForgot, std::nullopt, true);
+        add("GET", "/static/app.css", &Impl::cssFile, true);
+        add("GET", "/static/app.js", &Impl::jsFile, true);
+        add("GET", "/static/logo.png", &Impl::logoFile, true);
+        add("GET", "/static/login-bg.jpg", &Impl::loginBgFile, true);
+        add("GET", "/static/re.jpg", &Impl::reFile, true);
+        add("GET", "/login", &Impl::loginPage, true);
+        add("POST", "/login", &Impl::doLogin, true);
+        add("GET", "/setup", &Impl::setupPage, true);
+        add("POST", "/setup", &Impl::doSetup, true);
+        add("GET", "/forgot", &Impl::forgotPage, true);
+        add("POST", "/forgot", &Impl::doForgot, true);
         add("POST", "/logout", &Impl::doLogout);
-        add("GET", "/", &Impl::dashboard, P::ViewInventory);
-        add("GET", "/stock", &Impl::stockPage, P::AdjustStock);
-        add("POST", "/stock", &Impl::doStock, P::AdjustStock);
-        add("GET", "/add", &Impl::addPage, P::AddPart);
-        add("POST", "/add", &Impl::doAdd, P::AddPart);
-        add("GET", "/edit", &Impl::editPage, P::EditPart);
-        add("POST", "/edit", &Impl::doEdit, P::EditPart);
-        add("GET", "/delete", &Impl::deletePage, P::DeletePart);
-        add("POST", "/delete", &Impl::doDelete, P::DeletePart);
-        add("GET", "/invoice", &Impl::invoicePage, P::Sell);
-        add("POST", "/invoice", &Impl::doInvoice, P::Sell);
-        add("GET", "/invoices", &Impl::invoiceList, P::Sell);
-        add("GET", "/receivables", &Impl::receivablesPage, P::Receivables);
-        add("GET", "/payment", &Impl::paymentPage, P::Receivables);
-        add("POST", "/payment", &Impl::doPayment, P::Receivables);
-        add("GET", "/payment-edit", &Impl::paymentEditPage, P::Receivables);
-        add("POST", "/payment-edit", &Impl::doPaymentEdit, P::Receivables);
-        add("GET", "/cash-report", &Impl::cashReportPage, P::CashReport);
-        add("GET", "/customers", &Impl::customersPage, P::Customers);
-        add("GET", "/customer", &Impl::customerPage, P::Customers);
-        add("GET", "/customer/edit", &Impl::customerEditPage, P::Customers);
-        add("POST", "/customer/save", &Impl::doCustomerSave, P::Customers);
-        add("POST", "/customer/archive", &Impl::doCustomerArchive, P::ArchiveCustomers);
-        add("POST", "/customer/delete", &Impl::doCustomerDelete, P::ArchiveCustomers);
-        add("GET", "/vehicle", &Impl::vehiclePage, P::Customers);
-        add("GET", "/vehicle/edit", &Impl::vehicleEditPage, P::Customers);
-        add("POST", "/vehicle/save", &Impl::doVehicleSave, P::Customers);
-        add("POST", "/vehicle/archive", &Impl::doVehicleArchive, P::ArchiveCustomers);
-        add("POST", "/vehicle/delete", &Impl::doVehicleDelete, P::ArchiveCustomers);
-        add("GET", "/reports", &Impl::reportsPage, P::ViewReports);
-        add("GET", "/sales-report", &Impl::salesReportPage, P::ViewReports);
-        add("GET", "/export/sales.csv", &Impl::exportSales, P::ViewReports);
-        add("GET", "/analytics.pdf", &Impl::analyticsPdf, P::ViewReports);
-        add("GET", "/movements", &Impl::movementsPage, P::ViewReports);
-        add("GET", "/audit", &Impl::auditPage, P::ViewAudit);
-        add("GET", "/data", &Impl::dataPage, P::ExportData);
-        add("GET", "/export/inventory.csv", &Impl::exportInventory, P::ExportData);
-        add("GET", "/export/movements.csv", &Impl::exportMovements, P::ExportData);
-        add("POST", "/import", &Impl::doImport, P::ImportData);
-        add("POST", "/backup", &Impl::doBackup, P::RunBackup);
-        add("GET", "/users", &Impl::usersPage, P::ManageUsers);
-        add("POST", "/users/add", &Impl::doUserAdd, P::ManageUsers);
-        add("POST", "/users/role", &Impl::doUserRole, P::ManageUsers);
-        add("POST", "/users/reset", &Impl::doUserReset, P::ManageUsers);
-        add("POST", "/users/delete", &Impl::doUserDelete, P::ManageUsers);
-        // Suppliers pages disabled (confidential): add("GET", "/suppliers", &Impl::suppliersPage, P::ManageSuppliers);
-        // add("POST", "/suppliers/save", &Impl::doSupplierSave, P::ManageSuppliers);
-        // add("POST", "/suppliers/toggle", &Impl::doSupplierToggle, P::ManageSuppliers);
+        add("GET", "/", &Impl::dashboard);
+        add("GET", "/stock", &Impl::stockPage);
+        add("POST", "/stock", &Impl::doStock);
+        add("GET", "/add", &Impl::addPage);
+        add("POST", "/add", &Impl::doAdd);
+        add("GET", "/edit", &Impl::editPage);
+        add("POST", "/edit", &Impl::doEdit);
+        add("GET", "/delete", &Impl::deletePage);
+        add("POST", "/delete", &Impl::doDelete);
+        add("GET", "/invoice", &Impl::invoicePage);
+        add("POST", "/invoice", &Impl::doInvoice);
+        add("GET", "/invoices", &Impl::invoiceList);
+        add("GET", "/receivables", &Impl::receivablesPage);
+        add("GET", "/payment", &Impl::paymentPage);
+        add("POST", "/payment", &Impl::doPayment);
+        add("GET", "/payment-edit", &Impl::paymentEditPage);
+        add("POST", "/payment-edit", &Impl::doPaymentEdit);
+        add("GET", "/cash-report", &Impl::cashReportPage);
+        add("GET", "/customers", &Impl::customersPage);
+        add("GET", "/customer", &Impl::customerPage);
+        add("GET", "/customer/edit", &Impl::customerEditPage);
+        add("POST", "/customer/save", &Impl::doCustomerSave);
+        add("POST", "/customer/archive", &Impl::doCustomerArchive);
+        add("POST", "/customer/delete", &Impl::doCustomerDelete);
+        add("GET", "/vehicle", &Impl::vehiclePage);
+        add("GET", "/vehicle/edit", &Impl::vehicleEditPage);
+        add("POST", "/vehicle/save", &Impl::doVehicleSave);
+        add("POST", "/vehicle/archive", &Impl::doVehicleArchive);
+        add("POST", "/vehicle/delete", &Impl::doVehicleDelete);
+        add("GET", "/reports", &Impl::reportsPage);
+        add("GET", "/sales-report", &Impl::salesReportPage);
+        add("GET", "/export/sales.csv", &Impl::exportSales);
+        add("GET", "/analytics.pdf", &Impl::analyticsPdf);
+        add("GET", "/movements", &Impl::movementsPage);
+        add("GET", "/audit", &Impl::auditPage);
+        add("GET", "/data", &Impl::dataPage);
+        add("GET", "/export/inventory.csv", &Impl::exportInventory);
+        add("GET", "/export/movements.csv", &Impl::exportMovements);
+        add("POST", "/import", &Impl::doImport);
+        add("POST", "/backup", &Impl::doBackup);
+        // Suppliers pages disabled (confidential): add("GET", "/suppliers", &Impl::suppliersPage);
+        // add("POST", "/suppliers/save", &Impl::doSupplierSave);
+        // add("POST", "/suppliers/toggle", &Impl::doSupplierToggle);
         add("GET", "/account", &Impl::accountPage);
         add("POST", "/account/password", &Impl::doAccountPassword);
-        add("GET", "/jobs", &Impl::jobsPage, P::Jobs); 
-        add("GET", "/static/jobs.js", &Impl::jobsJsFile, P::Jobs);
+        add("GET", "/jobs", &Impl::jobsPage); 
+        add("GET", "/static/jobs.js", &Impl::jobsJsFile);
         apiRoutes(); 
     }
 
     // ------------------------------------------------------------------ Phase 4: the JSON API
-    // Sessions, roles and CSRF stay here (single source of truth); api.cpp only knows job logic.
+    // Sessions and CSRF stay here (single source of truth); api.cpp only knows job logic.
     void apiRoutes() {
         api::Deps deps;
         deps.inv = &inv;
@@ -290,8 +277,8 @@ struct WebApp::Impl {
         deps.corsOrigin = cfg.corsOrigin;
         deps.dataLock = &mtx;   // the same mutex every HTML request is served under
         api::registerRoutes(svr, deps,
-                            [this](const httplib::Request& rq, httplib::Response& rs, auth::Permission need, api::Credentials& out) {
-                                return apiAuthorize(rq, rs, need, out);
+                            [this](const httplib::Request& rq, httplib::Response& rs, api::Credentials& out) {
+                                return apiAuthorize(rq, rs, out);
                             });
     }
 
@@ -302,11 +289,11 @@ struct WebApp::Impl {
                           "application/json; charset=utf-8");
     }
 
-    bool apiAuthorize(const httplib::Request& req, httplib::Response& res, auth::Permission need, api::Credentials& out) {
+    bool apiAuthorize(const httplib::Request& req, httplib::Response& res, api::Credentials& out) {
         Ctx c{req, res};
         c.ip = req.remote_addr;
         if (!users.isConfigured()) {
-            apiDeny(c, 401, "This shop has no accounts yet - open the app and create the Admin account.");
+            apiDeny(c, 401, "This shop has no accounts yet - open the app and create the owner account.");
             return false;
         }
         std::string token;
@@ -315,16 +302,9 @@ struct WebApp::Impl {
             apiDeny(c, 401, "Not signed in (open the app in a browser and log in).");
             return false;
         }
-        const auto role = users.roleOf(c.sess->user);
-        if (!role) {
+        if (!users.exists(c.sess->user)) {
             sessions.erase(token);
             apiDeny(c, 401, "That account no longer exists.");
-            return false;
-        }
-        c.role = *role;
-        if (!auth::allowed(c.role, need)) {
-            audit.record(c.user(), "ACCESS_DENIED", std::string(req.method) + " " + req.path, c.ip);
-            apiDeny(c, 403, "Your role (" + std::string(auth::roleName(c.role)) + ") is not allowed to do that.");
             return false;
         }
         if (req.method != "GET" && req.method != "OPTIONS") {
@@ -340,7 +320,6 @@ struct WebApp::Impl {
             }
         }
         out.user = c.user();
-        out.role = c.role;
         out.ip = c.ip;
         return true;
     }
@@ -436,26 +415,23 @@ struct WebApp::Impl {
     std::string layout(Ctx& c, const std::string& title, const std::string& body) {
         std::string o = head(title);
         if (c.sess) {
-            using P = auth::Permission;
             const std::string path = c.req.path;
             auto link = [&](const std::string& href, const std::string& text) {
                 return "<a href='" + href + "'" + (path == href ? " class='on'" : "") + ">" + text + "</a>";
             };
             o += "<header class='top'><span class='brand'><img class='brand-logo' src='/static/logo.png' alt=''><span>" + h(cfg.shopName) + "</span></span><nav>" + link("/", "Inventory" + alertBadge());
-            if (auth::allowed(c.role, P::Sell)) o += link("/invoice", "New sale") + link("/invoices", "Invoices");
-            if (auth::allowed(c.role, P::Jobs)) o += link("/jobs", "Job orders");  
-            if (auth::allowed(c.role, P::Customers)) o += link("/customers", "Customers");
-            if (auth::allowed(c.role, P::Receivables)) o += link("/receivables", "Accounts Receivable");
-            if (auth::allowed(c.role, P::CashReport)) o += link("/cash-report", "Daily cash report");
-            if (auth::allowed(c.role, P::AddPart)) o += link("/add", "Add part");
-            if (auth::allowed(c.role, P::ViewReports)) o += link("/reports", "Reports") + link("/sales-report", "Sales report") + link("/movements", "Movements");
-            if (auth::allowed(c.role, P::ExportData)) o += link("/data", "Data &amp; backups");
-            if (auth::allowed(c.role, P::ViewAudit)) o += link("/audit", "Audit");
+            o += link("/invoice", "New sale") + link("/invoices", "Invoices");
+            o += link("/jobs", "Job orders");  
+            o += link("/customers", "Customers");
+            o += link("/receivables", "Accounts Receivable");
+            o += link("/cash-report", "Daily cash report");
+            o += link("/add", "Add part");
+            o += link("/reports", "Reports") + link("/sales-report", "Sales report") + link("/movements", "Movements");
+            o += link("/data", "Data &amp; backups");
+            o += link("/audit", "Audit");
             // Suppliers link hidden (confidential)
-            // Users link hidden (single-owner shop); the page is still at /users
             o += "</nav><div class='re-badge' aria-hidden='true'><img src='/static/re.jpg' alt='Bajaj RE'><span>Bajaj RE Parts</span></div>"
-                 "<form method='post' action='/logout'>" + tokenField(c) + "<a href='/account'><span class='chip'>" + h(c.user()) + " &middot; " +
-                 auth::roleName(c.role) + "</span></a><button class='sm sec' type='submit'>Log out</button></form></header>";
+                 "<form method='post' action='/logout'>" + tokenField(c) + "<a href='/account'><span class='chip'>" + h(c.user()) + "</span></a><button class='sm sec' type='submit'>Log out</button></form></header>";
         }
         o += "<main>" + flash(c);
         if (!inv.lastWarning().empty()) o += "<div class='flash err'>" + h(inv.lastWarning()) + "</div>";
@@ -484,7 +460,7 @@ struct WebApp::Impl {
                "<main class='auth-wrap'><section class='auth-card'>"
                "<div class='auth-brand'><div class='auth-logo'><img src='/static/logo.png' alt=\"Brother's Motorshop logo\"></div><h1>" + h(cfg.shopName) + "</h1>"
                "<p class='auth-sub'>RE Parts &amp; Inventory System</p></div>" + flash(c) + body +
-               "</section><p class='auth-foot'>Authorized staff only</p></main><script src='/static/app.js'></script></body></html>";
+               "</section><p class='auth-foot'>Authorized access only</p></main><script src='/static/app.js'></script></body></html>";
     }
 
     // ------------------------------------------------------------------ login / setup / recovery
@@ -529,8 +505,8 @@ struct WebApp::Impl {
             return redirect(c, msgUrl("/login", "Wrong username or password.", false));
         }
         throttle.ok(key);
-        const std::string token = startSession(who->first);
-        audit.record(who->first, "LOGIN", std::string("role ") + auth::roleName(who->second), c.ip);
+        const std::string token = startSession(*who);
+        audit.record(*who, "LOGIN", "", c.ip);
         c.res.set_header("Set-Cookie", sessionCookie(token, false));
         redirect(c, "/?welcome=1");
     }
@@ -545,8 +521,8 @@ struct WebApp::Impl {
     void setupPage(Ctx& c) {
         if (users.isConfigured()) return redirect(c, "/login");
         html(c, bare(c, "First-time setup",
-                     "<h2>First-time setup</h2><p class='mut'>Create the Admin account. Passwords are stored only as salted hashes.</p>"
-                     "<form method='post' action='/setup'><label>Admin username</label><input name='username' value='admin' required>"
+                     "<h2>First-time setup</h2><p class='mut'>Create the owner account. Passwords are stored only as salted hashes.</p>"
+                     "<form method='post' action='/setup'><label>Owner username</label><input name='username' value='admin' required>"
                      "<label>Password (min 8 characters)</label><input name='password' type='password' required autocomplete='new-password'>"
                      "<label>Repeat password</label><input name='password2' type='password' required autocomplete='new-password'>"
                      "<label>Recovery question</label><input name='question' required placeholder='e.g. Name of my first motorcycle?'>"
@@ -558,14 +534,14 @@ struct WebApp::Impl {
         if (c.param("password") != c.param("password2")) return redirect(c, msgUrl("/setup", "The two passwords do not match.", false));
         const std::string err = users.initialSetup(c.param("username"), c.param("password"), c.param("question"), c.param("answer"));
         if (!err.empty()) return redirect(c, msgUrl("/setup", err, false));
-        audit.record(c.param("username"), "USER_CREATED", "first Admin account", c.ip);
+        audit.record(c.param("username"), "ACCOUNT_CREATED", "owner account", c.ip);
         redirect(c, msgUrl("/login", "Account created. Please sign in.", true));
     }
     void forgotPage(Ctx& c) {
         const std::string u = c.param("u"), q = users.recoveryQuestion(u);
         std::string b = "<h2>Reset password</h2><form method='post' action='/forgot'><label>Username</label><input name='username' value='" + h(u) + "' required>";
         if (!u.empty() && !q.empty()) b += "<p><b>Recovery question:</b> " + h(q) + "</p>";
-        else if (!u.empty()) b += "<p class='mut'>No recovery question is set for that account. Ask an Admin to reset your password.</p>";
+        else if (!u.empty()) b += "<p class='mut'>No recovery question is set for that account. Contact the system developer to reset your password.</p>";
         b += "<label>Recovery answer</label><input name='answer' required>"
              "<label>New username (optional &mdash; leave blank to keep the current one)</label>"
              "<input name='newusername' autocomplete='off' placeholder='3-32 letters, digits, _ . -'>"
@@ -643,11 +619,37 @@ struct WebApp::Impl {
         return nullptr;
     }
 
-    // ------------------------------------------------------------------ dashboard analytics (Admin: same permission as Reports)
+    // ------------------------------------------------------------------ dashboard analytics
     static std::string barRow(const std::string& label, const std::string& value, double pct) {
         if (pct < 0) pct = 0;
         if (pct > 100) pct = 100;
         return "<tr><td>" + label + "</td><td style='width:38%'><div class='meter'><i style='width:" + util::money(pct) + "%'></i></div></td><td class='n'>" + value + "</td></tr>";
+    }
+    // Parts that still have stock but were not sold (or issued to a job order) in the last `days` days.
+    // Parts first stocked less than `days` days ago are left out - they have not had a fair chance to sell yet. Most money tied up first.
+    std::vector<const inv::Part*> unsoldParts(int days, std::time_t now) {
+        const std::time_t from = now - static_cast<std::time_t>(days) * 86400;
+        std::set<int> moved;
+        std::map<int, std::time_t> firstSeen;
+        for (const inv::Movement& m : inv.movements().all()) {
+            const auto t = util::parseStamp(m.timestamp);
+            if (!t) continue;
+            auto it = firstSeen.find(m.partId);
+            if (it == firstSeen.end() || *t < it->second) firstSeen[m.partId] = *t;
+            if ((m.type == inv::MoveType::Sale || m.type == inv::MoveType::JobIssue) && *t >= from) moved.insert(m.partId);
+        }
+        std::vector<const inv::Part*> out;
+        for (const inv::Part& p : inv.parts()) {
+            if (p.quantity() <= 0 || moved.count(p.id())) continue;
+            const auto fs = firstSeen.find(p.id());
+            if (fs != firstSeen.end() && fs->second >= from) continue;
+            out.push_back(&p);
+        }
+        std::sort(out.begin(), out.end(), [](const inv::Part* a, const inv::Part* b) {
+            if (a->stockValue() != b->stockValue()) return a->stockValue() > b->stockValue();
+            return a->id() < b->id();
+        });
+        return out;
     }
     std::string analyticsPanel() {
         const std::time_t now = std::time(nullptr);
@@ -660,9 +662,8 @@ struct WebApp::Impl {
         const double week = wk.empty() ? 0 : wk.back().revenue();
         const double month = mo.empty() ? 0 : mo.back().revenue();
         const double monthNet = mo.empty() ? 0 : mo.back().net();
-        const auto dead = reports::deadStock(inv.parts(), moves, 30, now);
-        double deadValue = 0;
-        for (const auto& d : dead) deadValue += d.stockValue;
+        double totalSelling = 0;
+        for (const inv::Part& p : inv.parts()) totalSelling += p.stockValue();
 
         std::string b = "<div class='an-head'><h2>Analytics</h2><span class='mut'><a href='/reports'>Full reports</a> &middot; <a class='btn sm sec noprint' href='/analytics.pdf'>Download PDF</a></span></div><div class='stats'>"
                         "<div class='stat'><span>Sales today (collected)</span><b>" + php(today) + "</b></div>"
@@ -670,7 +671,7 @@ struct WebApp::Impl {
                         "<div class='stat'><span>This month</span><b>" + php(month) + "</b></div>"
                         "<div class='stat'><span>Net this month</span><b class='" + (monthNet < 0 ? "minus" : "plus") + "'>" + php(monthNet) + "</b></div>"
                         "<div class='stat" + std::string(reports::totalReceivable(invoices) > 0 ? " warn" : "") + "'><span>Receivables outstanding</span><b>" + php(reports::totalReceivable(invoices)) + "</b></div>"
-                        "<div class='stat'><span>Idle 30+ days</span><b>" + num(static_cast<long long>(dead.size())) + " <small class='mut'>(" + php(deadValue) + ")</small></b></div></div>";
+                        "<div class='stat'><span>Total selling price (all stock)</span><b>" + php(totalSelling) + "</b></div></div>";
 
         b += "<div class='an-grid'>";
         // Revenue, last 7 days (newest first)
@@ -697,6 +698,22 @@ struct WebApp::Impl {
         b += "<div class='card'><h3>Stock value by system</h3><table><tbody>";
         for (const auto& kv : bySys) b += barRow(h(kv.first) + " <span class='mut'>(" + num(kv.second.first) + " pcs)</span>", php(kv.second.second), kv.second.second / sysMax * 100);
         if (bySys.empty()) b += "<tr><td class='mut'>No parts yet.</td></tr>";
+        b += "</tbody></table></div>";
+
+        // Parts that are not selling: in stock, but no sale in the last 30 days
+        const auto unsold = unsoldParts(30, now);
+        double unsoldValue = 0;
+        for (const inv::Part* p : unsold) unsoldValue += p->stockValue();
+        const double unsoldMax = unsold.empty() ? 1.0 : std::max(1.0, unsold.front()->stockValue());
+        b += "<div class='card' style='grid-column:1/-1'><h3>Parts not selling - no sale in the last 30 days <span class='mut'>(" + num(static_cast<long long>(unsold.size())) +
+             " parts, " + php(unsoldValue) + " tied up at selling price)</span></h3><table><tbody>";
+        size_t shownUnsold = 0;
+        for (const inv::Part* p : unsold) {
+            if (++shownUnsold > 10) break;
+            b += barRow(h(partLabel(*p)) + " - " + h(p->name()) + " <span class='mut'>(" + num(p->quantity()) + " pcs)</span>", php(p->stockValue()), p->stockValue() / unsoldMax * 100);
+        }
+        if (unsold.size() > 10) b += "<tr><td colspan='3' class='mut'>... and " + num(static_cast<long long>(unsold.size() - 10)) + " more parts that have not sold. <a href='/reports'>See Reports</a></td></tr>";
+        if (unsold.empty()) b += "<tr><td class='mut'>Every part in stock has sold within the last 30 days.</td></tr>";
         b += "</tbody></table></div>";
 
         b += "</div>";
@@ -806,17 +823,17 @@ struct WebApp::Impl {
         if (re.empty()) L.push_back("Every part is at or above its minimum.");
         L.push_back("");
 
-        const auto dead = reports::deadStock(inv.parts(), moves, 30, now);
+        const auto unsold = unsoldParts(30, now);
         double tied = 0;
-        for (const auto& d : dead) tied += d.stockValue;
-        L.push_back("#DEAD STOCK - NO MOVEMENT FOR 30+ DAYS (" + num(static_cast<long long>(dead.size())) + " parts, " + util::moneyFmt(tied) + " tied up)");
-        L.push_back(padR("ID", 10) + padR("Part", 44) + padL("In stock", 12) + padL("Value", 16) + padL("Days idle", 10));
+        for (const inv::Part* p : unsold) tied += p->stockValue();
+        L.push_back("#PARTS NOT SELLING - NO SALE IN THE LAST 30 DAYS (" + num(static_cast<long long>(unsold.size())) + " parts, " + util::moneyFmt(tied) + " tied up at selling price)");
+        L.push_back(padR("ID", 10) + padR("Part", 44) + padL("In stock", 12) + padL("Selling value", 16));
         shown = 0;
-        for (const auto& d : dead) {
-            if (++shown > 15) { L.push_back("... and " + num(static_cast<long long>(dead.size() - 15)) + " more (see Reports page)"); break; }
-            L.push_back(padR(num(d.part->id()), 10) + padR(d.part->name(), 44) + padL(num(d.part->quantity()), 12) + padL(util::moneyFmt(d.stockValue), 16) + padL(num(d.daysIdle), 10));
+        for (const inv::Part* p : unsold) {
+            if (++shown > 15) { L.push_back("... and " + num(static_cast<long long>(unsold.size() - 15)) + " more (see Reports page)"); break; }
+            L.push_back(padR(partLabel(*p), 10) + padR(p->name(), 44) + padL(num(p->quantity()), 12) + padL(util::moneyFmt(p->stockValue()), 16));
         }
-        if (dead.empty()) L.push_back("Nothing has been idle that long.");
+        if (unsold.empty()) L.push_back("Every part in stock has sold within the last 30 days.");
 
         audit.record(c.user(), "REPORT_DOWNLOAD", "analytics PDF", c.ip);
         c.res.set_header("Content-Disposition", "attachment; filename=\"analytics_" + util::formatTime(now, "%Y%m%d_%H%M") + ".pdf\"");
@@ -824,7 +841,6 @@ struct WebApp::Impl {
     }
 
     void dashboard(Ctx& c) {
-        using P = auth::Permission;
         const auto& parts = inv.parts();
         long long units = 0;
         double value = 0;
@@ -839,7 +855,7 @@ struct WebApp::Impl {
                         h(util::formatTime(clockNow, "%A, %B %d, %Y")) + "</div><div class='clk-time' id='clktime'>" + h(util::formatTime(clockNow, "%I:%M:%S")) +
                         "<small>" + h(util::formatTime(clockNow, "%p")) + "</small></div></div></div><div class='stats'><div class='stat'><span>Parts</span><b>" + num(static_cast<long long>(parts.size())) + "</b></div>"
                         "<div class='stat'><span>Units in stock</span><b>" + num(units) + "</b></div>";
-        if (auth::allowed(c.role, P::ViewReports)) b += "<div class='stat'><span>Stock value</span><b>" + php(value) + "</b></div>";
+        b += "<div class='stat'><span>Stock value</span><b>" + php(value) + "</b></div>";
         const int outN = outOfStockCount();
         b += std::string("<div class='stat") + (low ? " warn" : "") + "'><span>Below minimum</span><b>" + num(low) + "</b></div>"
              "<div class='stat" + (outN ? " bad" : "") + "'><span>Out of stock</span><b>" + num(outN) + "</b></div></div>";
@@ -848,9 +864,9 @@ struct WebApp::Impl {
                  (low ? num(low) + (low == 1 ? " part is" : " parts are") + " below the reorder level" : std::string("Some parts are out of stock")) + "</b>" +
                  (outN ? " &middot; <b>" + num(outN) + " out of stock</b>" : std::string()) +
                  "<div class='mut'>Restock soon so you do not lose sales.</div></div><div class='alert-acts'><a class='btn sm' href='/?low=1'>Show low stock</a>" +
-                 (auth::allowed(c.role, P::ViewReports) ? "<a class='btn sm sec' href='/reports'>Reorder list</a>" : std::string()) + "</div></div>";
+                 "<a class='btn sm sec' href='/reports'>Reorder list</a>" + "</div></div>";
         }
-        if (auth::allowed(c.role, P::ViewReports)) b += analyticsPanel();
+        b += analyticsPanel();
 
         b += "<div class='card'><div class='bar'><input id='q' type='search' placeholder='Search by part number, description, system or vehicle model...' autocomplete='off'>"
              "<select id='sys'><option value=''>All vehicle systems</option>";
@@ -865,24 +881,39 @@ struct WebApp::Impl {
              "<option value='price:-1'>Price: high to low</option><option value='price:1'>Price: low to high</option>"
              "<option value='cat:1'>System: A to Z</option></select>"
              "<label class='inline mut'><input id='lowonly' type='checkbox'> Low stock only</label><span id='count' class='mut grow'></span>";
-        if (auth::allowed(c.role, P::AddPart)) b += "<a class='btn' href='/add'>+ Add part</a>";
+        b += "<a class='btn' href='/add'>+ Add part</a>";
         b += "</div><table id='inv'><thead><tr><th data-sort='pn'>Part Number</th><th data-sort='name'>Part Description</th><th data-sort='cat'>System</th><th>Fits (vehicle models)</th>"
-             "<th class='n' data-sort='price' data-type='num'>Price</th><th class='n' data-sort='qty' data-type='num'>Stock</th><th class='n' data-sort='min' data-type='num'>Min</th><th>Status</th>" + std::string(auth::allowed(c.role, P::ViewReports) ? "<th class='n'>Cost</th><th class='n'>Margin</th>" : "") + "<th></th></tr></thead><tbody>";
+             "<th class='n' data-sort='price' data-type='num'>Selling Price</th><th class='n' data-sort='qty' data-type='num'>Stock</th><th class='n' data-sort='min' data-type='num'>Min</th><th>Status</th>" + std::string("<th class='n'>Purchase Price</th><th class='n'>Margin</th>") + "<th></th></tr></thead><tbody>";
         for (const inv::Part& p : parts) {
             b += "<tr" + std::string(p.quantity() == 0 ? " class='low outrow'" : (p.isLowStock() ? " class='low'" : "")) + " data-id='" + num(p.id()) + "' data-pn='" + h(util::toLower(partLabel(p))) + "' data-min='" + num(p.minStock()) + "' data-gap='" + num(p.quantity() - p.minStock()) + "' data-name='" + h(util::toLower(p.name())) +
-                 "' data-cat='" + h(util::toLower(p.category())) + "' data-models='" + h(util::toLower(modelsKey(p))) + "' data-price='" + util::money(p.price()) + "' data-qty='" + num(p.quantity()) +
+                 "' data-cat='" + h(util::toLower(p.category())) + "' data-models='" + h(util::toLower(modelsKey(p))) + "' data-price='" + util::money(p.price()) + "' data-qty='" + num(p.quantity()) + "' data-ts='" + util::money(p.price() * p.quantity()) + "' data-tc='" + util::money(p.costPrice() * p.quantity()) +
+                 "' data-tp='" + util::money(p.costPrice() > 0 ? (p.price() - p.costPrice()) * p.quantity() : 0.0) +
                  "' data-low='" + (p.isLowStock() ? "1" : "0") + "'><td>" + h(partLabel(p)) + "</td><td>" + h(p.name()) + "</td><td>" + h(p.category()) +
                  "</td><td class='fits'>" + (p.modelList().empty() ? std::string("<span class='mut'>-</span>") : h(modelsText(p))) +
                  "</td><td class='n'>" + php(p.price()) + "</td><td class='n'>" + num(p.quantity()) + "</td><td class='n'>" + num(p.minStock()) + "</td><td>" +
                  statusTag(p) + "</td>" + sourcingCells(c, p) + "<td class='right' style='white-space:nowrap'>";
             const std::string id = "?id=" + num(p.id());
-            if (auth::allowed(c.role, P::Sell)) b += "<a class='btn sm' href='/invoice?part=" + util::urlEncode(partLabel(p)) + "'>Sell</a> ";
-            if (auth::allowed(c.role, P::AdjustStock) && !auth::allowed(c.role, P::EditPart)) b += "<a class='btn sm sec' href='/stock" + id + "'>Stock</a> ";
-            if (auth::allowed(c.role, P::EditPart)) b += "<a class='btn sm sec' href='/edit" + id + "'>Edit</a> ";
-            if (auth::allowed(c.role, P::DeletePart)) b += "<a class='btn sm danger' href='/delete" + id + "'>Delete</a>";
+            if (p.isOutOfStock()) b += "<span class='btn sm sec' style='opacity:.45;cursor:not-allowed' title='Out of stock - ordering is disabled' aria-disabled='true'>Sell</span> ";
+            else b += "<a class='btn sm' href='/invoice?part=" + util::urlEncode(partLabel(p)) + "'>Sell</a> ";
+            b += "<a class='btn sm sec' href='/edit" + id + "'>Edit</a> ";
+            b += "<a class='btn sm danger' href='/delete" + id + "'>Delete</a>";
             b += "</td></tr>";
         }
-        b += "</tbody></table></div>";
+        {   // totals for the whole stock (the browser re-adds them for just the rows left after a search / filter)
+            double tSell = 0, tCost = 0, tProfit = 0;
+            long long tUnits = 0;
+            for (const inv::Part& p : parts) {
+                tUnits += p.quantity();
+                tSell += p.price() * p.quantity();
+                tCost += p.costPrice() * p.quantity();
+                if (p.costPrice() > 0) tProfit += (p.price() - p.costPrice()) * p.quantity();
+            }
+            b += "</tbody><tfoot><tr class='totals'><td colspan='4'>TOTAL <span class='mut'>(parts shown)</span></td>"
+                 "<td class='n'><small class='mut'>Total selling price</small><br><span id='ftsell'>" + php(tSell) + "</span></td>"
+                 "<td class='n'><small class='mut'>Units</small><br><span id='ftqty'>" + num(tUnits) + "</span></td><td></td><td></td>"
+                 "<td class='n'><small class='mut'>Total purchase price</small><br><span id='ftcost'>" + php(tCost) + "</span></td>"
+                 "<td class='n'><small class='mut'>Total tubo (profit)</small><br><span id='ftprofit'>" + php(tProfit) + "</span></td><td></td></tr></tfoot></table></div>";
+        }
         html(c, layout(c, "Inventory", b));
     }
 
@@ -909,8 +940,7 @@ struct WebApp::Impl {
         return "<td class='n'>" + php(p.costPrice()) + "</td><td class='n'" + std::string(profit < 0 ? " style='color:#b42318;font-weight:700'" : "") + ">" +
                php(profit) + " <span class='mut'>(" + buf + ")</span></td>";
     }
-    std::string sourcingCells(Ctx& c, const inv::Part& p) const {   // Admin-only inventory columns: Supplier | Cost | Margin
-        if (!auth::allowed(c.role, auth::Permission::ViewReports)) return "";
+    std::string sourcingCells(Ctx&, const inv::Part& p) const {   // inventory columns: Purchase price | Margin
         return marginCells(p);
     }
     void suppliersPage(Ctx& c) {
@@ -933,7 +963,7 @@ struct WebApp::Impl {
                         "<div><label>Address</label><input name='address' maxlength='120' value='" + h(ed ? ed->address : "") + "'></div></div>"
                         "<label>Notes</label><input name='notes' maxlength='200' style='width:100%' value='" + h(ed ? ed->notes : "") + "'>"
                         "<p><button type='submit'>" + std::string(ed ? "Save changes" : "Add supplier") + "</button>" + (ed ? " <a class='btn sec' href='/suppliers'>Cancel</a>" : "") + "</p></form></div>";
-        b += "<div class='card'><h2>Parts by supplier</h2><table><thead><tr><th>Supplier</th><th>Contact</th><th>Phone</th><th class='n'>Parts</th><th class='n'>Stock value (at cost)</th>"
+        b += "<div class='card'><h2>Parts by supplier</h2><table><thead><tr><th>Supplier</th><th>Contact</th><th>Phone</th><th class='n'>Parts</th><th class='n'>Stock value (at purchase price)</th>"
              "<th class='n'>Avg margin</th><th>Status</th><th></th></tr></thead><tbody>";
         for (const sup::Supplier& s : suppliers.all()) {
             const St& x = st[s.id];
@@ -949,7 +979,7 @@ struct WebApp::Impl {
         if (suppliers.all().empty() && none == st.end()) b += "<tr><td colspan='8' class='mut'>No suppliers yet.</td></tr>";
         b += "</tbody></table></div>";
         if (const sup::Supplier* v = suppliers.find(viewId)) {
-            b += "<div class='card'><h2>" + h(v->name) + " &middot; parts supplied</h2><table><thead><tr><th>Part Number</th><th>Part Description</th><th class='n'>Stock</th><th class='n'>Retail</th><th class='n'>Cost</th><th class='n'>Profit (margin)</th></tr></thead><tbody>";
+            b += "<div class='card'><h2>" + h(v->name) + " &middot; parts supplied</h2><table><thead><tr><th>Part Number</th><th>Part Description</th><th class='n'>Stock</th><th class='n'>Selling Price</th><th class='n'>Purchase Price</th><th class='n'>Profit (margin)</th></tr></thead><tbody>";
             int shown = 0;
             for (const inv::Part& p : inv.parts()) {
                 if (p.supplierId() != v->id) continue;
@@ -957,7 +987,7 @@ struct WebApp::Impl {
                 b += "<tr><td>" + h(partLabel(p)) + "</td><td>" + h(p.name()) + "</td><td class='n'>" + num(p.quantity()) + "</td><td class='n'>" + php(p.price()) + "</td>" + marginCells(p) + "</tr>";
             }
             if (!shown) b += "<tr><td colspan='6' class='mut'>No parts are linked to this supplier yet. Pick the supplier in Edit part or when restocking.</td></tr>";
-            b += "</tbody></table></div><div class='card'><h2>Purchase history</h2><table><thead><tr><th>Date</th><th>Part</th><th class='n'>Qty</th><th class='n'>Unit cost</th><th class='n'>Total</th><th>Note</th><th>By</th></tr></thead><tbody>";
+            b += "</tbody></table></div><div class='card'><h2>Purchase history</h2><table><thead><tr><th>Date</th><th>Part</th><th class='n'>Qty</th><th class='n'>Purchase price</th><th class='n'>Total</th><th>Note</th><th>By</th></tr></thead><tbody>";
             int n = 0;
             const auto& all = purchases.all();
             for (auto it = all.rbegin(); it != all.rend() && n < 100; ++it) {
@@ -991,7 +1021,7 @@ struct WebApp::Impl {
         redirect(c, msgUrl("/suppliers", on ? "Supplier activated." : "Supplier deactivated (history kept).", true));
     }
 
-    // ------------------------------------------------------------------ stock: restock / adjust (Staff + Admin)
+    // ------------------------------------------------------------------ stock: restock / adjust
     void stockPage(Ctx& c) {
         const inv::Part* p = inv.find(intParam(c, "id", 1, inv::limits::kMaxId, 0));
         if (!p) return redirect(c, msgUrl("/", "Part not found.", false));
@@ -1001,8 +1031,8 @@ struct WebApp::Impl {
                         "<form method='post' action='/stock'>" + tokenField(c) + "<input type='hidden' name='id' value='" + id + "'><input type='hidden' name='action' value='restock'>"
                         "<label>Quantity received</label><input name='qty' type='number' min='1' required>"
                         "<label>Supplier (optional - recorded in the purchase history)</label>" + supplierSelect(p->supplierId()) +
-                        "<label>Unit cost paid (&#8369;, optional - used for expense reports)</label><input name='cost' type='number' step='0.01' min='0'>" +
-                        std::string(auth::allowed(c.role, auth::Permission::ViewReports) ? "<label class='inline'><input type='checkbox' name='setcost' value='1'> Use this as the part's cost price (for margin)</label>" : "") +
+                        "<label>Purchase price paid per unit (&#8369;, optional - used for expense reports)</label><input name='cost' type='number' step='0.01' min='0'>" +
+                        std::string("<label class='inline'><input type='checkbox' name='setcost' value='1'> Use this as the part's Purchase Price (Selling Price is then set to Purchase Price + 20%)</label>") +
                         "<label>Note (optional)</label><input name='note' maxlength='80'><p><button type='submit'>Add stock</button></p></form></div>"
                         "<div class='card'><h2>Adjust (count correction, damage, loss)</h2><form method='post' action='/stock'>" + tokenField(c) +
                         "<input type='hidden' name='id' value='" + id + "'><input type='hidden' name='action' value='adjust'>"
@@ -1020,7 +1050,7 @@ struct WebApp::Impl {
         if (c.param("action") == "restock") {
             double cost = 0;
             if (!util::trim(c.param("cost")).empty() && !util::parseDouble(c.param("cost"), 0, inv::limits::kMaxPrice, cost))
-                return redirect(c, msgUrl("/stock?id=" + num(id), "Unit cost is not a valid amount.", false));
+                return redirect(c, msgUrl("/stock?id=" + num(id), "Purchase price is not a valid amount.", false));
             r = inv.restock(id, static_cast<int>(qty), cost, c.user(), note);
             if (r.ok) {   // Phase 2: remember who we bought it from
                 const inv::Part* rp = inv.find(id);
@@ -1030,9 +1060,17 @@ struct WebApp::Impl {
                     sup::Purchase pu;
                     pu.timestamp = util::nowStamp(); pu.supplierId = sid; pu.partId = id; pu.qty = static_cast<int>(qty); pu.unitCost = cost; pu.ref = note; pu.user = c.user();
                     purchases.record(pu);
-                    const bool setCost = auth::allowed(c.role, auth::Permission::ViewReports) && c.param("setcost") == "1" && cost > 0;
-                    if (setCost || oldSid == 0) inv.setSourcing(id, sid, setCost ? std::optional<double>(cost) : std::nullopt, c.user());
+                    if (oldSid == 0) inv.setSourcing(id, sid, std::nullopt, c.user());
                     audit.record(c.user(), "PURCHASE", "Part " + num(id) + " x" + num(qty) + " from " + suppliers.nameOf(sid) + " @ " + util::money(cost), c.ip);
+                }
+                // "Use this as the Purchase Price": store it and set Selling Price = Purchase Price * 1.20 (works with or without a supplier).
+                if (c.param("setcost") == "1" && cost > 0 && rp) {
+                    const double oldPrice = rp->price(), oldCost = rp->costPrice();
+                    if (inv.setSourcing(id, inv.find(id)->supplierId(), cost, c.user()).ok) {
+                        const double newPrice = inv.find(id)->price();
+                        audit.record(c.user(), "PRICE_CHANGE", "Part " + num(id) + " " + rp->fullName() + ": purchase price " + util::money(oldCost) + " -> " + util::money(cost) +
+                                     ", selling price " + util::money(oldPrice) + " -> " + util::money(newPrice) + " (purchase price + 20%)", c.ip);
+                    }
                 }
             }
         } else {
@@ -1041,7 +1079,7 @@ struct WebApp::Impl {
         redirect(c, r.ok ? msgUrl("/", r.message, true) : msgUrl("/stock?id=" + num(id), r.message, false));
     }
 
-    // ------------------------------------------------------------------ add / edit / delete part (Admin)
+    // ------------------------------------------------------------------ add / edit / delete part
     std::string systemsDatalist() const {
         std::set<std::string> s(inv::standardSystems().begin(), inv::standardSystems().end());
         for (const inv::Part& p : inv.parts()) s.insert(p.category());
@@ -1066,21 +1104,21 @@ struct WebApp::Impl {
                         "<div><label>Part Number</label><input name='pn' maxlength='40' required placeholder='e.g. 22170434'><input type='hidden' name='id' value='" + num(nextFreeId()) + "'></div>"
                         "<div><label>Part Description</label><input name='name' maxlength='80' required></div>"
                         "<div><label>Vehicle system</label><input name='category' list='systems' required></div>"
-                        "<div><label>Price (&#8369;)</label><input name='price' type='number' step='0.01' min='0' required></div>"
+                        "<div><label>Purchase Price (&#8369;, what you pay to get the item)</label><input name='cost' id='buyprice' data-markup='1.2' data-target='sellprice' type='number' step='0.01' min='0.01' required></div>"
+                        "<div><label>Selling Price (&#8369;, automatic: Purchase Price + 20%)</label><input id='sellprice' type='number' step='0.01' value='' readonly tabindex='-1' placeholder='computed'></div>"
                         "<div><label>Opening stock</label><input name='qty' type='number' min='0' value='0' required></div>"
                         "<div><label>Minimum stock</label><input name='min' type='number' min='0' value='5' required></div></div>"
-                        "<div class='grid'><div><label>Supplier (optional)</label>" + supplierSelect(0) + "</div><div><label>Cost price (&#8369;, what you pay - optional)</label><input name='cost' type='number' step='0.01' min='0'></div></div>"
+                        "<div class='grid'><div><label>Supplier (optional)</label>" + supplierSelect(0) + "</div></div>"
                         "<label>Compatible vehicle models <span class='mut'>(optional, separate with commas)</span></label>"
                         "<input name='models' maxlength='300' style='width:100%' placeholder='Bajaj RE 4S, Bajaj RE Compact, Bajaj RE Maxima'>" + systemsDatalist() +
                         "<p><button type='submit'>Save part</button> <a class='btn sec' href='/'>Cancel</a></p></form></div>";
         html(c, layout(c, "Add part", b));
     }
     // Parses the shared part fields; returns "" or an error.
-    std::string readPart(Ctx& c, long long& id, std::string& name, std::string& cat, double& price, long long& qty, long long& mn, bool needIdQty) {
+    std::string readPart(Ctx& c, long long& id, std::string& name, std::string& cat, long long& qty, long long& mn, bool needIdQty) {
         name = util::trim(c.param("name")); cat = util::trim(c.param("category"));
         if (needIdQty && (!util::parseInt(c.param("id"), 1, inv::limits::kMaxId, id) || !util::parseInt(c.param("qty"), 0, inv::limits::kMaxQty, qty)))
             return "ID and opening stock must be whole numbers in range.";
-        if (!util::parseDouble(c.param("price"), 0, inv::limits::kMaxPrice, price)) return "Price must be a valid amount.";
         if (!util::parseInt(c.param("min"), 0, inv::limits::kMaxQty, mn)) return "Minimum stock must be a whole number.";
         return "";
     }
@@ -1088,30 +1126,35 @@ struct WebApp::Impl {
         long long id = 0, qty = 0, mn = 0;
         double price = 0;
         std::string name, cat;
-        std::string err = readPart(c, id, name, cat, price, qty, mn, true);
+        std::string err = readPart(c, id, name, cat, qty, mn, true);
+        // The selling price is computed from the purchase price (cost_price): selling_price = cost_price * 1.20.
+        double buy = 0;
+        if (err.empty()) {
+            if (!parseMoneyText(c.param("cost"), buy) || buy <= 0) err = "Purchase Price is required (the Selling Price is computed from it).";
+            else price = inv::sellingPriceFor(buy);
+        }
         if (err.empty() && c.req.has_param("pn") && util::trim(c.param("pn")).empty()) err = "Part number is required.";   // an old form without the field still works
         if (err.empty()) {
             inv::Part part(static_cast<int>(id), name, cat, price, static_cast<int>(qty), static_cast<int>(mn));
             part.setCompatibleModels(util::oneLine(util::trim(c.param("models"))));
             part.setPartNumber(util::oneLine(util::trim(c.param("pn"))));
             part.setSupplierId(readSupplierId(c, 0));
-            { double cv = 0; if (parseMoneyText(c.param("cost"), cv)) part.setCostPrice(cv); }
+            part.setCostPriceAndMarkup(buy);
             const inv::Result r = inv.addPart(part, c.user());
             if (r.ok) return redirect(c, msgUrl("/", "Part " + part.partNumber() + " added.", true));
             err = r.message;
         }
         redirect(c, msgUrl("/add", err, false));
     }
-    // Restock / Adjust cards, shown on the Edit page (Admin) so the Stock button can leave the row.
+    // Restock / Adjust cards, shown on the Edit page so the Stock button can leave the row.
     std::string stockCards(Ctx& c, const inv::Part& p) {
-        if (!auth::allowed(c.role, auth::Permission::AdjustStock)) return std::string();
         const std::string id = num(p.id());
         return "<div class='grid'><div class='card'><h2>Restock (stock arrives)</h2>"
                "<form method='post' action='/stock'>" + tokenField(c) + "<input type='hidden' name='id' value='" + id + "'><input type='hidden' name='action' value='restock'>"
                "<label>Quantity received</label><input name='qty' type='number' min='1' required>"
                "<label>Supplier (optional - recorded in the purchase history)</label>" + supplierSelect(p.supplierId()) +
-               "<label>Unit cost paid (&#8369;, optional - used for expense reports)</label><input name='cost' type='number' step='0.01' min='0'>" +
-               std::string(auth::allowed(c.role, auth::Permission::ViewReports) ? "<label class='inline'><input type='checkbox' name='setcost' value='1'> Use this as the part's cost price (for margin)</label>" : "") +
+               "<label>Purchase price paid per unit (&#8369;, optional - used for expense reports)</label><input name='cost' type='number' step='0.01' min='0'>" +
+               std::string("<label class='inline'><input type='checkbox' name='setcost' value='1'> Use this as the part's Purchase Price (Selling Price is then set to Purchase Price + 20%)</label>") +
                "<label>Note (optional)</label><input name='note' maxlength='80'><p><button type='submit'>Add stock</button></p></form></div>"
                "<div class='card'><h2>Adjust (count correction, damage, loss)</h2><form method='post' action='/stock'>" + tokenField(c) +
                "<input type='hidden' name='id' value='" + id + "'><input type='hidden' name='action' value='adjust'>"
@@ -1124,9 +1167,9 @@ struct WebApp::Impl {
         std::string b = "<h1>Edit part " + h(partLabel(*p)) + "</h1><div class='card'><form method='post' action='/edit'>" + tokenField(c) +
                         "<input type='hidden' name='id' value='" + num(p->id()) + "'><div class='grid'><div><label>Part Number</label><input name='pn' maxlength='40' value='" + h(p->partNumber()) + "' required></div><div><label>Part Description</label><input name='name' maxlength='80' value='" + h(p->name()) + "' required></div>"
                         "<div><label>Vehicle system</label><input name='category' list='systems' value='" + h(p->category()) + "' required></div>"
-                        "<div><label>Price (&#8369;)</label><input name='price' type='number' step='0.01' min='0' value='" + util::money(p->price()) + "' required></div>"
+                        "<div><label>Selling Price (&#8369;, automatic: Purchase Price + 20%)</label><input id='sellprice' type='number' step='0.01' value='" + util::money(p->price()) + "' readonly tabindex='-1'></div>"
                         "<div><label>Minimum stock</label><input name='min' type='number' min='0' value='" + num(p->minStock()) + "' required></div></div>"
-                        "<div class='grid'><div><label>Supplier</label>" + supplierSelect(p->supplierId()) + "</div><div><label>Cost price (&#8369;, what you pay the supplier)</label><input name='cost' type='number' step='0.01' min='0' value='" + (p->costPrice() > 0 ? util::money(p->costPrice()) : std::string()) + "'></div></div>"
+                        "<div class='grid'><div><label>Supplier</label>" + supplierSelect(p->supplierId()) + "</div><div><label>Purchase Price (&#8369;, what you pay to get the item)</label><input name='cost' id='buyprice' data-markup='1.2' data-target='sellprice' type='number' step='0.01' min='0' value='" + (p->costPrice() > 0 ? util::money(p->costPrice()) : std::string()) + "'></div></div>"
                         "<label>Compatible vehicle models <span class='mut'>(separate with commas)</span></label>"
                         "<input name='models' maxlength='300' style='width:100%' value='" + h(p->compatibleModels()) + "' placeholder='Bajaj RE 4S, Bajaj RE Compact, Bajaj RE Maxima'>" + systemsDatalist() +
                         "<p class='mut'>Current stock is " + num(p->quantity()) + ". Change it with <b>Restock / Adjust</b> below so the movement is logged.</p>"
@@ -1142,7 +1185,8 @@ struct WebApp::Impl {
         long long dummy = 0, mn = 0;
         double price = 0;
         std::string name, cat;
-        std::string err = readPart(c, dummy, name, cat, price, dummy, mn, false);
+        std::string err = readPart(c, dummy, name, cat, dummy, mn, false);
+        price = oldPrice;   // the selling price cannot be typed: it only changes when the purchase price changes (below)
         if (err.empty()) {
             std::optional<std::string> models;   // a request without the field (old form) leaves the models alone
             if (c.req.has_param("models")) models = c.param("models");
@@ -1152,7 +1196,7 @@ struct WebApp::Impl {
             if (r.ok) {
                 if (models && inv.find(id) && inv.find(id)->compatibleModels() != oldModels)
                     audit.record(c.user(), "PART_MODELS_CHANGED", "Part " + num(id) + " " + oldName + ": [" + oldModels + "] -> [" + inv.find(id)->compatibleModels() + "]", c.ip);
-                if (c.req.has_param("supplier") || c.req.has_param("cost")) {   // Phase 2: supplier + cost price
+                if (c.req.has_param("supplier") || c.req.has_param("cost")) {   // Phase 2: supplier + purchase price
                     const inv::Part* np = inv.find(id);
                     const int oldSid = np ? np->supplierId() : 0;
                     const double oldCost = np ? np->costPrice() : 0.0;
@@ -1167,8 +1211,8 @@ struct WebApp::Impl {
                         audit.record(c.user(), "PART_SOURCING_CHANGED", "Part " + num(id) + " " + oldName + ": supplier " + suppliers.nameOf(oldSid) + " -> " + suppliers.nameOf(sid) +
                                      ", cost " + util::money(oldCost) + " -> " + util::money(newCost ? *newCost : oldCost), c.ip);
                 }
-                if (price != oldPrice)
-                    audit.record(c.user(), "PRICE_CHANGE", "Part " + num(id) + " " + oldName + ": " + util::money(oldPrice) + " -> " + util::money(price), c.ip);
+                if (const inv::Part* after = inv.find(id); after && after->price() != oldPrice)
+                    audit.record(c.user(), "PRICE_CHANGE", "Part " + num(id) + " " + oldName + ": selling price " + util::money(oldPrice) + " -> " + util::money(after->price()) + " (purchase price + 20%)", c.ip);
                 return redirect(c, msgUrl("/", "Part " + partLabelById(id) + " updated.", true));
             }
             err = r.message;
@@ -1194,14 +1238,7 @@ struct WebApp::Impl {
     }
 
     // ------------------------------------------------------------------ Phase 3: customers & vehicles
-    // "Juan Dela Cruz - 0917 123 4567 [CUST-0007]": the phone and the customer ID tell namesakes apart on the sale form.
-    static std::string customerLabel(const crm::Customer& k) { return (k.phone.empty() ? k.name : k.name + " - " + k.phone) + " [" + crm::customerCode(k.id) + "]"; }
-    // Phone as stored + a Mobile / Landline tag worked out from the number itself.
-    static std::string phoneCell(const std::string& phone) {
-        if (phone.empty()) return "<span class='mut'>-</span>";
-        const crm::PhoneInfo p = crm::parsePhone(phone);
-        return h(phone) + (p.error.empty() ? " <span class='tag stf'>" + std::string(crm::phoneKindName(p.kind)) + "</span>" : " <span class='tag low' title='Edit the customer to fix this number'>Check number</span>");
-    }
+    static std::string customerLabel(const crm::Customer& k) { return k.phone.empty() ? k.name : k.name + " - " + k.phone; }
     std::string vehicleLabel(const crm::Vehicle& v) const {
         const crm::Customer* o = people.findCustomer(v.customerId);
         return v.plate + (v.model.empty() ? "" : " - " + v.model) + (o ? " (" + o->name + ")" : "");
@@ -1209,6 +1246,18 @@ struct WebApp::Impl {
     // Red dot beside a customer who still owes the shop money (hover shows how much).
     static std::string owesDot(double owed) {
         return owed > 0 ? "<span role='img' aria-label='Has unpaid balance' title='Still owes " + php(owed) + "' style='display:inline-block;width:.7rem;height:.7rem;border-radius:50%;background:#dc2626;margin-right:.45rem;vertical-align:middle;box-shadow:0 0 0 3px rgba(220,38,38,.2)'></span>" : std::string();
+    }
+    // "Cellphone" / "Landline" / "Invalid" label shown beside a phone number.
+    static std::string phoneTag(const std::string& phone) {
+        const crm::PhoneKind k = crm::classifyPhone(phone);
+        if (k == crm::PhoneKind::None) return "";
+        return std::string(" <span class='tag") + (k == crm::PhoneKind::Invalid ? " out" : "") + "'>" + crm::phoneKindLabel(k) + "</span>";
+    }
+    // What this customer still owes (0 when nothing / unknown).
+    double owedBy(int customerId) const {
+        const auto balances = crm::balancesByCustomer(inv.invoices().all(), people);
+        auto bi = balances.find(customerId);
+        return bi == balances.end() ? 0.0 : bi->second.balance;
     }
     static std::string archivedTag(bool a) { return a ? " <span class='tag out'>Archived</span>" : ""; }
     static std::string val(Ctx& c, const char* name, const std::string& dflt) { return c.req.has_param(name) ? c.param(name) : dflt; }
@@ -1226,7 +1275,7 @@ struct WebApp::Impl {
         const auto m = people.findByName(name);
         return m.size() == 1 ? idLink("/customer", m[0]->id, h(name)) : h(name);
     }
-    static std::string historyTable(const std::vector<crm::HistoryRow>& rows, const crm::Registry& reg, bool showVehicle, bool canPay) {
+    static std::string historyTable(const std::vector<crm::HistoryRow>& rows, const crm::Registry& reg, bool showVehicle) {
         std::string b = "<div class='card'><table><thead><tr><th>Date</th><th>Invoice</th>" + std::string(showVehicle ? "<th>Vehicle</th>" : "") +
                         "<th>Items</th><th class='n'>Total</th><th class='n'>Balance</th><th>Status</th><th></th></tr></thead><tbody>";
         for (const crm::HistoryRow& r : rows) {
@@ -1234,14 +1283,14 @@ struct WebApp::Impl {
             b += "<tr><td>" + h(r.timestamp) + "</td><td>" + h(r.ref) + (r.linked ? "" : " <span class='mut' title='Old invoice typed as free text; matched to this customer by name'>(by name)</span>") + "</td>" +
                  (showVehicle ? "<td>" + (v ? idLink("/vehicle", v->id, h(v->plate)) : std::string("<span class='mut'>-</span>")) + "</td>" : std::string()) +
                  "<td>" + h(r.summary) + "</td><td class='n'>" + php(r.total) + "</td><td class='n'>" + (r.balance > 0 ? "<b class='minus'>" + php(r.balance) + "</b>" : php(0)) + "</td><td>" + statusTag(r.status) +
-                 "</td><td class='right'>" + (canPay && r.balance > 0 ? "<a class='btn sm' href='/payment?no=" + util::urlEncode(r.ref) + "'>Record payment</a> " : std::string()) +
+                 "</td><td class='right'>" + (r.balance > 0 ? "<a class='btn sm' href='/payment?no=" + util::urlEncode(r.ref) + "'>Record payment</a> " : std::string()) +
                  "<a class='btn sm sec' href='/invoice?no=" + util::urlEncode(r.ref) + "'>View</a></td></tr>";
         }
         if (rows.empty()) b += "<tr><td colspan='" + std::string(showVehicle ? "8" : "7") + "' class='mut'>No invoices yet.</td></tr>";
         return b + "</tbody></table></div>";
     }
 
-    // Turns what the cashier typed / picked on the New sale form into (name, customer id, vehicle id). "" = ok, otherwise the reason.
+    // Turns what was typed / picked on the New sale form into (name, customer id, vehicle id). "" = ok, otherwise the reason.
     // Typed free text that matches no customer record stays free text exactly as before (id 0). Hidden ids only disambiguate the text.
     std::string resolveParty(Ctx& c, std::string& name, int& cid, int& vid) const {
         name.clear(); cid = vid = 0;
@@ -1253,21 +1302,12 @@ struct WebApp::Impl {
             if (util::parseInt(c.param("customer_id"), 1, 999999, idv))
                 if (const crm::Customer* x = people.findCustomer(static_cast<int>(idv)))
                     if (util::equalsIgnoreCase(ctext, customerLabel(*x)) || util::equalsIgnoreCase(ctext, x->name)) k = x;
-            long long codeId = 0;
-            if (!k && crm::parseCustomerCode(ctext, codeId)) {   // the cashier typed a customer ID such as CUST-0007
-                k = people.findCustomer(static_cast<int>(codeId));
-                if (!k) return "No customer has the ID " + crm::customerCode(static_cast<int>(codeId)) + ".";
-            }
             if (!k) {
                 std::vector<const crm::Customer*> hits;
                 for (const crm::Customer& x : people.customers()) if (util::equalsIgnoreCase(ctext, customerLabel(x))) hits.push_back(&x);
                 if (hits.empty()) hits = people.findByName(ctext);
-                if (hits.size() > 1) return "More than one customer is called \"" + ctext + "\" - pick one from the suggestions (they show the phone number and customer ID) or type the customer ID, e.g. " + crm::customerCode(hits[0]->id) + ".";
+                if (hits.size() > 1) return "More than one customer is called \"" + ctext + "\" - pick one from the suggestions (they show the phone number).";
                 if (hits.size() == 1) k = hits[0];
-            }
-            if (!k) {   // free text that is not a saved customer must still be a name, not a number
-                const std::string bad = crm::checkPersonName(ctext);
-                if (!bad.empty()) return bad + " Pick a saved customer from the list or type just the name.";
             }
         }
         if (!vtext.empty()) {
@@ -1299,18 +1339,24 @@ struct WebApp::Impl {
     void customersPage(Ctx& c) {
         const std::string q = util::trim(c.param("q"));
         const bool showArchived = c.param("archived") == "1";
+        const bool onlyOwing = c.param("owing") == "1";   // utang filter: only customers who still owe money
         const auto& all = inv.invoices().all();
         const auto balances = crm::balancesByCustomer(all, people);
         std::vector<crm::SearchHit> hits;
         size_t hiddenArchived = 0;
+        double owingTotal = 0.0;
         for (crm::SearchHit& hit : people.search(q)) {
             if (hit.customer->archived && !showArchived) { ++hiddenArchived; continue; }
+            auto bal = balances.find(hit.customer->id);
+            const double owedNow = bal == balances.end() ? 0.0 : bal->second.balance;
+            if (onlyOwing) { if (owedNow <= 0) continue; owingTotal += owedNow; }
             hits.push_back(std::move(hit));
         }
-        std::string b = "<h1>Customers</h1><div class='card'><form class='bar' method='get' action='/customers'><input id='cq' name='q' type='search' autocomplete='off' autofocus placeholder='Search by name, phone, plate number or customer ID (CUST-0001)' value='" + h(q) +
-                        "'><label class='inline'><input type='checkbox' name='archived' value='1'" + std::string(showArchived ? " checked" : "") + "> Show archived</label><button type='submit'>Search</button>"
+        std::string b = "<h1>Customers</h1><div class='card'><form class='bar' method='get' action='/customers'><input id='cq' name='q' type='search' autocomplete='off' autofocus placeholder='Search by name, phone or plate number' value='" + h(q) +
+                        "'><label class='inline'><input type='checkbox' name='archived' value='1'" + std::string(showArchived ? " checked" : "") + "> Show archived</label>"
+                        "<label class='inline'><input type='checkbox' name='owing' value='1'" + std::string(onlyOwing ? " checked" : "") + "> Utang only</label><button type='submit'>Search</button>"
                         "<a class='btn sec' href='/customers'>Clear</a><span class='grow'></span><a class='btn' href='/customer/edit'>+ Add customer</a></form>"
-                        "<table><thead><tr><th>ID</th><th>Customer</th><th>Phone</th><th>Vehicles</th><th class='n'>Outstanding balance</th><th></th></tr></thead><tbody>";
+                        "<table><thead><tr><th>Customer</th><th>Phone</th><th>Vehicles</th><th class='n'>Outstanding balance</th><th></th></tr></thead><tbody>";
         for (const crm::SearchHit& hit : hits) {
             const crm::Customer& k = *hit.customer;
             std::string plates;
@@ -1320,12 +1366,13 @@ struct WebApp::Impl {
             }
             auto bi = balances.find(k.id);
             const double owed = bi == balances.end() ? 0.0 : bi->second.balance;
-            b += "<tr><td><span class='mut'>" + crm::customerCode(k.id) + "</span></td><td>" + owesDot(owed) + idLink("/customer", k.id, "<b>" + h(k.name) + "</b>") + archivedTag(k.archived) + (!hit.plateMatches.empty() ? " <span class='mut'>plate match</span>" : "") + "</td><td>" + phoneCell(k.phone) + "</td><td>" +
+            b += "<tr><td>" + owesDot(owed) + idLink("/customer", k.id, "<b>" + h(k.name) + "</b>") + archivedTag(k.archived) + (!hit.plateMatches.empty() ? " <span class='mut'>plate match</span>" : "") + "</td><td>" + h(k.phone) + phoneTag(k.phone) + "</td><td>" +
                  (plates.empty() ? "<span class='mut'>none</span>" : plates) + "</td><td class='n'>" + (owed > 0 ? "<b class='minus'>" + php(owed) + "</b>" : php(0)) +
                  "</td><td class='right'><a class='btn sm sec' href='/customer?id=" + num(k.id) + "'>Open</a></td></tr>";
         }
-        if (hits.empty()) b += "<tr><td colspan='6' class='mut'>" + std::string(q.empty() ? "No customers yet - add the first one." : "Nobody matches \"" + h(q) + "\".") + "</td></tr>";
+        if (hits.empty()) b += "<tr><td colspan='5' class='mut'>" + std::string(onlyOwing ? "Nobody owes the shop money right now (no utang)." : q.empty() ? "No customers yet - add the first one." : "Nobody matches \"" + h(q) + "\".") + "</td></tr>";
         b += "</tbody></table>";
+        if (onlyOwing && !hits.empty()) b += "<p><b>" + num(static_cast<long long>(hits.size())) + "</b> customer(s) with utang - total owed <b class='minus'>" + php(owingTotal) + "</b></p>";
         if (hiddenArchived) b += "<p class='mut'>" + num(static_cast<long long>(hiddenArchived)) + " archived customer(s) also match - tick <i>Show archived</i> to see them.</p>";
         html(c, layout(c, "Customers", b + "</div>"));
     }
@@ -1337,17 +1384,15 @@ struct WebApp::Impl {
         const auto hist = crm::customerHistory(all, people, *k);
         const crm::Balance bal = crm::customerBalance(all, people, *k);
         const auto cars = people.vehiclesOf(k->id);
-        const bool admin = auth::allowed(c.role, auth::Permission::ArchiveCustomers);
-        const bool canPay = auth::allowed(c.role, auth::Permission::Receivables);
         const bool hasHist = crm::customerHasHistory(all, k->id);
-        std::string b = "<p><a href='/customers'>&larr; All customers</a></p><h1>" + owesDot(bal.balance) + h(k->name) + archivedTag(k->archived) + " <span class='tag stf' title='Unique customer ID'>" + crm::customerCode(k->id) + "</span></h1>"
+        std::string b = "<p><a href='/customers'>&larr; All customers</a></p><h1>" + owesDot(bal.balance) + h(k->name) + archivedTag(k->archived) + "</h1>"
                         "<div class='stats'><div class='stat" + std::string(bal.balance > 0 ? " warn" : "") + "'><span>Outstanding balance</span><b>" + php(bal.balance) + "</b></div>"
                         "<div class='stat'><span>Open invoices</span><b>" + num(bal.openInvoices) + "</b></div><div class='stat'><span>Invoices</span><b>" + num(static_cast<long long>(hist.size())) + "</b></div>"
                         "<div class='stat'><span>Vehicles</span><b>" + num(static_cast<long long>(cars.size())) + "</b></div></div>"
-                        "<div class='card'><h2>Customer info</h2><table class='kv'><tr><td>Customer ID</td><td><b>" + crm::customerCode(k->id) + "</b></td></tr><tr><td>Phone</td><td>" + phoneCell(k->phone) + "</td></tr><tr><td>Address</td><td>" + h(k->address) + "</td></tr><tr><td>Notes</td><td>" + h(k->notes) + "</td></tr></table><p>";
+                        "<div class='card'><h2>Customer info</h2><table class='kv'><tr><td>Phone</td><td>" + h(k->phone) + phoneTag(k->phone) + "</td></tr><tr><td>Address</td><td>" + h(k->address) + "</td></tr><tr><td>Notes</td><td>" + h(k->notes) + "</td></tr></table><p>";
         b += "<a class='btn' href='/customer/edit?id=" + num(k->id) + "'>Edit customer</a> ";
         if (!k->archived) b += "<a class='btn' href='/invoice?customer=" + util::urlEncode(customerLabel(*k)) + "'>New sale</a> <a class='btn sec' href='/vehicle/edit?customer=" + num(k->id) + "'>+ Add vehicle</a> ";
-        if (admin) {
+        {
             b += "<form class='inline' method='post' action='/customer/archive' data-confirm='" + h(k->archived ? "Restore this customer?" : "Archive this customer? They stay in all history but disappear from the sale form.") + "'>" + tokenField(c) +
                  "<input type='hidden' name='id' value='" + num(k->id) + "'><input type='hidden' name='on' value='" + (k->archived ? "0" : "1") + "'><button class='sec' type='submit'>" + (k->archived ? "Restore" : "Archive") + "</button></form> ";
             if (!hasHist && cars.empty())
@@ -1361,19 +1406,21 @@ struct WebApp::Impl {
                  "</td><td class='n'>" + num(n) + "</td><td class='right'><a class='btn sm' href='/vehicle?id=" + num(v->id) + "'>History</a> <a class='btn sm sec' href='/vehicle/edit?id=" + num(v->id) + "'>Edit</a></td></tr>";
         }
         if (cars.empty()) b += "<tr><td colspan='7' class='mut'>No vehicles recorded.</td></tr>";
-        b += "</tbody></table></div><h2>Invoice history</h2>" + historyTable(hist, people, true, canPay);
+        b += "</tbody></table></div><h2>Invoice history</h2>" + historyTable(hist, people, true);
         html(c, layout(c, k->name, b));
     }
 
     void customerEditPage(Ctx& c) {
         const crm::Customer* k = nullptr;
         if (!c.param("id").empty() && !(k = customerParam(c))) return redirect(c, msgUrl("/customers", "Customer not found.", false));
+        const double owes = k ? owedBy(k->id) : 0.0;   // utang: address + contact number become required
         std::string b = "<h1>" + std::string(k ? "Edit customer" : "Add customer") + "</h1><div class='card'><form method='post' action='/customer/save'>" + tokenField(c) +
+                        (owes > 0 ? "<p class='flash err'>This customer still owes " + php(owes) + " (utang). A valid address and a cellphone / landline number are required.</p>" : std::string()) +
                         "<input type='hidden' name='id' value='" + (k ? num(k->id) : "0") + "'><input type='hidden' name='from' value='" + h(c.param("from")) + "'>"
-                        "<p class='mut'>" + (k ? "Customer ID: <b>" + crm::customerCode(k->id) + "</b>" : std::string("A unique customer ID is given automatically when you save.")) + "</p>"
-                        "<label>Name (required - letters only, no numbers)</label><input name='name' maxlength='60' required autofocus data-person='1' pattern='[^0-9]+' title='Letters only - numbers are not allowed in a name' value='" + h(val(c, "name", k ? k->name : "")) + "'><div id='name-hint' class='mut'></div>"
-                        "<label>Phone (mobile or landline)</label><input name='phone' maxlength='30' inputmode='tel' data-phone='1' placeholder='0917 123 4567  or  (02) 8123 4567' value='" + h(val(c, "phone", k ? k->phone : "")) + "'><div id='phone-hint' class='mut'></div>"
-                        "<label>Address</label><input name='address' maxlength='120' value='" + h(val(c, "address", k ? k->address : "")) + "'>"
+                        "<label>Name (required)</label><input name='name' maxlength='60' required autofocus pattern='[^0-9]*' data-no-digits title='Letters only - numbers are not allowed in a name.' value='" + h(val(c, "name", k ? k->name : "")) + "'>"
+                        "<label>Phone" + std::string(owes > 0 ? " (required)" : "") + " <span id='phoneKind' class='tag' hidden></span></label><input name='phone' data-phone-kind='phoneKind' maxlength='11' inputmode='numeric' pattern='[0-9]{7,11}'" + std::string(owes > 0 ? " required" : "") +
+                        " title='Digits only. Cellphone: 11 digits starting with 09 (09171234567). Landline: area code + number (0288123456) or 7-8 digit local number.' placeholder='09171234567' value='" + h(val(c, "phone", k ? k->phone : "")) + "'>"
+                        "<label>Address" + std::string(owes > 0 ? " (required)" : "") + "</label><input name='address' maxlength='120'" + std::string(owes > 0 ? " required" : "") + " value='" + h(val(c, "address", k ? k->address : "")) + "'>"
                         "<label>Notes</label><input name='notes' maxlength='200' value='" + h(val(c, "notes", k ? k->notes : "")) + "'>"
                         "<p><button type='submit'>Save customer</button> <a class='btn sec' href='" + (k ? "/customer?id=" + num(k->id) : std::string("/customers")) + "'>Cancel</a></p></form></div>";
         html(c, layout(c, k ? "Edit customer" : "Add customer", b));
@@ -1387,7 +1434,8 @@ struct WebApp::Impl {
         crm::Customer in;
         in.name = c.param("name"); in.phone = c.param("phone"); in.address = c.param("address"); in.notes = c.param("notes");
         int newId = 0;
-        const std::string err = people.saveCustomer(adding ? 0 : static_cast<int>(idv), in, newId);
+        const bool hasCredit = old && owedBy(old->id) > 0;   // customer with utang: valid address + phone are mandatory
+        const std::string err = people.saveCustomer(adding ? 0 : static_cast<int>(idv), in, newId, hasCredit);
         if (!err.empty()) {
             const std::string back = "/customer/edit?id=" + (adding ? std::string() : num(idv)) + "&from=" + util::urlEncode(c.param("from")) + "&name=" + util::urlEncode(c.param("name")) + "&phone=" + util::urlEncode(c.param("phone")) +
                                      "&address=" + util::urlEncode(c.param("address")) + "&notes=" + util::urlEncode(c.param("notes"));
@@ -1430,7 +1478,6 @@ struct WebApp::Impl {
         const auto hist = crm::vehicleHistory(all, v->id);   // Phase 4: job orders get merged into this list
         double spent = 0, owed = 0;
         for (const crm::HistoryRow& r : hist) { spent = util::round2(spent + r.total); owed = util::round2(owed + r.balance); }
-        const bool admin = auth::allowed(c.role, auth::Permission::ArchiveCustomers);
         std::string b = "<p>" + std::string(owner ? idLink("/customer", owner->id, "&larr; " + h(owner->name)) : std::string("<a href='/customers'>&larr; Customers</a>")) + "</p><h1>" + h(v->plate) + archivedTag(v->archived) + "</h1>"
                         "<div class='stats'><div class='stat'><span>Invoices</span><b>" + num(static_cast<long long>(hist.size())) + "</b></div><div class='stat'><span>Total billed</span><b>" + php(spent) + "</b></div>"
                         "<div class='stat" + std::string(owed > 0 ? " warn" : "") + "'><span>Unpaid</span><b>" + php(owed) + "</b></div></div>"
@@ -1438,13 +1485,13 @@ struct WebApp::Impl {
                         "<tr><td>Year</td><td>" + (v->year ? num(v->year) : std::string()) + "</td></tr><tr><td>Color</td><td>" + h(v->color) + "</td></tr><tr><td>Notes</td><td>" + h(v->notes) + "</td></tr></table><p>"
                         "<a class='btn' href='/vehicle/edit?id=" + num(v->id) + "'>Edit vehicle</a> ";
         if (!v->archived && owner && !owner->archived) b += "<a class='btn' href='/invoice?customer=" + util::urlEncode(customerLabel(*owner)) + "&vehicle=" + util::urlEncode(v->plate) + "'>New sale</a> ";
-        if (admin) {
+        {
             b += "<form class='inline' method='post' action='/vehicle/archive' data-confirm='" + h(v->archived ? "Restore this vehicle?" : "Archive this vehicle? Its history stays.") + "'>" + tokenField(c) +
                  "<input type='hidden' name='id' value='" + num(v->id) + "'><input type='hidden' name='on' value='" + (v->archived ? "0" : "1") + "'><button class='sec' type='submit'>" + (v->archived ? "Restore" : "Archive") + "</button></form> ";
             if (hist.empty())
                 b += "<form class='inline' method='post' action='/vehicle/delete' data-confirm='Delete this vehicle permanently? (It has no history.)'>" + tokenField(c) + "<input type='hidden' name='id' value='" + num(v->id) + "'><button class='danger' type='submit'>Delete</button></form>";
         }
-        b += "</p></div><h2>History (newest first)</h2>" + historyTable(hist, people, false, auth::allowed(c.role, auth::Permission::Receivables));
+        b += "</p></div><h2>History (newest first)</h2>" + historyTable(hist, people, false);
         html(c, layout(c, v->plate, b));
     }
 
@@ -1524,7 +1571,7 @@ struct WebApp::Impl {
                         "<label>Vehicle plate <span class='mut'>(optional - pick one of the customer's saved vehicles)</span></label><input id='veh-in' name='vehicle' list='vehs' maxlength='120' autocomplete='off' placeholder='e.g. ABC 1234' value='" + h(c.param("vehicle")) + "'>"
                         "<input type='hidden' id='veh-id' name='vehicle_id' value=''>" + vehiclesDatalist() +
                         "<p class='mut'><a href='/customer/edit?from=sale'>+ New customer</a> &middot; <a href='/customers'>Find a customer / plate</a></p>" +
-                        "<h2>Parts <span class='mut'>(type or pick a part ID - the catalogue price is applied)</span></h2><table><thead><tr><th>Part number</th><th>Quantity</th><th class='n'>Price</th><th class='n'>Amount</th></tr></thead><tbody id='part-rows'>";
+                        "<h2>Parts <span class='mut'>(type or pick a part ID - the Selling Price is applied)</span></h2><table><thead><tr><th>Part number</th><th>Quantity</th><th class='n'>Selling Price</th><th class='n'>Amount</th></tr></thead><tbody id='part-rows'>";
         const std::string pre = c.param("part");
         int shownRows = kStartPartRows;   // rows beyond the first 8 are kept if a failed submit sent them back
         for (int i = kStartPartRows + 1; i <= kPartRows; ++i)
@@ -1537,7 +1584,7 @@ struct WebApp::Impl {
         }
         b += "</tbody></table><p class='right'><b>Parts total: <span id='parts-total'>&#8369;0.00</span></b></p><p><button type='button' class='sec' id='add-part-row' data-max='" + num(kPartRows) + "'>+ Add 5 more rows</button></p><datalist id='plist'>";
         for (const inv::Part& p : inv.parts())
-            b += "<option value='" + h(partLabel(p)) + "' data-id='" + num(p.id()) + "' data-price='" + util::money(p.price()) + "'>" + h(p.fullName()) + " - &#8369;" + util::moneyFmt(p.price()) + " (" + num(p.quantity()) + " in stock)</option>";
+            b += "<option value='" + h(partLabel(p)) + "' data-id='" + num(p.id()) + "' data-price='" + util::money(p.price()) + "' data-stock='" + num(p.quantity()) + "'>" + h(p.fullName()) + " - &#8369;" + util::moneyFmt(p.price()) + (p.isOutOfStock() ? " (OUT OF STOCK)" : " (" + num(p.quantity()) + " in stock)") + "</option>";
         b += "</datalist><h2>Services <span class='mut'>(labour, repairs - optional)</span></h2><table><thead><tr><th>Description</th><th>Price (&#8369;)</th></tr></thead><tbody id='svc-rows'>";
         for (int i = 1; i <= kSvcRows; ++i)
             b += "<tr><td><input name='s_desc_" + num(i) + "' maxlength='100' value='" + h(c.param("s_desc_" + num(i))) + "'></td>" +
@@ -1597,15 +1644,20 @@ struct WebApp::Impl {
         const bool onCredit = c.param("pay_type") == "credit";
         if (onCredit && partyName.empty()) return back("A credit sale needs a customer name - type one or pick a saved customer.");
         if (onCredit && util::trim(c.param("amount_paid")).empty()) paid = 0.0;
-        // A credit sale to a typed name with no customer record yet: save the person as a customer first.
+        // Utang rule: a credit sale needs a SAVED customer with a valid address and a valid cellphone / landline number.
         int autoCustomer = 0;
-        if (onCredit && partyCustomer == 0 && !util::equalsIgnoreCase(partyName, "Walk-in customer")) {
-            crm::Customer nk;
-            nk.name = partyName; nk.notes = "Auto-added from a credit sale";
-            int nid = 0;
-            if (people.saveCustomer(0, nk, nid).empty()) {
-                if (const crm::Customer* made = people.findCustomer(nid)) { partyName = made->name; partyCustomer = nid; autoCustomer = nid; }
-            }
+        double expectedTotal = 0.0;   // catalogue prices, the same ones checkout() will use
+        for (const inv::InvoiceLine& l : lines) {
+            const inv::Part* lp = l.kind == inv::InvoiceLine::Kind::Part ? inv.find(l.partId) : nullptr;
+            expectedTotal += lp ? l.qty * lp->price() : l.total();
+        }
+        const bool leavesBalance = onCredit || (paid >= 0 && util::round2(paid) < util::round2(expectedTotal));   // any unpaid part = utang
+        // Applies to explicit credit sales and to any saved customer who is left owing (a typed free-text name with a part payment is unchanged).
+        if ((onCredit && !partyName.empty() && !util::equalsIgnoreCase(partyName, "Walk-in customer")) || (leavesBalance && partyCustomer != 0)) {
+            const crm::Customer* ck = partyCustomer ? people.findCustomer(partyCustomer) : nullptr;
+            if (!ck) return back("A credit (utang) sale needs a saved customer with a valid address and contact number. Add the customer first (Customers > + Add customer), then pick them here.");
+            if (const std::string ce = crm::contactProblem(ck->phone, ck->address); !ce.empty())
+                return back(ck->name + ": " + ce + " Open the customer, fix it (Edit), then record the credit sale again.");
         }
         const inv::CheckoutResult r = inv.checkout(partyName, lines, c.user(), paid, c.param("method").empty() ? "Cash" : c.param("method"), partyCustomer, partyVehicle, recvBy);
         if (!r.ok) {
@@ -1630,7 +1682,7 @@ struct WebApp::Impl {
         if (rv) vehicleLine = "<br><b>Vehicle:</b> " + h(rv->plate) + (rv->model.empty() ? "" : " - " + h(rv->model)) + (rv->year ? " (" + num(rv->year) + ")" : "");
         std::string b = "<p class='noprint'><button data-print>&#128424; Print receipt</button> <a class='btn sec' href='/invoice'>New sale</a> <a class='btn sec' href='/invoices'>All invoices</a>" +
                         (rk ? " <a class='btn sec' href='/customer?id=" + num(rk->id) + "'>Customer record</a>" : std::string()) + (rv ? " <a class='btn sec' href='/vehicle?id=" + num(rv->id) + "'>Vehicle history</a>" : std::string()) +
-                        (v->balance() > 0 && auth::allowed(c.role, auth::Permission::Receivables) ? " <a class='btn' href='/payment?no=" + util::urlEncode(v->number) + "'>Record payment</a>" : std::string()) + "</p>"
+                        (v->balance() > 0 ? " <a class='btn' href='/payment?no=" + util::urlEncode(v->number) + "'>Record payment</a>" : std::string()) + "</p>"
                         "<div class='receipt'><img class='doc-logo' src='/static/logo.png' alt=''><h1>" + h(cfg.shopName) + "</h1><div class='sub'>Official receipt</div><div class='meta'><div><b>Invoice:</b> " + h(v->number) +
                         "<br><b>Customer:</b> " + h(v->customer) + vehicleLine + "</div><div class='right'><b>Date:</b> " + h(v->timestamp.substr(0, 10)) + "<br><b>Time:</b> " + h(v->timestamp.size() > 11 ? v->timestamp.substr(11) : "") +
                         "<br><b>Served by:</b> " + h(v->user) + "</div></div><table><thead><tr><th>Item</th><th>Type</th><th class='n'>Qty</th><th class='n'>Unit price</th><th class='n'>Amount</th></tr></thead><tbody>";
@@ -1647,7 +1699,7 @@ struct WebApp::Impl {
             b += "<h2>Payments received</h2><table><thead><tr><th>Date</th><th>Method</th><th>Received by</th><th>Note</th><th class='n'>Amount</th><th class='n'>Balance after</th></tr></thead><tbody>";
             for (const inv::Payment* p : pays)
                 b += "<tr><td>" + h(p->timestamp) + "</td><td>" + h(p->method) + "</td><td>" + h(p->user) +
-                     (auth::allowed(c.role, auth::Permission::Receivables) ? " <span class='noprint'><a href='/payment-edit?no=" + util::urlEncode(v->number) + "&amp;i=" + num(p - inv.payments().all().data()) + "'>edit</a></span>" : std::string()) +
+                     " <span class='noprint'><a href='/payment-edit?no=" + util::urlEncode(v->number) + "&amp;i=" + num(p - inv.payments().all().data()) + "'>edit</a></span>" +
                      "</td><td>" + h(p->note) + "</td><td class='n'>" + php(p->amount) + "</td><td class='n'>" + php(p->balanceAfter) + "</td></tr>";
             b += "</tbody></table>";
         }
@@ -1678,7 +1730,7 @@ struct WebApp::Impl {
         html(c, layout(c, "Invoices", b + "</tbody></table></div>"));
     }
 
-    // ------------------------------------------------------------------ accounts receivable (Staff + Admin)
+    // ------------------------------------------------------------------ accounts receivable
     void receivablesPage(Ctx& c) {
         const std::time_t now = std::time(nullptr);
         const auto& all = inv.invoices().all();
@@ -1791,7 +1843,7 @@ struct WebApp::Impl {
         redirect(c, msgUrl("/invoice?no=" + util::urlEncode(no), r.message, true));
     }
 
-    // ------------------------------------------------------------------ end-of-day cashier summary (Staff + Admin)
+    // ------------------------------------------------------------------ end-of-day cash summary
     void cashReportPage(Ctx& c) {
         const std::string today = util::formatTime(std::time(nullptr), "%Y-%m-%d");
         std::string date = util::trim(c.param("date")), warn;
@@ -1838,11 +1890,11 @@ struct WebApp::Impl {
         for (const inv::Payment* p : r.payments)
             b += "<tr><td>" + h(p->timestamp.size() > 11 ? p->timestamp.substr(11) : "") + "</td><td>" + h(p->invoiceNo) + "</td><td>" + h(p->method) + "</td><td>" + h(p->user) + "</td><td class='n'>" + php(p->amount) + "</td></tr>";
         if (r.payments.empty()) b += "<tr><td colspan='5' class='mut'>No payments on this date.</td></tr>";
-        b += "</tbody></table><div class='sigs'><div>Prepared by (cashier)</div><div>Checked by (owner / manager)</div></div></div>";
+        b += "</tbody></table><div class='sigs'><div>Prepared by (Owner)</div></div></div>";
         html(c, layout(c, "Daily cash report", b));
     }
 
-    // ------------------------------------------------------------------ reports (Admin)
+    // ------------------------------------------------------------------ reports
     static std::string periodTable(const std::string& title, const std::vector<reports::PeriodTotals>& rows) {
         double mx = 1;
         for (const auto& r : rows) mx = std::max(mx, r.revenue());
@@ -1860,8 +1912,8 @@ struct WebApp::Impl {
         const std::time_t now = std::time(nullptr);
         const int days = intParam(c, "days", 0, 3650, 30), idle = intParam(c, "idle", 1, 3650, 30);
         const auto& moves = inv.movements().all();
-        std::string b = "<h1>Business reports</h1><p class='mut'>Generated " + h(util::formatTime(now, "%A, %B %d, %Y, %I:%M %p")) + "</p><p><a class='btn' href='/sales-report'>Sales by custom date range</a></p><p class='mut'>Revenue = money actually received (payments, on the day they were received): a credit sale only counts as the customer pays it. Expenses = RESTOCK movements at the unit cost entered when stock arrived"
-                        " (restocks with no cost entered count as 0: " + num(reports::restocksWithoutCost(moves)) + " so far).</p>";
+        std::string b = "<h1>Business reports</h1><p class='mut'>Generated " + h(util::formatTime(now, "%A, %B %d, %Y, %I:%M %p")) + "</p><p><a class='btn' href='/sales-report'>Sales by custom date range</a></p><p class='mut'>Revenue = money actually received (payments, on the day they were received): a credit sale only counts as the customer pays it. Expenses = RESTOCK movements at the purchase price entered when stock arrived"
+                        " (restocks with no purchase price entered count as 0: " + num(reports::restocksWithoutCost(moves)) + " so far).</p>";
         b += periodTable("Daily (last 14 days)", reports::revenueByPeriod(moves, inv.invoices().all(), inv.payments().all(), reports::Period::Daily, 14, now));
         b += periodTable("Weekly (last 8 weeks, Monday start)", reports::revenueByPeriod(moves, inv.invoices().all(), inv.payments().all(), reports::Period::Weekly, 8, now));
         b += periodTable("Monthly (last 12 months)", reports::revenueByPeriod(moves, inv.invoices().all(), inv.payments().all(), reports::Period::Monthly, 12, now));
@@ -1899,7 +1951,7 @@ struct WebApp::Impl {
         html(c, layout(c, "Reports", b));
     }
 
-    // ------------------------------------------------------------------ custom date-range sales report (Admin)
+    // ------------------------------------------------------------------ custom date-range sales report
     // Reads ?from=YYYY-MM-DD&to=YYYY-MM-DD (nothing given = this month so far; only one date given = just that day).
     // Returns a warning to show above the report, or "".
     std::string salesRange(Ctx& c, std::string& from, std::string& to) {
@@ -2024,7 +2076,7 @@ struct WebApp::Impl {
         o += csvRow({"Total", "", num(r.invoiceCount), M(r.grossSales), M(r.collected)}) + "\r\n";
         o += csvRow({"PAYMENT METHODS"}) + csvRow({"Method", "Payments", "Amount"});
         for (const auto& m : r.byMethod) o += csvRow({m.method, num(m.count), M(m.amount)});
-        o += "\r\n" + csvRow({"INVOICES"}) + csvRow({"Invoice", "Date", "Time", "Customer", "Vehicle", "Parts", "Services", "Total", "Paid so far", "Balance now", "Status now", "Cashier"});
+        o += "\r\n" + csvRow({"INVOICES"}) + csvRow({"Invoice", "Date", "Time", "Customer", "Vehicle", "Parts", "Services", "Total", "Paid so far", "Balance now", "Status now", "Recorded by"});
         for (const inv::Invoice* v : r.invoices) {
             const crm::Vehicle* car = v->vehicleId ? people.findVehicle(v->vehicleId) : nullptr;
             o += csvRow({v->number, v->timestamp.substr(0, 10), v->timestamp.size() > 11 ? v->timestamp.substr(11) : std::string(), v->customer, car ? car->plate : std::string(),
@@ -2040,7 +2092,7 @@ struct WebApp::Impl {
 
     void movementsPage(Ctx& c) {
         std::string b = "<h1>Stock movement log</h1><p><a class='btn sec' href='/export/movements.csv'>Download CSV</a> <span class='mut'>Newest 500 shown.</span></p><div class='card'><table><thead><tr><th>Time</th><th>User</th><th>Part</th><th>Action</th>"
-                        "<th class='n'>Change</th><th class='n'>Stock after</th><th class='n'>Unit price/cost</th><th>Ref</th></tr></thead><tbody>";
+                        "<th class='n'>Change</th><th class='n'>Stock after</th><th class='n'>Selling / purchase price</th><th>Ref</th></tr></thead><tbody>";
         for (const inv::Movement* m : inv.movements().recent(500))
             b += "<tr><td>" + h(m->timestamp) + "</td><td>" + h(m->user) + "</td><td>" + (carriesLabel(m->partName, m->partId) ? std::string() : h(partLabelById(m->partId)) + " ") + h(m->partName) + "</td><td>" + inv::moveName(m->type) + "</td><td class='n " +
                  (m->qtyChanged < 0 ? "minus'>" : "plus'>+") + num(m->qtyChanged) + "</td><td class='n'>" + num(m->resultingStock) + "</td><td class='n'>" + util::money(m->unitPrice) + "</td><td>" + h(m->ref) + "</td></tr>";
@@ -2060,7 +2112,7 @@ struct WebApp::Impl {
                         "<div class='grid'><div class='card'><h2>Export (opens in Excel)</h2><p><a class='btn' href='/export/inventory.csv'>Download inventory CSV</a></p><p><a class='btn' href='/export/movements.csv'>Download movement log CSV</a></p></div>"
                         "<div class='card'><h2>Backup</h2><p class='mut'>Copies every CSV file into the <code>backups</code> folder with a timestamp. This also runs automatically each time the program starts.</p>"
                         "<form method='post' action='/backup'>" + tokenField(c) + "<button type='submit'>Back up now</button></form></div></div>"
-                        "<div class='card'><h2>Import / update stock from CSV</h2><p class='mut'>Columns: <code>ID, Name, System, Price, Quantity, MinStock</code> plus an optional <code>UnitCost</code> (header row recommended; the inventory export works as a template). "
+                        "<div class='card'><h2>Import / update stock from CSV</h2><p class='mut'>Columns: <code>ID, Name, System, Price, Quantity, MinStock</code> plus an optional <code>PurchasePrice</code> (what you pay to get the item: the Selling Price is then set to Purchase Price + 20%) and an optional <code>UnitCost</code> (what you paid for the stock arriving in this import, used for expenses). Header row recommended; the inventory export works as a template. "
                         "<b>Quantity is the new stock level.</b> Known IDs are updated (blank cells keep the current value); unknown IDs are added and need a name, system and price.</p>"
                         "<form method='post' action='/import'>" + tokenField(c) + "<p><input id='csvfile' type='file' accept='.csv,text/csv'></p>"
                         "<textarea id='csvtext' name='csv' rows='10' style='width:100%' placeholder='...or paste CSV text here' required></textarea><p><button type='submit'>Import</button></p></form></div>";
@@ -2087,60 +2139,9 @@ struct WebApp::Impl {
         redirect(c, b.problems.empty() ? msgUrl("/data", num(b.copied) + " file(s) copied to the backups folder.", true) : msgUrl("/data", "Backup problem: " + b.problems.front(), false));
     }
 
-    // ------------------------------------------------------------------ user management (Admin) + own account
-    void usersPage(Ctx& c) {
-        std::string b = "<h1>Users</h1><div class='card'><table><thead><tr><th>Username</th><th>Role</th><th>Recovery</th><th>Change role</th><th>Reset password</th><th></th></tr></thead><tbody>";
-        for (const auth::UserInfo& u : users.users()) {
-            const bool self = util::equalsIgnoreCase(u.username, c.user());
-            const std::string nm = "<input type='hidden' name='username' value='" + h(u.username) + "'>";
-            b += "<tr><td>" + h(u.username) + (self ? " <span class='mut'>(you)</span>" : "") + "</td><td><span class='tag " + (u.role == auth::Role::Admin ? "adm" : "stf") + "'>" + auth::roleName(u.role) + "</span></td><td>" +
-                 (u.hasRecovery ? "set" : "-") + "</td><td>";
-            if (!self) b += "<form method='post' action='/users/role'>" + tokenField(c) + nm + "<select name='role'><option>Staff</option><option" + std::string(u.role == auth::Role::Admin ? " selected" : "") +
-                            ">Admin</option></select> <button class='sm sec' type='submit'>Set</button></form>";
-            b += "</td><td><form method='post' action='/users/reset'>" + tokenField(c) + nm + "<input name='password' type='password' placeholder='new password' minlength='8' required> <button class='sm sec' type='submit'>Reset</button></form></td><td>";
-            if (!self) b += "<form method='post' action='/users/delete' data-confirm='Delete user " + h(u.username) + "?'>" + tokenField(c) + nm + "<button class='sm danger' type='submit'>Delete</button></form>";
-            b += "</td></tr>";
-        }
-        b += "</tbody></table></div><h2>Add user</h2><div class='card'><form method='post' action='/users/add'>" + tokenField(c) + "<div class='grid'><div><label>Username</label><input name='username' required></div>"
-             "<div><label>Password (min 8)</label><input name='password' type='password' minlength='8' required></div><div><label>Role</label><select name='role'><option>Staff</option><option>Admin</option></select></div></div>"
-             "<p class='mut'>Staff: sell, view inventory, adjust stock. Admin: everything, including prices, deletion, reports, backups and users.</p><p><button type='submit'>Create user</button></p></form></div>";
-        html(c, layout(c, "Users", b));
-    }
-    void doUserAdd(Ctx& c) {
-        const auto role = auth::parseRole(c.param("role"));
-        if (!role) return redirect(c, msgUrl("/users", "Choose a role.", false));
-        const std::string err = users.addUser(util::trim(c.param("username")), c.param("password"), *role);
-        if (err.empty()) audit.record(c.user(), "USER_CREATED", util::trim(c.param("username")) + " as " + auth::roleName(*role), c.ip);
-        redirect(c, msgUrl("/users", err.empty() ? "User created." : err, err.empty()));
-    }
-    void doUserRole(Ctx& c) {
-        const std::string name = users.canonicalName(c.param("username"));
-        const auto role = auth::parseRole(c.param("role"));
-        if (name.empty() || !role || util::equalsIgnoreCase(name, c.user())) return redirect(c, msgUrl("/users", "You cannot change that account's role.", false));
-        const std::string err = users.setRole(name, *role);
-        if (err.empty()) audit.record(c.user(), "ROLE_CHANGED", name + " -> " + auth::roleName(*role), c.ip);
-        redirect(c, msgUrl("/users", err.empty() ? "Role updated." : err, err.empty()));
-    }
-    void doUserReset(Ctx& c) {
-        const std::string name = users.canonicalName(c.param("username"));
-        std::string err = name.empty() ? "User not found." : users.resetPassword(name, c.param("password"));
-        if (err.empty()) {
-            std::string token;
-            sessionFor(c.req, &token);
-            dropUserSessions(name, util::equalsIgnoreCase(name, c.user()) ? token : std::string());  // keep my own session
-            audit.record(c.user(), "PASSWORD_RESET", "password reset for " + name, c.ip);
-        }
-        redirect(c, msgUrl("/users", err.empty() ? "Password reset for " + name + "." : err, err.empty()));
-    }
-    void doUserDelete(Ctx& c) {
-        const std::string name = users.canonicalName(c.param("username"));
-        if (name.empty() || util::equalsIgnoreCase(name, c.user())) return redirect(c, msgUrl("/users", "You cannot delete that account.", false));
-        const std::string err = users.removeUser(name);
-        if (err.empty()) { dropUserSessions(name); audit.record(c.user(), "USER_DELETED", name, c.ip); }
-        redirect(c, msgUrl("/users", err.empty() ? "User deleted." : err, err.empty()));
-    }
+    // ------------------------------------------------------------------ the owner's own account (password)
     void accountPage(Ctx& c) {
-        std::string b = "<h1>My account</h1><div class='card'><p>Signed in as <b>" + h(c.user()) + "</b> (" + auth::roleName(c.role) + ").</p><form method='post' action='/account/password'>" + tokenField(c) +
+        std::string b = "<h1>My account</h1><div class='card'><p>Signed in as <b>" + h(c.user()) + "</b> (Business Owner).</p><form method='post' action='/account/password'>" + tokenField(c) +
                         "<label>Current password</label><input name='current' type='password' required autocomplete='current-password'><label>New password (min 8)</label><input name='password' type='password' minlength='8' required autocomplete='new-password'>"
                         "<p><button type='submit'>Change password</button></p></form></div>";
         html(c, layout(c, "My account", b));

@@ -468,32 +468,6 @@ inline constexpr const char* kJs = R"JS(
   if (f && t) f.addEventListener('change', function () {
     if (f.files[0]) f.files[0].text().then(function (s) { t.value = s; if (window.confirm('Import ' + f.files[0].name + ' now?')) t.form.submit(); });
   });
-  // ---- Customer form: name takes no digits; phone is recognised live as Mobile (SIM) or Landline (mirrors crm::parsePhone) ----
-  var nameIn = document.querySelector('input[data-person]'), phoneIn = document.querySelector('input[data-phone]');
-  var say = function (id, cls, msg) { var e = document.getElementById(id); if (e) { e.className = cls; e.textContent = msg; } };
-  if (nameIn) nameIn.addEventListener('input', function () {
-    var clean = nameIn.value.replace(/[0-9]/g, '');
-    if (clean !== nameIn.value) { nameIn.value = clean; say('name-hint', 'minus', 'Numbers are not allowed in a name. Put the phone number in the Phone box.'); }
-    else say('name-hint', 'mut', '');
-  });
-  if (phoneIn) {
-    var checkPhone = function () {
-      var raw = phoneIn.value.trim();
-      if (!raw) { say('phone-hint', 'mut', ''); return; }
-      if (/[^0-9+\s().-]/.test(raw) || raw.indexOf('+') > 0) { say('phone-hint', 'minus', 'Digits only, please (spaces, dashes and brackets are fine).'); return; }
-      var d = raw.replace(/\D/g, '');
-      if (raw.charAt(0) === '+') { if (d.indexOf('63') !== 0) { say('phone-hint', 'minus', 'Only Philippine numbers (+63).'); return; } d = '0' + d.slice(2); }
-      else if (/^63\d{9,10}$/.test(d)) d = '0' + d.slice(2);
-      else if (/^9\d{9}$/.test(d)) d = '0' + d;
-      else if (/^[2-9]\d{7}$/.test(d)) d = '02' + d;
-      if (/^09\d{9}$/.test(d)) say('phone-hint', 'plus', 'Mobile number (SIM) detected');
-      else if (/^02[2-9]\d{7}$/.test(d) || /^0[3-8]\d{8}$/.test(d)) say('phone-hint', 'plus', 'Landline number detected');
-      else if (/^09/.test(d)) say('phone-hint', d.length < 11 ? 'mut' : 'minus', d.length < 11 ? 'Mobile number? Keep typing - it needs 11 digits.' : 'A mobile number has 11 digits.');
-      else say('phone-hint', d.length < 10 ? 'mut' : 'minus', d.length < 10 ? 'Keep typing...' : 'Not a valid PH number. Landlines need the area code, e.g. (02) 8123 4567.');
-    };
-    phoneIn.addEventListener('input', checkPhone);
-    checkPhone();
-  }
   // ---- New sale: customer / vehicle autocomplete (the server also resolves the typed text, so this is only a convenience) ----
   var cin = document.getElementById('cust-in'), cid = document.getElementById('cust-id'),
       vin = document.getElementById('veh-in'), vid = document.getElementById('veh-id'),

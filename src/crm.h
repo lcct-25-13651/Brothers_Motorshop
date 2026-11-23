@@ -1,5 +1,5 @@
 // crm.h - Phase 3: customer & vehicle records. Header-only on purpose (same style as suppliers.h).
-//   customers.csv: id,name,phone,address,notes,archived     (id is shown to people as CUST-0001, see customerCode())
+//   customers.csv: id,name,phone,address,notes,archived
 //   vehicles.csv : id,customer_id,plate,model,year,color,notes,archived
 // "archived" is the only column added to the Phase 3 spec; files without it (5 / 7 columns) load fine (= not archived).
 // Plates are stored UPPERCASE with every space removed and are unique across ALL vehicles (archived ones too).
@@ -43,88 +43,59 @@ inline std::string phoneDigits(const std::string& s) {
     return d;
 }
 
-// ---------------------------------------------------------------- phone numbers (Philippines)
-// Tells a SIM / mobile number from a landline and stores it in one canonical form, so the same number is never
-// saved in three spellings. Accepted (spaces, dashes, dots and brackets are ignored):
-//   Mobile   09171234567 | 9171234567 | +639171234567 | 639171234567           -> "0917 123 4567"
-//   Landline (02) 8123 4567 | 02-8123-4567 | 8123 4567 (Metro Manila, area code assumed)  -> "(02) 8123 4567"
-//            (032) 123 4567 | 032 123 4567 | +63 32 123 4567 (provincial: 0 + 2-digit area code + 7 digits) -> "(032) 123 4567"
-enum class PhoneKind { None, Mobile, Landline };
+// ---- Phone numbers (Philippines). Digits 0-9 only - no spaces, dashes, "+" or letters.
+//   Cellphone: exactly 11 digits starting with 09          e.g. 09171234567
+//   Landline : area code + number, 9-10 digits starting with 0 but not 09   e.g. 0288123456, 032234567
+//              or a local number of 7-8 digits (no area code)               e.g. 8123456
+enum class PhoneKind { None, Cellphone, Landline, Invalid };
 
-struct PhoneInfo {
-    PhoneKind kind = PhoneKind::None;   // None = nothing typed (the phone is optional) or not valid
-    std::string formatted;              // canonical form to store / show
-    std::string error;                  // "" = fine, otherwise the reason (shown to the cashier)
-};
-
-inline const char* phoneKindName(PhoneKind k) {
-    return k == PhoneKind::Mobile ? "Mobile" : k == PhoneKind::Landline ? "Landline" : "";
+inline bool onlyDigits(const std::string& s) {
+    if (s.empty()) return false;
+    for (unsigned char ch : s) if (ch < '0' || ch > '9') return false;
+    return true;
 }
-
-inline PhoneInfo parsePhone(const std::string& raw) {
-    PhoneInfo r;
-    const std::string s = util::trim(raw);
-    if (s.empty()) return r;                                   // optional field
-    for (size_t i = 0; i < s.size(); ++i) {
-        const unsigned char ch = static_cast<unsigned char>(s[i]);
-        if (!(std::isdigit(ch) || ch == ' ' || ch == '-' || ch == '(' || ch == ')' || ch == '.' || (ch == '+' && i == 0))) {
-            r.error = "Phone number can only contain digits, spaces, dashes and brackets (a + is allowed at the start).";
-            return r;
-        }
-    }
-    std::string d = phoneDigits(s);
-    if (s[0] == '+') {
-        if (d.compare(0, 2, "63") != 0) { r.error = "Only Philippine numbers (+63) are accepted."; return r; }
-        d = "0" + d.substr(2);
-    } else if ((d.size() == 11 || d.size() == 12) && d.compare(0, 2, "63") == 0) d = "0" + d.substr(2);   // 63917... / 6332...
-    else if (d.size() == 10 && d[0] == '9') d = "0" + d;                                                  // 917 123 4567
-    else if (d.size() == 8 && d[0] >= '2') d = "02" + d;                                                  // Metro Manila number without the area code
-
-    if (d.size() == 11 && d.compare(0, 2, "09") == 0) {
-        r.kind = PhoneKind::Mobile;
-        r.formatted = d.substr(0, 4) + " " + d.substr(4, 3) + " " + d.substr(7);
-        return r;
-    }
-    if (d.size() == 10 && d.compare(0, 2, "02") == 0 && d[2] >= '2') {          // Metro Manila: (02) + 8 digits
-        r.kind = PhoneKind::Landline;
-        r.formatted = "(02) " + d.substr(2, 4) + " " + d.substr(6);
-        return r;
-    }
-    if (d.size() == 10 && d[0] == '0' && d[1] >= '3' && d[1] <= '8') {         // provincial: (0XX) + 7 digits
-        r.kind = PhoneKind::Landline;
-        r.formatted = "(" + d.substr(0, 3) + ") " + d.substr(3, 3) + " " + d.substr(6);
-        return r;
-    }
-    if (d.compare(0, 2, "09") == 0) r.error = "A mobile number has 11 digits, like 0917 123 4567.";
-    else r.error = "Not a valid Philippine number. Mobile: 0917 123 4567. Landline: (02) 8123 4567 or (032) 123 4567 (with the area code).";
-    return r;
+inline PhoneKind classifyPhone(const std::string& s) {
+    if (s.empty()) return PhoneKind::None;
+    if (!onlyDigits(s)) return PhoneKind::Invalid;
+    if (s.size() == 11 && s[0] == '0' && s[1] == '9') return PhoneKind::Cellphone;
+    if ((s.size() == 9 || s.size() == 10) && s[0] == '0' && s[1] != '9') return PhoneKind::Landline;
+    if ((s.size() == 7 || s.size() == 8) && s[0] != '0') return PhoneKind::Landline;
+    return PhoneKind::Invalid;
 }
-
-// ---------------------------------------------------------------- customer name & customer ID
-// A name is text: any digit is refused (it is almost always a phone number typed in the wrong box). "" = ok.
-inline std::string checkPersonName(const std::string& name) {
-    bool letter = false;
-    for (unsigned char ch : name) {
-        if (std::isdigit(ch)) return "Customer name can't contain numbers.";
-        if (std::isalpha(ch) || ch >= 0x80) letter = true;      // >= 0x80: UTF-8 letters such as n-tilde
+inline const char* phoneKindLabel(PhoneKind k) {
+    switch (k) {
+        case PhoneKind::Cellphone: return "Cellphone";
+        case PhoneKind::Landline: return "Landline";
+        case PhoneKind::Invalid: return "Invalid";
+        default: return "";
     }
-    return letter ? std::string() : std::string("Customer name must contain letters.");
 }
-
-// Every customer has a permanent, unique ID that is shown everywhere ("CUST-0007"), because names repeat.
-// It is the record's numeric id (customers.csv is unchanged) written out in a form people can read and say aloud.
-inline std::string customerCode(int id) {
-    std::string n = std::to_string(id);
-    if (n.size() < 4) n.insert(0, 4 - n.size(), '0');
-    return "CUST-" + n;
+// "" when the number is acceptable (an empty number is acceptable here - see contactProblem for the credit rule).
+inline std::string phoneProblem(const std::string& phone) {
+    if (phone.empty()) return "";
+    if (!onlyDigits(phone)) return "Phone number must contain digits 0-9 only (no letters, spaces, dashes or symbols).";
+    if (classifyPhone(phone) == PhoneKind::Invalid)
+        return "Not a valid phone number. Cellphone = 11 digits starting with 09 (e.g. 09171234567); landline = area code + number, 9-10 digits (e.g. 0288123456), or a 7-8 digit local number.";
+    return "";
 }
-// "cust-0007" / "CUST-7" / " Cust 0007 " -> 7. False when the text is not a customer ID.
-inline bool parseCustomerCode(const std::string& text, long long& id) {
-    std::string t = util::toLower(util::trim(text));
-    if (t.rfind("cust", 0) != 0) return false;
-    t.erase(0, 4);
-    while (!t.empty() && (t[0] == '-' || t[0] == ' ')) t.erase(0, 1);
-    return util::parseInt(t, 1, 999999, id);
+// "" when the name is acceptable. A person's name has letters only - no digits 0-9.
+inline std::string nameProblem(const std::string& name) {
+    for (unsigned char ch : name) if (ch >= '0' && ch <= '9') return "Customer name cannot contain numbers - letters only (e.g. Jiro Batumbakal).";
+    return "";
+}
+// A usable address for a customer who owes money: at least 5 characters and at least one letter.
+inline bool validAddress(const std::string& address) {
+    if (address.size() < 5) return false;
+    for (unsigned char ch : address) if (std::isalpha(ch)) return true;
+    return false;
+}
+// The rule for a customer with credit (utang): a valid address AND a valid contact number (cellphone or landline).
+inline std::string contactProblem(const std::string& phone, const std::string& address) {
+    if (phone.empty()) return "A customer with credit (utang) needs a contact number - enter a cellphone (09XXXXXXXXX) or landline number.";
+    const std::string pp = phoneProblem(phone);
+    if (!pp.empty()) return pp;
+    if (!validAddress(address)) return "A customer with credit (utang) needs a valid address (at least 5 characters, with a street / barangay / town).";
+    return "";
 }
 
 // ---------------------------------------------------------------- records
@@ -229,7 +200,7 @@ public:
         return out;
     }
 
-    // Search by name (every typed word must appear), phone (digits, at least 3), customer ID ("CUST-0007") or plate (any spelling, at least 2 characters).
+    // Search by name (every typed word must appear), phone (digits, at least 3) or plate (any spelling, at least 2 characters).
     // Archived customers ARE returned - the caller decides whether to show them. Active customers first, then by name.
     std::vector<SearchHit> search(const std::string& query) const {
         const std::string q = util::trim(query);
@@ -252,10 +223,9 @@ public:
                 const std::string lname = util::toLower(k.name);
                 for (const std::string& w : words) if (lname.find(w) == std::string::npos) { byName = false; break; }
                 const bool byPhone = digits.size() >= 3 && phoneDigits(k.phone).find(digits) != std::string::npos;
-                const bool byCode = plateQ.size() > 5 && plateQ.rfind("CUST-", 0) == 0 && customerCode(k.id).find(plateQ) != std::string::npos;
                 if (plateQ.size() >= 2)
                     for (const Vehicle& v : vehicles_) if (v.customerId == k.id && v.plate.find(plateQ) != std::string::npos) hit.plateMatches.push_back(&v);
-                if (!byName && !byPhone && !byCode && hit.plateMatches.empty()) continue;
+                if (!byName && !byPhone && hit.plateMatches.empty()) continue;
             }
             out.push_back(std::move(hit));
         }
@@ -269,20 +239,18 @@ public:
 
     // ------------------------------------------------------------ customers
     // Adds (id == 0) or updates a customer. Returns "" on success, otherwise the reason. newId gets the id used.
-    std::string saveCustomer(int id, Customer in, int& newId) {
+    // hasCredit = the customer owes money (utang): then a valid address and a valid cellphone / landline number are required.
+    std::string saveCustomer(int id, Customer in, int& newId, bool hasCredit = false) {
         in.name = util::oneLine(util::trim(in.name));
         in.phone = util::oneLine(util::trim(in.phone));
         in.address = util::oneLine(util::trim(in.address));
         in.notes = util::oneLine(util::trim(in.notes));
         if (in.name.empty() || in.name.size() > static_cast<size_t>(kMaxNameLen)) return "Customer name is required (max " + std::to_string(kMaxNameLen) + " characters).";
-        if (const std::string e = checkPersonName(in.name); !e.empty()) return e;
+        if (const std::string ne = nameProblem(in.name); !ne.empty()) return ne;
         if (util::equalsIgnoreCase(in.name, "Walk-in customer")) return "\"Walk-in customer\" is reserved for sales without a customer record.";
         if (in.phone.size() > 30 || in.address.size() > 120 || in.notes.size() > 200) return "One of the fields is too long (phone 30, address 120, notes 200).";
-        {   // phone: must be a real PH mobile or landline number; saved in one canonical format
-            const PhoneInfo pi = parsePhone(in.phone);
-            if (!pi.error.empty()) return pi.error;
-            in.phone = pi.formatted;
-        }
+        if (const std::string pe = phoneProblem(in.phone); !pe.empty()) return pe;
+        if (hasCredit) if (const std::string ce = contactProblem(in.phone, in.address); !ce.empty()) return ce;
         for (const Customer& k : customers_)   // same person entered twice
             if (k.id != id && reports::customerKey(k.name) == reports::customerKey(in.name) && phoneDigits(k.phone) == phoneDigits(in.phone))
                 return "A customer named \"" + k.name + "\" with the same phone number already exists (#" + std::to_string(k.id) + ")" +

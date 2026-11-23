@@ -291,6 +291,47 @@ int main() {
         CHECK(!reg.saveCustomer(0, bad, id).empty());                        // name required
         bad.name = "walk-in CUSTOMER";
         CHECK(!reg.saveCustomer(0, bad, id).empty());                        // reserved word
+        // ---- phone detection (mobile vs landline), canonical format, name without digits, customer ID ----
+        {
+            using crm::PhoneKind;
+            auto kindOf = [](const char* t) { return crm::parsePhone(t); };
+            CHECK(kindOf("09171234567").kind == PhoneKind::Mobile && kindOf("09171234567").formatted == "0917 123 4567");
+            CHECK(kindOf("+63 917 123 4567").formatted == "0917 123 4567" && kindOf("639171234567").kind == PhoneKind::Mobile && kindOf("9171234567").kind == PhoneKind::Mobile);
+            CHECK(kindOf("0917-123-4567").kind == PhoneKind::Mobile);
+            CHECK(kindOf("(02) 8123 4567").kind == PhoneKind::Landline && kindOf("(02) 8123 4567").formatted == "(02) 8123 4567");
+            CHECK(kindOf("02-8123-4567").formatted == "(02) 8123 4567" && kindOf("8123 4567").formatted == "(02) 8123 4567" && kindOf("+63 2 8123 4567").kind == PhoneKind::Landline);
+            CHECK(kindOf("032 123 4567").kind == PhoneKind::Landline && kindOf("032 123 4567").formatted == "(032) 123 4567" && kindOf("+63 32 123 4567").formatted == "(032) 123 4567");
+            CHECK(kindOf("").kind == PhoneKind::None && kindOf("").error.empty() && kindOf("   ").error.empty());     // optional
+            CHECK(!kindOf("0917 123 456").error.empty());           // mobile one digit short
+            CHECK(!kindOf("0917 123 45678").error.empty());         // one digit too many
+            CHECK(!kindOf("123 4567").error.empty());               // landline without area code (not NCR style)
+            CHECK(!kindOf("0917abc4567").error.empty() && !kindOf("+1 212 555 0100").error.empty() && !kindOf("0917").error.empty());
+            CHECK(std::string(crm::phoneKindName(PhoneKind::Mobile)) == "Mobile" && std::string(crm::phoneKindName(PhoneKind::Landline)) == "Landline");
+
+            crm::Registry r2;
+            const std::filesystem::path d2 = std::filesystem::temp_directory_path() / "crm_phone_test";
+            std::filesystem::remove_all(d2); std::filesystem::create_directories(d2);
+            r2.open(d2.string());
+            int nid = 0;
+            crm::Customer a; a.name = "Ana Reyes"; a.phone = "02 8123 4567";
+            CHECK(r2.saveCustomer(0, a, nid).empty() && r2.findCustomer(nid)->phone == "(02) 8123 4567");           // stored in canonical form
+            crm::Customer b; b.name = "Ben 2"; CHECK(!r2.saveCustomer(0, b, nid).empty());                           // digit in name
+            b.name = "09171234567"; CHECK(!r2.saveCustomer(0, b, nid).empty());                                      // a phone number typed as the name
+            b.name = "Juan"; b.phone = "12345"; CHECK(!r2.saveCustomer(0, b, nid).empty());                          // bad phone refused
+            b.name = "---"; b.phone = ""; CHECK(!r2.saveCustomer(0, b, nid).empty());                                // no letters
+            b.name = "Mu\xC3\xB1oz, Jose Jr."; CHECK(r2.saveCustomer(0, b, nid).empty());                           // UTF-8 letters, comma and dot are fine
+            // two people with the same name get different IDs
+            crm::Customer j1; j1.name = "Juan dela Cruz"; j1.phone = "0917 111 0001";
+            crm::Customer j2 = j1; j2.phone = "0918 111 0002";
+            int i1 = 0, i2 = 0;
+            CHECK(r2.saveCustomer(0, j1, i1).empty() && r2.saveCustomer(0, j2, i2).empty() && i1 != i2);
+            CHECK(crm::customerCode(i1) != crm::customerCode(i2) && crm::customerCode(7) == "CUST-0007" && crm::customerCode(12345) == "CUST-12345");
+            long long pid = 0;
+            CHECK(crm::parseCustomerCode("cust-0007", pid) && pid == 7 && crm::parseCustomerCode(" CUST 7 ", pid) && pid == 7 && !crm::parseCustomerCode("Juan", pid) && !crm::parseCustomerCode("CUST-", pid));
+            CHECK(r2.search(crm::customerCode(i2)).size() == 1 && r2.search(crm::customerCode(i2))[0].customer->id == i2);   // search by customer ID
+            std::filesystem::remove_all(d2);
+        }
+
         bad.name = std::string(61, 'x');
         CHECK(!reg.saveCustomer(0, bad, id).empty());
         CHECK(reg.customers().size() == 3);
@@ -422,11 +463,11 @@ int main() {
         {   // a namesake record makes the by-name match ambiguous: nobody is charged for it
             crm::Registry two;
             two.open(cd.string());
-            crm::Customer ns; ns.name = "JUAN dela cruz"; ns.phone = "0999";
+            crm::Customer ns; ns.name = "JUAN dela cruz"; ns.phone = "0999 123 4567";
             int nid = 0;
             CHECK(two.saveCustomer(0, ns, nid).empty());                    // a namesake with another phone number is allowed
-            ns.phone = "0999";
-            CHECK(!two.saveCustomer(0, ns, nid).empty());                   // ...the same phone again is not
+            ns.phone = "+63 999 123 4567";
+            CHECK(!two.saveCustomer(0, ns, nid).empty());                   // ...the same phone again is not (even typed another way)
             const crm::Balance linkedOnly = crm::customerBalance(in.invoices().all(), two, *two.findCustomer(1));
             CHECK(linkedOnly.openInvoices == 1 && linkedOnly.balance < jb.balance);
             CHECK(crm::balancesByCustomer(in.invoices().all(), two).count(nid) == 0);

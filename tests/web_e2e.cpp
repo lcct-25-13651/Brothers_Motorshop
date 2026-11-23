@@ -156,7 +156,7 @@ int main() {
         CHECK(s.call("GET", "/customers").headers["Location"] == "/login");
         CHECK(s.call("GET", "/vehicle", {{"id","1"}}).headers["Location"] == "/login");
         for (auto* who : {&ck, &ck2}) {   // Staff and Admin both work with customers
-            r = s.call("GET", "/customers", {}, *who); CHECK(r.status == 200 && has(r.body, "Search by name, phone or plate number") && has(r.body, "No customers yet") && has(r.body, ">Customers</a>"));
+            r = s.call("GET", "/customers", {}, *who); CHECK(r.status == 200 && has(r.body, "Search by name, phone, plate number or customer ID") && has(r.body, "No customers yet") && has(r.body, ">Customers</a>"));
         }
         CHECK(s.call("POST", "/customer/save", {{"name","No Token"}}, ck2).status == 403);                      // CSRF
         r = s.call("POST", "/customer/save", {{"csrf",csrf2},{"id","0"},{"name",""}}, ck2); CHECK(has(r.headers["Location"], "err") && in.invoices().all().size() == oldInvoiceCount);
@@ -166,8 +166,8 @@ int main() {
         CHECK(has(r.headers["Location"], "/customer?id=2"));
         r = s.call("POST", "/customer/save", {{"csrf",csrf2},{"id","0"},{"name","aling  NENA"},{"phone","09182223333"}}, ck2); CHECK(has(r.headers["Location"], "err") && has(r.headers["Location"], "already%20exists"));
         r = s.call("GET", "/customer/edit", {{"name","aling  NENA"}}, ck2); CHECK(r.status == 200 && has(r.body, "value='aling  NENA'"));   // typed values survive an error
-        r = s.call("POST", "/customer/save", {{"csrf",csrf2},{"id","0"},{"name","<script>alert(2)</script>"}}, ck2); CHECK(has(r.headers["Location"], "kind=ok"));
-        r = s.call("GET", "/customers", {}, ck2); CHECK(has(r.body, "Mang Tonyo") && has(r.body, "Aling Nena") && has(r.body, "&lt;script&gt;alert(2)") && !has(r.body, "<script>alert(2)"));
+        r = s.call("POST", "/customer/save", {{"csrf",csrf2},{"id","0"},{"name","<script>alert(x)</script>"}}, ck2); CHECK(has(r.headers["Location"], "kind=ok"));
+        r = s.call("GET", "/customers", {}, ck2); CHECK(has(r.body, "Mang Tonyo") && has(r.body, "Aling Nena") && has(r.body, "&lt;script&gt;alert(x)") && !has(r.body, "<script>alert(x)"));
         r = s.call("GET", "/customer", {{"id","1"}}, ck2); CHECK(has(r.body, "&lt;b&gt;trike&lt;/b&gt;") && !has(r.body, "<b>trike</b>") && has(r.body, "Customer info") && has(r.body, "Invoice history"));
         CHECK(has(s.call("GET", "/customer", {{"id","77"}}, ck2).headers["Location"], "not%20found"));
 

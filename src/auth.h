@@ -1,4 +1,5 @@
-// auth.h - accounts, salted password hashing, role-based access control, audit trail.
+// auth.h - the owner's account, salted password hashing, audit trail.
+// The system is used by ONE person only: the Business Owner (Admin). There are no other accounts, roles or permissions.
 #pragma once
 #include <array>
 #include <chrono>
@@ -9,37 +10,6 @@
 #include <vector>
 
 namespace auth {
-
-// ---------------------------------------------------------------- roles / RBAC
-enum class Role { Admin, Staff };
-
-const char* roleName(Role r);
-std::optional<Role> parseRole(const std::string& s);
-
-enum class Permission {
-    ViewInventory,  // everyone
-    Sell,           // create invoices / sales
-    AdjustStock,    // restock + stock adjustments
-    Receivables,    // see customer balances + record payments (credit sales) -> Staff + Admin
-    CashReport,     // end-of-day register close-out report -> Staff + Admin
-    Customers,      // Phase 3: look up / add / edit customers and vehicles -> Staff + Admin
-    Jobs,           // Phase 4: job orders / repair tickets (open, lines, status, print) -> Staff + Admin
-    ServiceCatalog, // Phase 4: edit the service catalogue (labour fees, reminder intervals) -> Admin
-    ArchiveCustomers, // Phase 3: archive / restore / delete customer + vehicle records -> Admin
-    AddPart,        // sets a price  -> Admin
-    EditPart,       // price/name/min stock -> Admin
-    DeletePart,     // Admin
-    ViewReports,    // Admin
-    ViewAudit,      // Admin
-    ExportData,     // Admin
-    ImportData,     // Admin
-    RunBackup,      // Admin
-    ManageUsers,    // Admin
-    ManageSuppliers // Admin (suppliers, purchase prices, margins)
-};
-
-// The single place that decides what each role may do.
-bool allowed(Role role, Permission perm);
 
 // ---------------------------------------------------------------- hashing
 using Digest = std::array<std::uint8_t, 32>;
@@ -56,14 +26,7 @@ struct Credential {
     std::string username;
     std::string salt;
     std::string hash;
-    Role role = Role::Staff;
     std::string recQuestion, recSalt, recHash;  // optional recovery phrase (empty = none)
-};
-
-struct UserInfo {
-    std::string username;
-    Role role;
-    bool hasRecovery;
 };
 
 // All mutating members return "" on success or a human-readable error.
@@ -72,25 +35,21 @@ public:
     explicit Authenticator(std::string file = "users.csv");
 
     bool isConfigured() const { return !users_.empty(); }
-    std::vector<UserInfo> users() const;
-    std::optional<Role> roleOf(const std::string& username) const;
+    bool exists(const std::string& username) const;                  // is this the owner's account?
     std::string canonicalName(const std::string& username) const;  // "" if unknown
-    int adminCount() const;
 
     static std::string checkUsername(const std::string& name);
     static std::string checkPassword(const std::string& pw);
 
-    // First-run: creates the first Admin (with a recovery question/answer).
+    // First-run: creates the Business Owner's (Admin) account, with a recovery question/answer.
+    // Only one account can ever exist.
     std::string initialSetup(const std::string& username, const std::string& password,
                              const std::string& question, const std::string& answer);
 
-    // Returns the canonical username + role on success. Does equal work for unknown users.
-    std::optional<std::pair<std::string, Role>> login(const std::string& username, const std::string& password) const;
+    // Returns the canonical username on success. Does equal work for unknown users.
+    std::optional<std::string> login(const std::string& username, const std::string& password) const;
 
-    std::string addUser(const std::string& username, const std::string& password, Role role);
-    std::string setRole(const std::string& username, Role role);          // keeps >= 1 Admin
-    std::string removeUser(const std::string& username);                  // keeps >= 1 Admin
-    std::string resetPassword(const std::string& username, const std::string& newPassword);  // admin action
+    std::string resetPassword(const std::string& username, const std::string& newPassword);  // used by recovery / tests
     std::string changePassword(const std::string& username, const std::string& current, const std::string& newPassword);
 
     // "Forgot password": only for accounts that set a recovery phrase.
@@ -127,7 +86,7 @@ struct AuditEntry {
 };
 
 // Events: LOGIN, LOGIN_FAILED, LOGOUT, PRICE_CHANGE, RECORD_DELETED, PASSWORD_RESET,
-//         PASSWORD_CHANGED, USER_CREATED, USER_DELETED, ROLE_CHANGED, BACKUP, IMPORT, ACCESS_DENIED,
+//         PASSWORD_CHANGED, BACKUP, IMPORT,
 //         CREDIT_SALE, PAYMENT_RECORDED, PART_MODELS_CHANGED,
 //         JOB_CREATED, JOB_UPDATED, JOB_MECHANIC, JOB_STATUS, JOB_LINE_ADDED, JOB_LINE_REMOVED,
 //         JOB_STOCK_RECONCILED, SERVICE_ADDED, SERVICE_UPDATED, SERVICE_TOGGLED

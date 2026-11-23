@@ -448,7 +448,7 @@ int main() {
         CHECK_EQ(static_cast<int>(lines.lines.size()), start);            // one line per request
     }
 
-    // ---------------------------------------------------------------- concurrency: two cashiers, one unit
+    // ---------------------------------------------------------------- concurrency: two simultaneous requests, one unit
     {
         inv::Inventory in3(d + "_race2");
         auth::AuditLog a3(d + "_race2/audit.csv");
@@ -510,11 +510,41 @@ int main() {
         fs::remove_all(cd);
     }
 
-    // ---------------------------------------------------------------- permissions reference
-    CHECK(auth::allowed(auth::Role::Staff, auth::Permission::Jobs));
-    CHECK(auth::allowed(auth::Role::Admin, auth::Permission::Jobs));
-    CHECK(auth::allowed(auth::Role::Admin, auth::Permission::ServiceCatalog));
-    CHECK(!auth::allowed(auth::Role::Staff, auth::Permission::ServiceCatalog));
+    // ---------------------------------------------------------------- zero stock: ordering is refused
+    {
+        CreateJob cj;
+        cj.customerId = cid;
+        cj.vehicleId = vid;
+        cj.complaint = "Zero-stock check";
+        const auto zr = book.createJob(cj, "juan");
+        CHECK(zr.ok);
+        const std::string zno = zr.job.jobNo;
+        const int left = in.find(103)->quantity();
+        if (left > 0) CHECK(in.adjust(103, -static_cast<long long>(left), "boss", "sold out").ok);   // (already 0 in some runs)
+        CHECK_EQ(in.find(103)->quantity(), 0);                              // an item that runs out sits at exactly 0
+        CHECK(in.find(103)->isOutOfStock());
+
+        AddLine a;
+        a.kind = JobLine::Kind::Part;
+        a.partId = 103;
+        a.quantity = 1;
+        const auto r = book.addLine(zno, a, "juan");
+        CHECK(!r.ok);
+        CHECK(r.message.find("OUT OF STOCK") != std::string::npos);        // clear error, no order
+        CHECK_EQ(in.find(103)->quantity(), 0);                              // stock never goes negative
+        CHECK(book.lines(zno).lines.empty());
+
+        CHECK(!in.adjust(103, -1, "boss", "x").ok);                         // cannot take from 0
+        inv::InvoiceLine il;
+        il.kind = inv::InvoiceLine::Kind::Part;
+        il.partId = 103;
+        il.qty = 1;
+        const auto co = in.checkout("", {il}, "boss", -1.0, "Cash", 0, 0, "");
+        CHECK(!co.ok && co.message.find("OUT OF STOCK") != std::string::npos);   // the sales till is blocked too
+
+        CHECK(in.restock(103, 5, 0.0, "boss", "back in").ok);               // once restocked, ordering works again
+        CHECK(book.addLine(zno, a, "juan").ok);
+    }
 
     if (failures == 0) std::cout << "ALL PHASE 4 CORE TESTS PASSED\n";
     return failures == 0 ? 0 : 1;

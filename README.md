@@ -74,6 +74,18 @@ go back up. A services-only invoice gets one marker row (part_id 0, quantity 0).
 A voided invoice is shown as VOIDED, cannot be voided twice, and its sales/services no longer count in revenue or Top Sellers
 (they drop out of their original period). If a part on the invoice has since been deleted, re-add it with the same ID first.
 
+## Customer records: phone type, names, customer ID
+- **Phone** (optional, Philippine numbers). The form recognises the number as you type and the app stores it in one format:
+  *Mobile / SIM* `0917 123 4567` (also accepts `+63 917...`, `63917...`, `917...`) or *Landline* `(02) 8123 4567` (Metro Manila; the
+  area code is assumed for a bare 8-digit number) and `(032) 123 4567` (provincial: area code + 7 digits). Anything else is refused with a reason.
+  The Customers list and the customer page show a **Mobile** / **Landline** tag. Old records with a non-standard number show *Check number*
+  until the customer is edited.
+- **Name** must contain letters and **no digits** (checked in the form, on the server, and for free-text names typed on the sale form).
+- **Customer ID**: every customer has a permanent, unique ID shown as `CUST-0001`, `CUST-0002`... (it is the existing numeric `id` in
+  `customers.csv`, so no data migration). Namesakes are told apart by it: it appears in the Customers list, on the customer page, in the sale-form
+  suggestions (`Juan dela Cruz - 0917 111 0001 [CUST-0001]`), and can be typed in the search box or in the sale form's Customer box.
+- Tests: `make custweb` (customer web rules) plus the new cases in `make test`.
+
 ## Importing the client's receipt (tools/seed_data.cpp)
 Standalone C++17 tool that adds the 75 parts from the supplier receipt to `parts.csv` (schema
 `id,part_name,vehicle_system,selling_price,quantity,min_stock,cost_price,compatible_models`).

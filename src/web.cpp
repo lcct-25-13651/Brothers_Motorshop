@@ -1194,7 +1194,14 @@ struct WebApp::Impl {
     }
 
     // ------------------------------------------------------------------ Phase 3: customers & vehicles
-    static std::string customerLabel(const crm::Customer& k) { return k.phone.empty() ? k.name : k.name + " - " + k.phone; }
+    // "Juan Dela Cruz - 0917 123 4567 [CUST-0007]": the phone and the customer ID tell namesakes apart on the sale form.
+    static std::string customerLabel(const crm::Customer& k) { return (k.phone.empty() ? k.name : k.name + " - " + k.phone) + " [" + crm::customerCode(k.id) + "]"; }
+    // Phone as stored + a Mobile / Landline tag worked out from the number itself.
+    static std::string phoneCell(const std::string& phone) {
+        if (phone.empty()) return "<span class='mut'>-</span>";
+        const crm::PhoneInfo p = crm::parsePhone(phone);
+        return h(phone) + (p.error.empty() ? " <span class='tag stf'>" + std::string(crm::phoneKindName(p.kind)) + "</span>" : " <span class='tag low' title='Edit the customer to fix this number'>Check number</span>");
+    }
     std::string vehicleLabel(const crm::Vehicle& v) const {
         const crm::Customer* o = people.findCustomer(v.customerId);
         return v.plate + (v.model.empty() ? "" : " - " + v.model) + (o ? " (" + o->name + ")" : "");
@@ -1246,12 +1253,21 @@ struct WebApp::Impl {
             if (util::parseInt(c.param("customer_id"), 1, 999999, idv))
                 if (const crm::Customer* x = people.findCustomer(static_cast<int>(idv)))
                     if (util::equalsIgnoreCase(ctext, customerLabel(*x)) || util::equalsIgnoreCase(ctext, x->name)) k = x;
+            long long codeId = 0;
+            if (!k && crm::parseCustomerCode(ctext, codeId)) {   // the cashier typed a customer ID such as CUST-0007
+                k = people.findCustomer(static_cast<int>(codeId));
+                if (!k) return "No customer has the ID " + crm::customerCode(static_cast<int>(codeId)) + ".";
+            }
             if (!k) {
                 std::vector<const crm::Customer*> hits;
                 for (const crm::Customer& x : people.customers()) if (util::equalsIgnoreCase(ctext, customerLabel(x))) hits.push_back(&x);
                 if (hits.empty()) hits = people.findByName(ctext);
-                if (hits.size() > 1) return "More than one customer is called \"" + ctext + "\" - pick one from the suggestions (they show the phone number).";
+                if (hits.size() > 1) return "More than one customer is called \"" + ctext + "\" - pick one from the suggestions (they show the phone number and customer ID) or type the customer ID, e.g. " + crm::customerCode(hits[0]->id) + ".";
                 if (hits.size() == 1) k = hits[0];
+            }
+            if (!k) {   // free text that is not a saved customer must still be a name, not a number
+                const std::string bad = crm::checkPersonName(ctext);
+                if (!bad.empty()) return bad + " Pick a saved customer from the list or type just the name.";
             }
         }
         if (!vtext.empty()) {
@@ -1291,10 +1307,10 @@ struct WebApp::Impl {
             if (hit.customer->archived && !showArchived) { ++hiddenArchived; continue; }
             hits.push_back(std::move(hit));
         }
-        std::string b = "<h1>Customers</h1><div class='card'><form class='bar' method='get' action='/customers'><input id='cq' name='q' type='search' autocomplete='off' autofocus placeholder='Search by name, phone or plate number' value='" + h(q) +
+        std::string b = "<h1>Customers</h1><div class='card'><form class='bar' method='get' action='/customers'><input id='cq' name='q' type='search' autocomplete='off' autofocus placeholder='Search by name, phone, plate number or customer ID (CUST-0001)' value='" + h(q) +
                         "'><label class='inline'><input type='checkbox' name='archived' value='1'" + std::string(showArchived ? " checked" : "") + "> Show archived</label><button type='submit'>Search</button>"
                         "<a class='btn sec' href='/customers'>Clear</a><span class='grow'></span><a class='btn' href='/customer/edit'>+ Add customer</a></form>"
-                        "<table><thead><tr><th>Customer</th><th>Phone</th><th>Vehicles</th><th class='n'>Outstanding balance</th><th></th></tr></thead><tbody>";
+                        "<table><thead><tr><th>ID</th><th>Customer</th><th>Phone</th><th>Vehicles</th><th class='n'>Outstanding balance</th><th></th></tr></thead><tbody>";
         for (const crm::SearchHit& hit : hits) {
             const crm::Customer& k = *hit.customer;
             std::string plates;
@@ -1304,11 +1320,11 @@ struct WebApp::Impl {
             }
             auto bi = balances.find(k.id);
             const double owed = bi == balances.end() ? 0.0 : bi->second.balance;
-            b += "<tr><td>" + owesDot(owed) + idLink("/customer", k.id, "<b>" + h(k.name) + "</b>") + archivedTag(k.archived) + (!hit.plateMatches.empty() ? " <span class='mut'>plate match</span>" : "") + "</td><td>" + h(k.phone) + "</td><td>" +
+            b += "<tr><td><span class='mut'>" + crm::customerCode(k.id) + "</span></td><td>" + owesDot(owed) + idLink("/customer", k.id, "<b>" + h(k.name) + "</b>") + archivedTag(k.archived) + (!hit.plateMatches.empty() ? " <span class='mut'>plate match</span>" : "") + "</td><td>" + phoneCell(k.phone) + "</td><td>" +
                  (plates.empty() ? "<span class='mut'>none</span>" : plates) + "</td><td class='n'>" + (owed > 0 ? "<b class='minus'>" + php(owed) + "</b>" : php(0)) +
                  "</td><td class='right'><a class='btn sm sec' href='/customer?id=" + num(k.id) + "'>Open</a></td></tr>";
         }
-        if (hits.empty()) b += "<tr><td colspan='5' class='mut'>" + std::string(q.empty() ? "No customers yet - add the first one." : "Nobody matches \"" + h(q) + "\".") + "</td></tr>";
+        if (hits.empty()) b += "<tr><td colspan='6' class='mut'>" + std::string(q.empty() ? "No customers yet - add the first one." : "Nobody matches \"" + h(q) + "\".") + "</td></tr>";
         b += "</tbody></table>";
         if (hiddenArchived) b += "<p class='mut'>" + num(static_cast<long long>(hiddenArchived)) + " archived customer(s) also match - tick <i>Show archived</i> to see them.</p>";
         html(c, layout(c, "Customers", b + "</div>"));
@@ -1324,11 +1340,11 @@ struct WebApp::Impl {
         const bool admin = auth::allowed(c.role, auth::Permission::ArchiveCustomers);
         const bool canPay = auth::allowed(c.role, auth::Permission::Receivables);
         const bool hasHist = crm::customerHasHistory(all, k->id);
-        std::string b = "<p><a href='/customers'>&larr; All customers</a></p><h1>" + owesDot(bal.balance) + h(k->name) + archivedTag(k->archived) + "</h1>"
+        std::string b = "<p><a href='/customers'>&larr; All customers</a></p><h1>" + owesDot(bal.balance) + h(k->name) + archivedTag(k->archived) + " <span class='tag stf' title='Unique customer ID'>" + crm::customerCode(k->id) + "</span></h1>"
                         "<div class='stats'><div class='stat" + std::string(bal.balance > 0 ? " warn" : "") + "'><span>Outstanding balance</span><b>" + php(bal.balance) + "</b></div>"
                         "<div class='stat'><span>Open invoices</span><b>" + num(bal.openInvoices) + "</b></div><div class='stat'><span>Invoices</span><b>" + num(static_cast<long long>(hist.size())) + "</b></div>"
                         "<div class='stat'><span>Vehicles</span><b>" + num(static_cast<long long>(cars.size())) + "</b></div></div>"
-                        "<div class='card'><h2>Customer info</h2><table class='kv'><tr><td>Phone</td><td>" + h(k->phone) + "</td></tr><tr><td>Address</td><td>" + h(k->address) + "</td></tr><tr><td>Notes</td><td>" + h(k->notes) + "</td></tr></table><p>";
+                        "<div class='card'><h2>Customer info</h2><table class='kv'><tr><td>Customer ID</td><td><b>" + crm::customerCode(k->id) + "</b></td></tr><tr><td>Phone</td><td>" + phoneCell(k->phone) + "</td></tr><tr><td>Address</td><td>" + h(k->address) + "</td></tr><tr><td>Notes</td><td>" + h(k->notes) + "</td></tr></table><p>";
         b += "<a class='btn' href='/customer/edit?id=" + num(k->id) + "'>Edit customer</a> ";
         if (!k->archived) b += "<a class='btn' href='/invoice?customer=" + util::urlEncode(customerLabel(*k)) + "'>New sale</a> <a class='btn sec' href='/vehicle/edit?customer=" + num(k->id) + "'>+ Add vehicle</a> ";
         if (admin) {
@@ -1354,8 +1370,9 @@ struct WebApp::Impl {
         if (!c.param("id").empty() && !(k = customerParam(c))) return redirect(c, msgUrl("/customers", "Customer not found.", false));
         std::string b = "<h1>" + std::string(k ? "Edit customer" : "Add customer") + "</h1><div class='card'><form method='post' action='/customer/save'>" + tokenField(c) +
                         "<input type='hidden' name='id' value='" + (k ? num(k->id) : "0") + "'><input type='hidden' name='from' value='" + h(c.param("from")) + "'>"
-                        "<label>Name (required)</label><input name='name' maxlength='60' required autofocus value='" + h(val(c, "name", k ? k->name : "")) + "'>"
-                        "<label>Phone</label><input name='phone' maxlength='30' inputmode='tel' value='" + h(val(c, "phone", k ? k->phone : "")) + "'>"
+                        "<p class='mut'>" + (k ? "Customer ID: <b>" + crm::customerCode(k->id) + "</b>" : std::string("A unique customer ID is given automatically when you save.")) + "</p>"
+                        "<label>Name (required - letters only, no numbers)</label><input name='name' maxlength='60' required autofocus data-person='1' pattern='[^0-9]+' title='Letters only - numbers are not allowed in a name' value='" + h(val(c, "name", k ? k->name : "")) + "'><div id='name-hint' class='mut'></div>"
+                        "<label>Phone (mobile or landline)</label><input name='phone' maxlength='30' inputmode='tel' data-phone='1' placeholder='0917 123 4567  or  (02) 8123 4567' value='" + h(val(c, "phone", k ? k->phone : "")) + "'><div id='phone-hint' class='mut'></div>"
                         "<label>Address</label><input name='address' maxlength='120' value='" + h(val(c, "address", k ? k->address : "")) + "'>"
                         "<label>Notes</label><input name='notes' maxlength='200' value='" + h(val(c, "notes", k ? k->notes : "")) + "'>"
                         "<p><button type='submit'>Save customer</button> <a class='btn sec' href='" + (k ? "/customer?id=" + num(k->id) : std::string("/customers")) + "'>Cancel</a></p></form></div>";

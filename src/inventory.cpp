@@ -37,7 +37,7 @@ std::string Part::validate(int id, const std::string& name, const std::string& c
     if (id < 1 || id > limits::kMaxId) return "Part ID must be 1 to " + std::to_string(limits::kMaxId) + ".";
     if (name.empty() || name.size() > 80) return "Part name is required (max 80 characters).";
     if (category.empty() || category.size() > 40) return "Vehicle system is required (max 40 characters).";
-    if (!(price >= 0.0 && price <= limits::kMaxPrice)) return "Price is out of range.";
+    if (!(price >= 0.0 && price <= limits::kMaxPrice)) return "Selling price is out of range.";
     if (qty < 0 || qty > limits::kMaxQty) return "Quantity must be 0 to " + std::to_string(limits::kMaxQty) + ".";
     if (minStock < 0 || minStock > limits::kMaxQty) return "Minimum stock must be 0 to " + std::to_string(limits::kMaxQty) + ".";
     return "";
@@ -442,7 +442,9 @@ void Inventory::reconcileLedger() {
     }
 }
 
-Result Inventory::addPart(const Part& p, const std::string& actor) {
+Result Inventory::addPart(const Part& given, const std::string& actor) {
+    Part p = given;
+    if (p.costPrice() > 0) p.setCostPriceAndMarkup(p.costPrice());   // selling price = purchase price + 20 %
     const std::string err = Part::validate(p.id(), p.name(), p.category(), p.price(), p.quantity(), p.minStock());
     if (!err.empty()) return Result::fail(err);
     if (find(p.id())) return Result::fail("A part with ID " + std::to_string(p.id()) + " already exists.");
@@ -512,13 +514,16 @@ Result Inventory::setSourcing(int id, int supplierId, std::optional<double> cost
     Part* p = mut(id);
     if (!p) return Result::fail("Part not found.");
     if (supplierId < 0 || supplierId > limits::kMaxId) return Result::fail("Invalid supplier.");
-    if (costPrice && !(*costPrice >= 0 && *costPrice <= limits::kMaxPrice)) return Result::fail("Cost price is out of range.");
+    if (costPrice && !(*costPrice >= 0 && *costPrice <= limits::kMaxPrice)) return Result::fail("Purchase price is out of range.");
+    const bool reprice = costPrice && *costPrice > 0;   // a purchase price was entered -> selling price follows (+20 %)
+    if (reprice && sellingPriceFor(*costPrice) > limits::kMaxPrice) return Result::fail("Selling price (purchase price + 20%) is out of range.");
     warning_.clear();
     const int oldS = p->supplierId();
-    const double oldC = p->costPrice();
+    const double oldC = p->costPrice(), oldP = p->price();
     p->setSupplierId(supplierId);
-    if (costPrice) p->setCostPrice(util::round2(*costPrice));
-    if (!save()) { p->setSupplierId(oldS); p->setCostPrice(oldC); return Result::fail(warning_); }
+    if (reprice) p->setCostPriceAndMarkup(*costPrice);
+    else if (costPrice) p->setCostPrice(util::round2(*costPrice));   // cleared (0): the selling price stays as it is
+    if (!save()) { p->setSupplierId(oldS); p->setCostPrice(oldC); p->setPrice(oldP); return Result::fail(warning_); }
     return Result::success("Supplier details updated.");
 }
 
@@ -526,6 +531,7 @@ Result Inventory::adjust(int id, long long delta, const std::string& actor, cons
     Part* p = mut(id);
     if (!p) return Result::fail("Part not found.");
     if (delta == 0) return Result::fail("The change must not be zero.");
+    if (delta < 0 && p->isOutOfStock()) return Result::fail(outOfStockMessage(*p));
     const long long n = static_cast<long long>(p->quantity()) + delta;
     if (n < 0) return Result::fail("Cannot remove " + std::to_string(-delta) + ": only " + std::to_string(p->quantity()) + " in stock.");
     if (n > limits::kMaxQty) return Result::fail("Stock cannot exceed " + std::to_string(limits::kMaxQty) + " units.");
@@ -553,6 +559,7 @@ Result Inventory::applyStock(const std::vector<StockDelta>& deltas, MoveType typ
     if (total.empty()) return Result::fail("Nothing to change.");
     for (const auto& t : total) {
         const Part* p = find(t.first);
+        if (t.second < 0 && p->isOutOfStock()) return Result::fail(outOfStockMessage(*p));   // strict: stock == 0 -> nothing can be taken
         const long long n = static_cast<long long>(p->quantity()) + t.second;
         if (n < 0)
             return Result::fail("Not enough stock for \"" + p->fullName() + "\": " + std::to_string(p->quantity()) + " available, " +
@@ -587,6 +594,7 @@ CheckoutResult Inventory::checkout(const std::string& customerIn, const std::vec
         if (l.kind == InvoiceLine::Kind::Part) {
             const Part* p = find(l.partId);
             if (!p) return fail("Part " + std::to_string(l.partId) + " does not exist.");
+            if (p->isOutOfStock()) return fail(outOfStockMessage(*p));   // strict: stock == 0 -> no order at all
             need[l.partId] += l.qty;
             line.description = p->fullName();
             line.unitPrice = p->price();  // catalogue price - never taken from the request
@@ -708,7 +716,7 @@ ImportSummary Inventory::importCsv(const std::string& text, const std::string& a
     if (rows.empty()) { sum.problems.push_back("The file is empty."); return sum; }
 
     // Column positions: by header name when a header row is present, otherwise parts.csv order.
-    int cId = 0, cName = 1, cCat = 2, cPrice = 3, cQty = 4, cMin = 5, cCost = -1, cModels = -1, cPN = -1;
+    int cId = 0, cName = 1, cCat = 2, cPrice = 3, cQty = 4, cMin = 5, cCost = -1, cBuy = -1, cModels = -1, cPN = -1;
     size_t first = 0;
     long long dummy;
     if (!util::parseInt(rows[0][0], 0, limits::kMaxId, dummy)) {
@@ -722,7 +730,8 @@ ImportSummary Inventory::importCsv(const std::string& text, const std::string& a
             else if (k == "price" || k == "unitprice" || k == "pricephp") cPrice = c;
             else if (k == "quantity" || k == "qty" || k == "stock" || k == "stocklevel") cQty = c;
             else if (k == "minstock" || k == "min" || k == "minimum" || k == "reorderlevel") cMin = c;
-            else if (k == "unitcost" || k == "cost") cCost = c;
+            else if (k == "unitcost" || k == "cost") cCost = c;   // what was paid for the stock arriving in this import (expense report)
+            else if (k == "purchaseprice" || k == "costprice") cBuy = c;   // the part's purchase price: the selling price is then set to +20 %
             else if (k == "partnumber" || k == "partno" || k == "partcode") cPN = c;
             else if (k == "compatiblemodels" || k == "models" || k == "compatible" || k == "vehiclemodels") cModels = c;
         }
@@ -755,6 +764,11 @@ ImportSummary Inventory::importCsv(const std::string& text, const std::string& a
             if (!util::parseDouble(cell(r, cPrice), 0, limits::kMaxPrice, pr)) { sum.problems.push_back(where + "invalid price."); ++sum.skipped; continue; }
             p.setPrice(pr);
         }
+        if (!cell(r, cBuy).empty()) {
+            double buy;
+            if (!util::parseDouble(cell(r, cBuy), 0, limits::kMaxPrice, buy)) { sum.problems.push_back(where + "invalid purchase price."); ++sum.skipped; continue; }
+            if (buy > 0 && util::round2(buy) != p.costPrice()) p.setCostPriceAndMarkup(buy);   // entered / changed -> selling price = purchase price * 1.20
+        }
         if (!cell(r, cMin).empty()) {
             if (!util::parseInt(cell(r, cMin), 0, limits::kMaxQty, mn)) { sum.problems.push_back(where + "invalid minimum stock."); ++sum.skipped; continue; }
             p.setMinStock(static_cast<int>(mn));
@@ -783,7 +797,7 @@ ImportSummary Inventory::importCsv(const std::string& text, const std::string& a
         } else {
             Part* c = mut(o.part.id());
             const bool changed = c->name() != o.part.name() || c->category() != o.part.category() || c->price() != o.part.price() ||
-                                 c->minStock() != o.part.minStock() || c->compatibleModels() != o.part.compatibleModels() || c->partNumber() != o.part.partNumber() || o.delta != 0;
+                                 c->minStock() != o.part.minStock() || c->costPrice() != o.part.costPrice() || c->compatibleModels() != o.part.compatibleModels() || c->partNumber() != o.part.partNumber() || o.delta != 0;
             if (c->price() != o.part.price()) sum.priceChanges.push_back({c->id(), c->fullName(), c->price(), o.part.price()});
             *c = o.part;
             if (changed) ++sum.updated; else ++sum.unchanged;

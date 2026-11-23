@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
     inv::Inventory inventory(dataDir);
     auth::Authenticator users(dataDir + "/users.csv");
     auth::AuditLog audit(dataDir + "/audit.csv");
-    if (!users.isConfigured()) std::cout << "No accounts yet: open the page in your browser to create the Admin account.\n";
+    if (!users.isConfigured()) std::cout << "No accounts yet: open the page in your browser to create the owner (Admin) account.\n";
     if (!inventory.lastWarning().empty()) std::cerr << "Warning: " << inventory.lastWarning() << '\n';
 
     web::WebApp app(inventory, users, audit, cfg);

@@ -78,6 +78,11 @@ inline std::string phoneProblem(const std::string& phone) {
         return "Not a valid phone number. Cellphone = 11 digits starting with 09 (e.g. 09171234567); landline = area code + number, 9-10 digits (e.g. 0288123456), or a 7-8 digit local number.";
     return "";
 }
+// "" when the name is acceptable. A person's name has letters only - no digits 0-9.
+inline std::string nameProblem(const std::string& name) {
+    for (unsigned char ch : name) if (ch >= '0' && ch <= '9') return "Customer name cannot contain numbers - letters only (e.g. Jiro Batumbakal).";
+    return "";
+}
 // A usable address for a customer who owes money: at least 5 characters and at least one letter.
 inline bool validAddress(const std::string& address) {
     if (address.size() < 5) return false;
@@ -241,6 +246,7 @@ public:
         in.address = util::oneLine(util::trim(in.address));
         in.notes = util::oneLine(util::trim(in.notes));
         if (in.name.empty() || in.name.size() > static_cast<size_t>(kMaxNameLen)) return "Customer name is required (max " + std::to_string(kMaxNameLen) + " characters).";
+        if (const std::string ne = nameProblem(in.name); !ne.empty()) return ne;
         if (util::equalsIgnoreCase(in.name, "Walk-in customer")) return "\"Walk-in customer\" is reserved for sales without a customer record.";
         if (in.phone.size() > 30 || in.address.size() > 120 || in.notes.size() > 200) return "One of the fields is too long (phone 30, address 120, notes 200).";
         if (const std::string pe = phoneProblem(in.phone); !pe.empty()) return pe;

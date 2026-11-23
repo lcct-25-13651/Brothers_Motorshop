@@ -625,6 +625,32 @@ struct WebApp::Impl {
         if (pct > 100) pct = 100;
         return "<tr><td>" + label + "</td><td style='width:38%'><div class='meter'><i style='width:" + util::money(pct) + "%'></i></div></td><td class='n'>" + value + "</td></tr>";
     }
+    // Parts that still have stock but were not sold (or issued to a job order) in the last `days` days.
+    // Parts first stocked less than `days` days ago are left out - they have not had a fair chance to sell yet. Most money tied up first.
+    std::vector<const inv::Part*> unsoldParts(int days, std::time_t now) {
+        const std::time_t from = now - static_cast<std::time_t>(days) * 86400;
+        std::set<int> moved;
+        std::map<int, std::time_t> firstSeen;
+        for (const inv::Movement& m : inv.movements().all()) {
+            const auto t = util::parseStamp(m.timestamp);
+            if (!t) continue;
+            auto it = firstSeen.find(m.partId);
+            if (it == firstSeen.end() || *t < it->second) firstSeen[m.partId] = *t;
+            if ((m.type == inv::MoveType::Sale || m.type == inv::MoveType::JobIssue) && *t >= from) moved.insert(m.partId);
+        }
+        std::vector<const inv::Part*> out;
+        for (const inv::Part& p : inv.parts()) {
+            if (p.quantity() <= 0 || moved.count(p.id())) continue;
+            const auto fs = firstSeen.find(p.id());
+            if (fs != firstSeen.end() && fs->second >= from) continue;
+            out.push_back(&p);
+        }
+        std::sort(out.begin(), out.end(), [](const inv::Part* a, const inv::Part* b) {
+            if (a->stockValue() != b->stockValue()) return a->stockValue() > b->stockValue();
+            return a->id() < b->id();
+        });
+        return out;
+    }
     std::string analyticsPanel() {
         const std::time_t now = std::time(nullptr);
         const auto& moves = inv.movements().all();
@@ -636,9 +662,8 @@ struct WebApp::Impl {
         const double week = wk.empty() ? 0 : wk.back().revenue();
         const double month = mo.empty() ? 0 : mo.back().revenue();
         const double monthNet = mo.empty() ? 0 : mo.back().net();
-        const auto dead = reports::deadStock(inv.parts(), moves, 30, now);
-        double deadValue = 0;
-        for (const auto& d : dead) deadValue += d.stockValue;
+        double totalSelling = 0;
+        for (const inv::Part& p : inv.parts()) totalSelling += p.stockValue();
 
         std::string b = "<div class='an-head'><h2>Analytics</h2><span class='mut'><a href='/reports'>Full reports</a> &middot; <a class='btn sm sec noprint' href='/analytics.pdf'>Download PDF</a></span></div><div class='stats'>"
                         "<div class='stat'><span>Sales today (collected)</span><b>" + php(today) + "</b></div>"
@@ -646,7 +671,7 @@ struct WebApp::Impl {
                         "<div class='stat'><span>This month</span><b>" + php(month) + "</b></div>"
                         "<div class='stat'><span>Net this month</span><b class='" + (monthNet < 0 ? "minus" : "plus") + "'>" + php(monthNet) + "</b></div>"
                         "<div class='stat" + std::string(reports::totalReceivable(invoices) > 0 ? " warn" : "") + "'><span>Receivables outstanding</span><b>" + php(reports::totalReceivable(invoices)) + "</b></div>"
-                        "<div class='stat'><span>Idle 30+ days</span><b>" + num(static_cast<long long>(dead.size())) + " <small class='mut'>(" + php(deadValue) + ")</small></b></div></div>";
+                        "<div class='stat'><span>Total selling price (all stock)</span><b>" + php(totalSelling) + "</b></div></div>";
 
         b += "<div class='an-grid'>";
         // Revenue, last 7 days (newest first)
@@ -673,6 +698,22 @@ struct WebApp::Impl {
         b += "<div class='card'><h3>Stock value by system</h3><table><tbody>";
         for (const auto& kv : bySys) b += barRow(h(kv.first) + " <span class='mut'>(" + num(kv.second.first) + " pcs)</span>", php(kv.second.second), kv.second.second / sysMax * 100);
         if (bySys.empty()) b += "<tr><td class='mut'>No parts yet.</td></tr>";
+        b += "</tbody></table></div>";
+
+        // Parts that are not selling: in stock, but no sale in the last 30 days
+        const auto unsold = unsoldParts(30, now);
+        double unsoldValue = 0;
+        for (const inv::Part* p : unsold) unsoldValue += p->stockValue();
+        const double unsoldMax = unsold.empty() ? 1.0 : std::max(1.0, unsold.front()->stockValue());
+        b += "<div class='card' style='grid-column:1/-1'><h3>Parts not selling - no sale in the last 30 days <span class='mut'>(" + num(static_cast<long long>(unsold.size())) +
+             " parts, " + php(unsoldValue) + " tied up at selling price)</span></h3><table><tbody>";
+        size_t shownUnsold = 0;
+        for (const inv::Part* p : unsold) {
+            if (++shownUnsold > 10) break;
+            b += barRow(h(partLabel(*p)) + " - " + h(p->name()) + " <span class='mut'>(" + num(p->quantity()) + " pcs)</span>", php(p->stockValue()), p->stockValue() / unsoldMax * 100);
+        }
+        if (unsold.size() > 10) b += "<tr><td colspan='3' class='mut'>... and " + num(static_cast<long long>(unsold.size() - 10)) + " more parts that have not sold. <a href='/reports'>See Reports</a></td></tr>";
+        if (unsold.empty()) b += "<tr><td class='mut'>Every part in stock has sold within the last 30 days.</td></tr>";
         b += "</tbody></table></div>";
 
         b += "</div>";
@@ -782,17 +823,17 @@ struct WebApp::Impl {
         if (re.empty()) L.push_back("Every part is at or above its minimum.");
         L.push_back("");
 
-        const auto dead = reports::deadStock(inv.parts(), moves, 30, now);
+        const auto unsold = unsoldParts(30, now);
         double tied = 0;
-        for (const auto& d : dead) tied += d.stockValue;
-        L.push_back("#DEAD STOCK - NO MOVEMENT FOR 30+ DAYS (" + num(static_cast<long long>(dead.size())) + " parts, " + util::moneyFmt(tied) + " tied up)");
-        L.push_back(padR("ID", 10) + padR("Part", 44) + padL("In stock", 12) + padL("Value", 16) + padL("Days idle", 10));
+        for (const inv::Part* p : unsold) tied += p->stockValue();
+        L.push_back("#PARTS NOT SELLING - NO SALE IN THE LAST 30 DAYS (" + num(static_cast<long long>(unsold.size())) + " parts, " + util::moneyFmt(tied) + " tied up at selling price)");
+        L.push_back(padR("ID", 10) + padR("Part", 44) + padL("In stock", 12) + padL("Selling value", 16));
         shown = 0;
-        for (const auto& d : dead) {
-            if (++shown > 15) { L.push_back("... and " + num(static_cast<long long>(dead.size() - 15)) + " more (see Reports page)"); break; }
-            L.push_back(padR(num(d.part->id()), 10) + padR(d.part->name(), 44) + padL(num(d.part->quantity()), 12) + padL(util::moneyFmt(d.stockValue), 16) + padL(num(d.daysIdle), 10));
+        for (const inv::Part* p : unsold) {
+            if (++shown > 15) { L.push_back("... and " + num(static_cast<long long>(unsold.size() - 15)) + " more (see Reports page)"); break; }
+            L.push_back(padR(partLabel(*p), 10) + padR(p->name(), 44) + padL(num(p->quantity()), 12) + padL(util::moneyFmt(p->stockValue()), 16));
         }
-        if (dead.empty()) L.push_back("Nothing has been idle that long.");
+        if (unsold.empty()) L.push_back("Every part in stock has sold within the last 30 days.");
 
         audit.record(c.user(), "REPORT_DOWNLOAD", "analytics PDF", c.ip);
         c.res.set_header("Content-Disposition", "attachment; filename=\"analytics_" + util::formatTime(now, "%Y%m%d_%H%M") + ".pdf\"");
@@ -845,7 +886,8 @@ struct WebApp::Impl {
              "<th class='n' data-sort='price' data-type='num'>Selling Price</th><th class='n' data-sort='qty' data-type='num'>Stock</th><th class='n' data-sort='min' data-type='num'>Min</th><th>Status</th>" + std::string("<th class='n'>Purchase Price</th><th class='n'>Margin</th>") + "<th></th></tr></thead><tbody>";
         for (const inv::Part& p : parts) {
             b += "<tr" + std::string(p.quantity() == 0 ? " class='low outrow'" : (p.isLowStock() ? " class='low'" : "")) + " data-id='" + num(p.id()) + "' data-pn='" + h(util::toLower(partLabel(p))) + "' data-min='" + num(p.minStock()) + "' data-gap='" + num(p.quantity() - p.minStock()) + "' data-name='" + h(util::toLower(p.name())) +
-                 "' data-cat='" + h(util::toLower(p.category())) + "' data-models='" + h(util::toLower(modelsKey(p))) + "' data-price='" + util::money(p.price()) + "' data-qty='" + num(p.quantity()) +
+                 "' data-cat='" + h(util::toLower(p.category())) + "' data-models='" + h(util::toLower(modelsKey(p))) + "' data-price='" + util::money(p.price()) + "' data-qty='" + num(p.quantity()) + "' data-ts='" + util::money(p.price() * p.quantity()) + "' data-tc='" + util::money(p.costPrice() * p.quantity()) +
+                 "' data-tp='" + util::money(p.costPrice() > 0 ? (p.price() - p.costPrice()) * p.quantity() : 0.0) +
                  "' data-low='" + (p.isLowStock() ? "1" : "0") + "'><td>" + h(partLabel(p)) + "</td><td>" + h(p.name()) + "</td><td>" + h(p.category()) +
                  "</td><td class='fits'>" + (p.modelList().empty() ? std::string("<span class='mut'>-</span>") : h(modelsText(p))) +
                  "</td><td class='n'>" + php(p.price()) + "</td><td class='n'>" + num(p.quantity()) + "</td><td class='n'>" + num(p.minStock()) + "</td><td>" +
@@ -857,7 +899,21 @@ struct WebApp::Impl {
             b += "<a class='btn sm danger' href='/delete" + id + "'>Delete</a>";
             b += "</td></tr>";
         }
-        b += "</tbody></table></div>";
+        {   // totals for the whole stock (the browser re-adds them for just the rows left after a search / filter)
+            double tSell = 0, tCost = 0, tProfit = 0;
+            long long tUnits = 0;
+            for (const inv::Part& p : parts) {
+                tUnits += p.quantity();
+                tSell += p.price() * p.quantity();
+                tCost += p.costPrice() * p.quantity();
+                if (p.costPrice() > 0) tProfit += (p.price() - p.costPrice()) * p.quantity();
+            }
+            b += "</tbody><tfoot><tr class='totals'><td colspan='4'>TOTAL <span class='mut'>(parts shown)</span></td>"
+                 "<td class='n'><small class='mut'>Total selling price</small><br><span id='ftsell'>" + php(tSell) + "</span></td>"
+                 "<td class='n'><small class='mut'>Units</small><br><span id='ftqty'>" + num(tUnits) + "</span></td><td></td><td></td>"
+                 "<td class='n'><small class='mut'>Total purchase price</small><br><span id='ftcost'>" + php(tCost) + "</span></td>"
+                 "<td class='n'><small class='mut'>Total tubo (profit)</small><br><span id='ftprofit'>" + php(tProfit) + "</span></td><td></td></tr></tfoot></table></div>";
+        }
         html(c, layout(c, "Inventory", b));
     }
 
@@ -1333,7 +1389,7 @@ struct WebApp::Impl {
                         "<div class='stats'><div class='stat" + std::string(bal.balance > 0 ? " warn" : "") + "'><span>Outstanding balance</span><b>" + php(bal.balance) + "</b></div>"
                         "<div class='stat'><span>Open invoices</span><b>" + num(bal.openInvoices) + "</b></div><div class='stat'><span>Invoices</span><b>" + num(static_cast<long long>(hist.size())) + "</b></div>"
                         "<div class='stat'><span>Vehicles</span><b>" + num(static_cast<long long>(cars.size())) + "</b></div></div>"
-                        "<div class='card'><h2>Customer info</h2><table class='kv'><tr><td>Phone</td><td>" + h(k->phone) + "</td></tr><tr><td>Address</td><td>" + h(k->address) + "</td></tr><tr><td>Notes</td><td>" + h(k->notes) + "</td></tr></table><p>";
+                        "<div class='card'><h2>Customer info</h2><table class='kv'><tr><td>Phone</td><td>" + h(k->phone) + phoneTag(k->phone) + "</td></tr><tr><td>Address</td><td>" + h(k->address) + "</td></tr><tr><td>Notes</td><td>" + h(k->notes) + "</td></tr></table><p>";
         b += "<a class='btn' href='/customer/edit?id=" + num(k->id) + "'>Edit customer</a> ";
         if (!k->archived) b += "<a class='btn' href='/invoice?customer=" + util::urlEncode(customerLabel(*k)) + "'>New sale</a> <a class='btn sec' href='/vehicle/edit?customer=" + num(k->id) + "'>+ Add vehicle</a> ";
         {
@@ -1361,8 +1417,8 @@ struct WebApp::Impl {
         std::string b = "<h1>" + std::string(k ? "Edit customer" : "Add customer") + "</h1><div class='card'><form method='post' action='/customer/save'>" + tokenField(c) +
                         (owes > 0 ? "<p class='flash err'>This customer still owes " + php(owes) + " (utang). A valid address and a cellphone / landline number are required.</p>" : std::string()) +
                         "<input type='hidden' name='id' value='" + (k ? num(k->id) : "0") + "'><input type='hidden' name='from' value='" + h(c.param("from")) + "'>"
-                        "<label>Name (required)</label><input name='name' maxlength='60' required autofocus value='" + h(val(c, "name", k ? k->name : "")) + "'>"
-                        "<label>Phone" + std::string(owes > 0 ? " (required)" : "") + "</label><input name='phone' maxlength='11' inputmode='numeric' pattern='[0-9]{7,11}'" + std::string(owes > 0 ? " required" : "") +
+                        "<label>Name (required)</label><input name='name' maxlength='60' required autofocus pattern='[^0-9]*' data-no-digits title='Letters only - numbers are not allowed in a name.' value='" + h(val(c, "name", k ? k->name : "")) + "'>"
+                        "<label>Phone" + std::string(owes > 0 ? " (required)" : "") + " <span id='phoneKind' class='tag' hidden></span></label><input name='phone' data-phone-kind='phoneKind' maxlength='11' inputmode='numeric' pattern='[0-9]{7,11}'" + std::string(owes > 0 ? " required" : "") +
                         " title='Digits only. Cellphone: 11 digits starting with 09 (09171234567). Landline: area code + number (0288123456) or 7-8 digit local number.' placeholder='09171234567' value='" + h(val(c, "phone", k ? k->phone : "")) + "'>"
                         "<label>Address" + std::string(owes > 0 ? " (required)" : "") + "</label><input name='address' maxlength='120'" + std::string(owes > 0 ? " required" : "") + " value='" + h(val(c, "address", k ? k->address : "")) + "'>"
                         "<label>Notes</label><input name='notes' maxlength='200' value='" + h(val(c, "notes", k ? k->notes : "")) + "'>"

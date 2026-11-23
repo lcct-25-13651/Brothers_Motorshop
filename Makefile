@@ -48,8 +48,13 @@ e2e: tests/web_e2e.cpp src/web.cpp src/api.cpp $(CORE) $(wildcard src/*.h) tests
 	$(CXX) $(CXXFLAGS) -Isrc -Itests/stub tests/web_e2e.cpp src/web.cpp src/api.cpp $(CORE) -o web_e2e$(EXE) $(LDLIBS)
 	./web_e2e$(EXE)
 
+# Customer form / list / sale-form rules (phone type, no digits in names, customer ID).
+custweb: tests/customer_web_test.cpp src/web.cpp src/api.cpp $(CORE) $(wildcard src/*.h) tests/stub/httplib.h
+	$(CXX) $(CXXFLAGS) -Isrc -Itests/stub tests/customer_web_test.cpp src/web.cpp src/api.cpp $(CORE) -o customer_web_test$(EXE) $(LDLIBS)
+	./customer_web_test$(EXE)
+
 # Everything, the way CI would run it.
-check: test jobstest e2e apie2e
+check: test jobstest e2e apie2e custweb
 
 # Imports the client's supplier-receipt parts into ./parts.csv (safe to re-run, see tools/seed_data.cpp).
 seed: tools/seed_data.cpp
@@ -66,6 +71,6 @@ clean:
 
 .PHONY: all test e2e jobs seed clean
 clean:
-	rm -f $(TARGET) smoke_test$(EXE) web_e2e$(EXE) jobs_test$(EXE) api_e2e$(EXE) seed_data$(EXE)
+	rm -f $(TARGET) smoke_test$(EXE) web_e2e$(EXE) jobs_test$(EXE) api_e2e$(EXE) customer_web_test$(EXE) seed_data$(EXE)
 
 .PHONY: all test jobstest e2e apie2e check seed clean

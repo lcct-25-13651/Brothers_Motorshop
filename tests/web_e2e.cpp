@@ -26,43 +26,49 @@ int main() {
     CHECK(has(r.body, "Delete") && has(r.body, "Reports"));
     std::string csrf = csrfOf(r.body); CHECK(csrf.size() == 64);
     // CSRF enforced
-    // CSRF enforced; there is no user management at all (single owner)
-    r = s.call("POST", "/add", {{"id","499"},{"name","No token"},{"category","Engine"},{"cost","10"},{"qty","1"},{"min","1"}}, ck); CHECK(r.status == 403 && !in.find(499));
-    CHECK(s.call("GET", "/users", {}, ck).status != 200 && s.call("POST", "/users/add", {{"csrf",csrf},{"username","juan"},{"password","juanpass1"}}, ck).status != 303);
-    r = s.call("GET", "/", {}, ck); CHECK(!has(r.body, "Staff") && !has(r.body, "Cashier") && !has(r.body, ">Admin<") && !has(r.body, "ACCESS_DENIED"));
-    CHECK(has(r.body, ">Reports<") && has(r.body, ">New sale<") && has(r.body, ">Job orders<") && has(r.body, ">Audit<") && has(r.body, "Data &amp; backups"));   // the owner sees every menu item
+    r = s.call("POST", "/users/add", {{"username","juan"},{"password","juanpass1"},{"role","Staff"}}, ck); CHECK(r.status == 403);
+    r = s.call("POST", "/users/add", {{"csrf",csrf},{"username","juan"},{"password","juanpass1"},{"role","Staff"}}, ck); CHECK(has(r.headers["Location"], "ok"));
     // XSS escaping
-    r = s.call("POST", "/add", {{"csrf",csrf},{"id","500"},{"pn","P500"},{"name","<script>alert(1)</script>"},{"category","Engine"},{"cost","10"},{"qty","3"},{"min","1"}}, ck); CHECK(r.status == 303);
+    r = s.call("POST", "/add", {{"csrf",csrf},{"id","500"},{"name","<script>alert(1)</script>"},{"category","Engine"},{"price","10"},{"qty","3"},{"min","1"}}, ck); CHECK(r.status == 303);
     r = s.call("GET", "/", {}, ck); CHECK(!has(r.body, "<script>alert") && has(r.body, "&lt;script&gt;"));
-    // Purchase Price (cost_price) -> Selling Price: restock with "use as purchase price" sets selling = purchase x 1.20
-    r = s.call("POST", "/stock", {{"csrf",csrf},{"id","101"},{"action","restock"},{"qty","2"},{"cost","100"},{"setcost","1"}}, ck); CHECK(has(r.headers["Location"], "ok"));
-    CHECK(in.find(101)->costPrice() == 100.0 && in.find(101)->price() == 120.0);
-    r = s.call("GET", "/", {}, ck); CHECK(has(r.body, "Margin</th>") && has(r.body, "Purchase Price</th>") && has(r.body, "Selling Price</th>") && has(r.body, "&#8369;100.00") && has(r.body, "&#8369;120.00"));
-    CHECK(!has(r.body, ">Cost</th>") && !has(r.body, ">Price</th>"));
+    // p2supplier: suppliers, purchase history, supplier cost vs retail (margin)
+    r = s.call("POST", "/suppliers/save", {{"csrf",csrf},{"id","0"},{"name","Bajaj Parts Depot"},{"phone","0917"}}, ck); CHECK(has(r.headers["Location"], "ok"));
+    r = s.call("GET", "/suppliers", {}, ck); CHECK(r.status == 200 && has(r.body, "Bajaj Parts Depot"));
+    r = s.call("POST", "/suppliers/save", {{"csrf",csrf},{"id","0"},{"name","bajaj PARTS depot"}}, ck); CHECK(has(r.headers["Location"], "err"));   // duplicate name
+    r = s.call("POST", "/stock", {{"csrf",csrf},{"id","101"},{"action","restock"},{"qty","2"},{"cost","100"},{"supplier","1"},{"setcost","1"}}, ck); CHECK(has(r.headers["Location"], "ok"));
+    r = s.call("GET", "/", {}, ck); CHECK(has(r.body, "Margin</th>") && has(r.body, "Bajaj Parts Depot") && has(r.body, "&#8369;100.00"));
+    r = s.call("GET", "/suppliers", {{"view","1"}}, ck); CHECK(has(r.body, "Purchase history") && has(r.body, "Engine Oil 1L"));
+    r = s.call("POST", "/suppliers/toggle", {{"csrf",csrf},{"id","1"},{"on","0"}}, ck); CHECK(has(r.headers["Location"], "ok"));
+    r = s.call("POST", "/suppliers/toggle", {{"csrf",csrf},{"id","1"},{"on","1"}}, ck); CHECK(has(r.headers["Location"], "ok"));
     // price edit -> audit
-    r = s.call("POST", "/edit", {{"csrf",csrf},{"id","101"},{"name","Engine Oil 1L"},{"category","Engine"},{"cost","416.25"},{"min","8"}}, ck); CHECK(has(r.headers["Location"], "ok"));
-    CHECK(in.find(101)->costPrice() == 416.25 && in.find(101)->price() == 499.5);   // selling price follows the purchase price automatically
-    r = s.call("POST", "/edit", {{"csrf",csrf},{"id","101"},{"name","Engine Oil 1L"},{"category","Engine"},{"price","1"},{"min","8"}}, ck); CHECK(has(r.headers["Location"], "ok") && in.find(101)->price() == 499.5);   // a typed selling price is ignored
+    r = s.call("POST", "/edit", {{"csrf",csrf},{"id","101"},{"name","Engine Oil 1L"},{"category","Engine"},{"price","499.5"},{"min","8"}}, ck); CHECK(has(r.headers["Location"], "ok"));
     // p1alert: low-stock banner + sidebar counter appear when a part is below its minimum
     r = s.call("POST", "/edit", {{"csrf",csrf},{"id","101"},{"name","Engine Oil 1L"},{"category","Engine"},{"price","499.5"},{"min","99999"}}, ck); CHECK(has(r.headers["Location"], "ok"));
     r = s.call("GET", "/", {}, ck); CHECK(has(r.body, "alert-low") && has(r.body, "nbadge") && has(r.body, "Out of stock") && has(r.body, "href='/?low=1'"));
     r = s.call("POST", "/edit", {{"csrf",csrf},{"id","101"},{"name","Engine Oil 1L"},{"category","Engine"},{"price","499.5"},{"min","8"}}, ck); CHECK(has(r.headers["Location"], "ok"));
-    // the owner is the only user: the old "second session" helpers just point at the owner session
-    std::string ck2 = ck, csrf2 = csrf;
-    r = s.call("GET", "/edit", {{"id","101"}}, ck); CHECK(r.status == 200 && has(r.body, "Purchase Price") && has(r.body, "Selling Price") && has(r.body, "value='499.50' readonly") && has(r.body, "name='cost'") && !has(r.body, "name='price'"));
-    r = s.call("GET", "/add", {}, ck); CHECK(r.status == 200 && has(r.body, "Purchase Price") && has(r.body, "Selling Price") && has(r.body, "data-markup='1.2'") && !has(r.body, "name='price'"));
-    // Add part: only the purchase price is typed; the selling price is computed (+20%) and a typed price is ignored
-    r = s.call("POST", "/add", {{"csrf",csrf},{"id","510"},{"pn","P510"},{"name","Chain"},{"category","Engine"},{"price","5"},{"cost","250"},{"qty","2"},{"min","1"}}, ck); CHECK(r.status == 303 && has(r.headers["Location"], "ok") && in.find(510) && in.find(510)->costPrice() == 250.0 && in.find(510)->price() == 300.0);
-    r = s.call("POST", "/add", {{"csrf",csrf},{"id","511"},{"pn","P511"},{"name","NoCost"},{"category","Engine"},{"price","5"},{"qty","2"},{"min","1"}}, ck); CHECK(has(r.headers["Location"], "err") && !in.find(511));   // purchase price is required
-    CHECK(s.call("POST", "/delete", {{"csrf",csrf},{"id","510"}}, ck).status == 303 && !in.find(510));
+    // Staff session
+    auto lj = s.call("POST", "/login", {{"username","juan"},{"password","juanpass1"}});
+    std::string ck2 = lj.headers["Set-Cookie"].substr(0, lj.headers["Set-Cookie"].find(';'));
+    r = s.call("GET", "/", {}, ck2); CHECK(r.status == 200 && !has(r.body, "btn sm danger") && !has(r.body, ">Reports<") && has(r.body, ">Sell<"));
+    CHECK(!has(r.body, "Margin</th>") && !has(r.body, "Suppliers</a>"));   // p2supplier: Staff see no costs or margins
+    r = s.call("GET", "/suppliers", {}, ck2); CHECK(r.status == 403);
+    std::string csrf2 = csrfOf(r.body);
+    CHECK(s.call("GET", "/reports", {}, ck2).status == 403);
+    CHECK(s.call("GET", "/users", {}, ck2).status == 403);
+    CHECK(s.call("GET", "/audit", {}, ck2).status == 403);
+    CHECK(s.call("GET", "/export/inventory.csv", {}, ck2).status == 403);
+    CHECK(s.call("POST", "/delete", {{"csrf",csrf2},{"id","101"}}, ck2).status == 403);
+    CHECK(s.call("POST", "/edit", {{"csrf",csrf2},{"id","101"},{"name","x"},{"category","Engine"},{"price","1"},{"min","1"}}, ck2).status == 403);
+    CHECK(s.call("POST", "/add", {{"csrf",csrf2},{"id","900"},{"name","x"},{"category","Engine"},{"price","1"},{"qty","1"},{"min","1"}}, ck2).status == 403);
+    CHECK(in.find(101) && in.find(101)->price() == 499.5);
     r = s.call("POST", "/stock", {{"csrf",csrf2},{"id","101"},{"action","adjust"},{"qty","-2"},{"note","damaged"}}, ck2); CHECK(has(r.headers["Location"], "ok"));
-    // sale: price tampering ignored (no price field for parts)
+    // staff sells (price tampering ignored: no price field for parts)
     r = s.call("POST", "/invoice", {{"csrf",csrf2},{"customer","Pedro <b>Santos</b>"},{"p_id_1","101"},{"p_qty_1","2"},{"s_desc_1","Labor"},{"s_qty_1","1"},{"s_price_1","200"}}, ck2);
     CHECK(r.status == 303 && has(r.headers["Location"], "INV-000001"));
     r = s.call("GET", "/invoice", {{"no","INV-000001"}}, ck2); CHECK(has(r.body, "Pedro &lt;b&gt;Santos") && has(r.body, "1,199.00") && has(r.body, "Print receipt") && has(r.body, "Labor"));
     r = s.call("POST", "/invoice", {{"csrf",csrf2},{"p_id_1","101"},{"p_qty_1","9999"}}, ck2); CHECK(has(r.headers["Location"], "Not%20enough%20stock"));
     // ===== Phase 2: credit sales (utang) =====
-    CHECK(has(s.call("GET", "/", {}, ck2).body, "Accounts Receivable") && has(s.call("GET", "/", {}, ck2).body, "Daily cash report"));
+    CHECK(has(s.call("GET", "/", {}, ck2).body, "Receivables / Utang") && has(s.call("GET", "/", {}, ck2).body, "Daily cash report"));
     r = s.call("POST", "/invoice", {{"csrf",csrf2},{"customer",""},{"p_id_1","103"},{"p_qty_1","2"},{"amount_paid","50"},{"method","Cash"}}, ck2);
     CHECK(has(r.headers["Location"], "needs%20a%20customer") && in.find(103)->quantity() == 30);        // walk-in cannot owe, stock untouched
     r = s.call("POST", "/invoice", {{"csrf",csrf2},{"customer","Mang Tonyo"},{"p_id_1","103"},{"p_qty_1","2"},{"amount_paid","abc"}}, ck2);
@@ -122,11 +128,11 @@ int main() {
     CHECK(s.call("GET", "/cash-report").headers["Location"] == "/login");
 
     // ===== Phase 2: vehicle compatibility =====
-    r = s.call("POST", "/add", {{"csrf",csrf},{"id","600"},{"name","Piston Kit"},{"category","Engine"},{"cost","750"},{"qty","4"},{"min","1"},{"models","Bajaj RE 4S, Bajaj RE Maxima; <b>x</b>"}}, ck);
+    r = s.call("POST", "/add", {{"csrf",csrf},{"id","600"},{"name","Piston Kit"},{"category","Engine"},{"price","900"},{"qty","4"},{"min","1"},{"models","Bajaj RE 4S, Bajaj RE Maxima; <b>x</b>"}}, ck);
     CHECK(r.status == 303 && in.find(600) && in.find(600)->fitsModel("Bajaj RE Maxima") && in.find(600)->fitsModel("Bajaj RE 4S"));
-    r = s.call("POST", "/add", {{"csrf",csrf},{"id","601"},{"name","Clutch Cable"},{"category","Transmission"},{"cost","125"},{"qty","4"},{"min","1"},{"models","Bajaj RE Compact"}}, ck);
+    r = s.call("POST", "/add", {{"csrf",csrf},{"id","601"},{"name","Clutch Cable"},{"category","Transmission"},{"price","150"},{"qty","4"},{"min","1"},{"models","Bajaj RE Compact"}}, ck);
     CHECK(r.status == 303 && in.find(601));
-    r = s.call("POST", "/add", {{"csrf",csrf},{"id","602"},{"name","Long"},{"category","Engine"},{"cost","1"},{"qty","1"},{"min","1"},{"models",std::string(400, 'z')}}, ck);
+    r = s.call("POST", "/add", {{"csrf",csrf},{"id","602"},{"name","Long"},{"category","Engine"},{"price","1"},{"qty","1"},{"min","1"},{"models",std::string(400, 'z')}}, ck);
     CHECK(has(r.headers["Location"], "too%20long") && !in.find(602));
     r = s.call("GET", "/", {}, ck2);
     CHECK(has(r.body, "<select id='model'") && has(r.body, "All vehicle models") && has(r.body, "<option>Bajaj RE 4S</option>") && has(r.body, "<option>Bajaj RE Maxima</option>") &&
@@ -135,10 +141,11 @@ int main() {
     r = s.call("GET", "/", {{"model","bajaj re compact"}}, ck2); CHECK(has(r.body, "<option selected>Bajaj RE Compact</option>") && !has(r.body, "<option selected>Bajaj RE 4S"));
     r = s.call("GET", "/static/app.js"); CHECK(has(r.body, "getElementById('model')") && has(r.body, "r.hay"));
     r = s.call("GET", "/edit", {{"id","601"}}, ck); CHECK(has(r.body, "name='models'") && has(r.body, "value='Bajaj RE Compact'"));
-    r = s.call("POST", "/edit", {{"csrf",csrf},{"id","601"},{"name","Clutch Cable"},{"category","Transmission"},{"min","1"}}, ck);   // old form without the models field
-    CHECK(has(r.headers["Location"], "ok") && in.find(601)->fitsModel("Bajaj RE Compact") && in.find(601)->price() == 150.0 && in.find(600)->price() == 900.0);   // 125 x 1.20 and 750 x 1.20
-    r = s.call("POST", "/edit", {{"csrf",csrf},{"id","601"},{"name","Clutch Cable"},{"category","Transmission"},{"min","1"},{"models","Bajaj RE Compact, Bajaj RE Maxima"}}, ck);
+    r = s.call("POST", "/edit", {{"csrf",csrf},{"id","601"},{"name","Clutch Cable"},{"category","Transmission"},{"price","160"},{"min","1"}}, ck);   // old form without the field
+    CHECK(has(r.headers["Location"], "ok") && in.find(601)->fitsModel("Bajaj RE Compact"));
+    r = s.call("POST", "/edit", {{"csrf",csrf},{"id","601"},{"name","Clutch Cable"},{"category","Transmission"},{"price","160"},{"min","1"},{"models","Bajaj RE Compact, Bajaj RE Maxima"}}, ck);
     CHECK(has(r.headers["Location"], "ok") && in.find(601)->fitsModel("Bajaj RE Maxima"));
+    CHECK(s.call("POST", "/edit", {{"csrf",csrf2},{"id","601"},{"name","x"},{"category","Engine"},{"price","1"},{"min","1"},{"models","hack"}}, ck2).status == 403);
     CHECK(!in.find(601)->fitsModel("hack"));
     r = s.call("POST", "/import", {{"csrf",csrf},{"csv","id,name,system,price,quantity,compatible_models\n601,,,,4,Bajaj RE Compact\n"}}, ck); CHECK(has(r.body, "1 updated") && !in.find(601)->fitsModel("Bajaj RE Maxima"));
 
@@ -148,8 +155,8 @@ int main() {
         const double oldReceivable = reports::totalReceivable(in.invoices().all());
         CHECK(s.call("GET", "/customers").headers["Location"] == "/login");
         CHECK(s.call("GET", "/vehicle", {{"id","1"}}).headers["Location"] == "/login");
-        for (auto* who : {&ck, &ck2}) {   // the owner works with customers
-            r = s.call("GET", "/customers", {}, *who); CHECK(r.status == 200 && has(r.body, "Search by name, phone or plate number") && has(r.body, "No customers yet") && has(r.body, ">Customers</a>"));
+        for (auto* who : {&ck, &ck2}) {   // Staff and Admin both work with customers
+            r = s.call("GET", "/customers", {}, *who); CHECK(r.status == 200 && has(r.body, "Search by name, phone, plate number or customer ID") && has(r.body, "No customers yet") && has(r.body, ">Customers</a>"));
         }
         CHECK(s.call("POST", "/customer/save", {{"name","No Token"}}, ck2).status == 403);                      // CSRF
         r = s.call("POST", "/customer/save", {{"csrf",csrf2},{"id","0"},{"name",""}}, ck2); CHECK(has(r.headers["Location"], "err") && in.invoices().all().size() == oldInvoiceCount);
@@ -159,8 +166,8 @@ int main() {
         CHECK(has(r.headers["Location"], "/customer?id=2"));
         r = s.call("POST", "/customer/save", {{"csrf",csrf2},{"id","0"},{"name","aling  NENA"},{"phone","09182223333"}}, ck2); CHECK(has(r.headers["Location"], "err") && has(r.headers["Location"], "already%20exists"));
         r = s.call("GET", "/customer/edit", {{"name","aling  NENA"}}, ck2); CHECK(r.status == 200 && has(r.body, "value='aling  NENA'"));   // typed values survive an error
-        r = s.call("POST", "/customer/save", {{"csrf",csrf2},{"id","0"},{"name","<script>alert(2)</script>"}}, ck2); CHECK(has(r.headers["Location"], "kind=ok"));
-        r = s.call("GET", "/customers", {}, ck2); CHECK(has(r.body, "Mang Tonyo") && has(r.body, "Aling Nena") && has(r.body, "&lt;script&gt;alert(2)") && !has(r.body, "<script>alert(2)"));
+        r = s.call("POST", "/customer/save", {{"csrf",csrf2},{"id","0"},{"name","<script>alert(x)</script>"}}, ck2); CHECK(has(r.headers["Location"], "kind=ok"));
+        r = s.call("GET", "/customers", {}, ck2); CHECK(has(r.body, "Mang Tonyo") && has(r.body, "Aling Nena") && has(r.body, "&lt;script&gt;alert(x)") && !has(r.body, "<script>alert(x)"));
         r = s.call("GET", "/customer", {{"id","1"}}, ck2); CHECK(has(r.body, "&lt;b&gt;trike&lt;/b&gt;") && !has(r.body, "<b>trike</b>") && has(r.body, "Customer info") && has(r.body, "Invoice history"));
         CHECK(has(s.call("GET", "/customer", {{"id","77"}}, ck2).headers["Location"], "not%20found"));
 
@@ -190,7 +197,7 @@ int main() {
         r = s.call("GET", "/vehicle", {{"id","1"}}, ck2); CHECK(r.status == 200 && has(r.body, "ABC123") && has(r.body, "Bajaj RE Maxima") && has(r.body, "No invoices yet."));
 
         // Aling Nena already owes 180 on the OLD free-text invoice INV-000003: her record shows it ("by name"), same number as Receivables
-        r = s.call("GET", "/customer", {{"id","2"}}, ck2); CHECK(has(r.body, "INV-000003") && has(r.body, "(by name)") && has(r.body, "&#8369;180.00") && has(r.body, "Outstanding balance"));
+        r = s.call("GET", "/customer", {{"id","2"}}, ck2); CHECK(has(r.body, "INV-000003") && has(r.body, "(by name)") && has(r.body, "&#8369;180.00") && has(r.body, "Utang balance"));
         r = s.call("GET", "/receivables", {}, ck2); CHECK(has(r.body, "href='/customer?id=2'") && has(r.body, "&#8369;180.00"));
 
         // New sale: pick a saved customer + vehicle
@@ -236,7 +243,12 @@ int main() {
         r = s.call("POST", "/payment", {{"csrf",csrf2},{"no","INV-000004"},{"amount","80"},{"method","Cash"},{"balance","80.00"}}, ck2); CHECK(has(r.headers["Location"], "kind=ok"));
         r = s.call("GET", "/customer", {{"id","2"}}, ck2); CHECK(has(r.body, "&#8369;180.00") && !has(r.body, "&#8369;260.00"));
 
-        // archive / delete; history is never deleted
+        // archive / delete are Admin only; history is never deleted
+        CHECK(s.call("POST", "/customer/archive", {{"csrf",csrf2},{"id","2"},{"on","1"}}, ck2).status == 403);
+        CHECK(s.call("POST", "/customer/delete", {{"csrf",csrf2},{"id","2"}}, ck2).status == 403);
+        CHECK(s.call("POST", "/vehicle/archive", {{"csrf",csrf2},{"id","1"},{"on","1"}}, ck2).status == 403);
+        CHECK(s.call("POST", "/vehicle/delete", {{"csrf",csrf2},{"id","1"}}, ck2).status == 403);
+        r = s.call("GET", "/customer", {{"id","2"}}, ck2); CHECK(!has(r.body, ">Archive<") && !has(r.body, ">Delete<"));
         r = s.call("GET", "/customer", {{"id","2"}}, ck); CHECK(has(r.body, ">Archive<") && !has(r.body, ">Delete<"));      // admin sees Archive; Delete is hidden because of the history
         r = s.call("POST", "/customer/delete", {{"csrf",csrf},{"id","2"}}, ck); CHECK(has(r.headers["Location"], "err") && has(r.headers["Location"], "archive") && in.invoices().find("INV-000004") && !s.call("GET", "/customer", {{"id","2"}}, ck).body.empty());
         r = s.call("POST", "/vehicle/delete", {{"csrf",csrf},{"id","1"}}, ck); CHECK(has(r.headers["Location"], "err") && has(r.headers["Location"], "archive"));
@@ -303,8 +315,14 @@ int main() {
         r = s.call("DELETE", "/api/jobs/JOB-000001/lines/1", {}, ck, "", tok);
         CHECK(r.status == 200 && in.find(103)->quantity() == stock103);              // ...and comes straight back
 
-        // jobs and the service catalogue are both available to the owner
-        CHECK(s.call("GET", "/jobs", {}, ck).status == 200 && s.call("GET", "/api/services", {}, ck).status == 200);
+        // Staff work with jobs, but the service catalogue is Admin-only
+        std::string acsrf2;
+        { std::string p2 = s.call("GET", "/jobs", {}, ck2).body; auto at = p2.find("data-csrf=\"");
+          if (at != std::string::npos) acsrf2 = p2.substr(at + 11, 64); }
+        const std::map<std::string, std::string> tok2{{"X-CSRF-Token", acsrf2}};
+        CHECK(s.call("GET", "/jobs", {}, ck2).status == 200);
+        CHECK(s.call("GET", "/api/services", {}, ck2).status == 200);
+        CHECK(s.call("POST", "/api/services", {}, ck2, "{\"name\":\"Wash\"}", tok2).status == 403);
 
         // a cross-site post has no token; a signed-out caller gets 401
         CHECK(s.call("POST", "/api/jobs", {{"complaint", "x"}}, ck, "", {}).status == 403);   // no CSRF token
@@ -328,16 +346,15 @@ int main() {
     r = s.call("POST", "/backup", {{"csrf",csrf}}, ck); CHECK(has(r.headers["Location"], "ok"));
     CHECK(fs::exists(dir + "/backups"));
     r = s.call("POST", "/delete", {{"csrf",csrf},{"id","500"}}, ck); CHECK(has(r.headers["Location"], "ok") && !in.find(500));
-    r = s.call("POST", "/account/password", {{"csrf",csrf},{"current","bosspass1"},{"password","brandnew99"}}, ck); CHECK(has(r.headers["Location"], "ok"));
-    CHECK(s.call("GET", "/", {}, ck).status == 200);   // the current session stays signed in
+    r = s.call("POST", "/users/reset", {{"csrf",csrf},{"username","juan"},{"password","brandnew99"}}, ck); CHECK(has(r.headers["Location"], "ok"));
+    CHECK(s.call("GET", "/", {}, ck2).headers["Location"] == "/login");  // juan's session ended by the reset
     r = s.call("POST", "/logout", {{"csrf",csrf}}, ck); CHECK(r.status == 303);
     CHECK(s.call("GET", "/", {}, ck).headers["Location"] == "/login");
     // brute force lock
     for (int i = 0; i < 6; ++i) s.call("POST", "/login", {{"username","boss"},{"password","bad"}});
     r = s.call("POST", "/login", {{"username","boss"},{"password","bosspass1"}}); CHECK(has(r.headers["Location"], "Too%20many"));
     std::string events; for (auto& e : au.entries()) events += e.event + ",";
-    for (const char* e : {"LOGIN", "LOGOUT", "LOGIN_FAILED", "PRICE_CHANGE", "RECORD_DELETED", "PASSWORD_CHANGED", "BACKUP", "IMPORT", "ACCOUNT_CREATED", "CREDIT_SALE", "PAYMENT_RECORDED", "PART_MODELS_CHANGED"}) CHECK(has(events, e));
-    CHECK(!has(events, "ACCESS_DENIED") && !has(events, "USER_CREATED") && !has(events, "ROLE_CHANGED"));
+    for (const char* e : {"LOGIN", "LOGOUT", "LOGIN_FAILED", "PRICE_CHANGE", "RECORD_DELETED", "PASSWORD_RESET", "ACCESS_DENIED", "BACKUP", "IMPORT", "USER_CREATED", "CREDIT_SALE", "PAYMENT_RECORDED", "PART_MODELS_CHANGED"}) CHECK(has(events, e));
     fs::remove_all(dir);
     std::cout << (fails ? "E2E FAILED\n" : "WEB E2E PASSED\n"); return fails ? 1 : 0;
 }

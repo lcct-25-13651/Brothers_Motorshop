@@ -23,31 +23,28 @@ int main() {
     fs::create_directories(dir);
     const std::string d = dir.string();
 
-    // ---- auth: single owner account ----
+    // ---- auth / RBAC ----
     {
         auth::Authenticator a((dir / "users.csv").string());
         CHECK(!a.isConfigured());
         CHECK(a.initialSetup("owner", "correct-horse", "First pet name?", "fluffy-the-cat").empty());
         CHECK(a.login("OWNER", "correct-horse").has_value());
-        CHECK(*a.login("OWNER", "correct-horse") == "owner");
         CHECK(!a.login("owner", "wrong-password").has_value());
-        CHECK(!a.initialSetup("second", "another-pass1", "First pet name?", "fluffy-the-cat").empty());  // only one account ever
+        CHECK(a.addUser("juan", "staffpass1", auth::Role::Staff).empty());
+        CHECK(!a.addUser("juan", "staffpass1", auth::Role::Staff).empty());  // duplicate
+        CHECK(!a.removeUser("owner").empty());                               // last admin
+        CHECK(!a.setRole("owner", auth::Role::Staff).empty());
         auth::Authenticator reload((dir / "users.csv").string());            // persisted + salted
-        CHECK(reload.isConfigured() && reload.exists("owner") && !reload.exists("juan"));
-        CHECK(reload.changePassword("owner", "correct-horse", "newpass123").empty());
-        CHECK(!reload.login("owner", "correct-horse").has_value());
-        CHECK(reload.login("owner", "newpass123").has_value());
-        // a leftover Staff row from an older version's users.csv is ignored: it cannot log in
-        {
-            const std::string salt = auth::randomSalt("juan");
-            std::ofstream f((dir / "users_old.csv").string());
-            f << "juan," << salt << ',' << auth::hashPassword(salt, "staffpass1") << ",Staff,,,\n";
-            const std::string osalt = auth::randomSalt("boss");
-            f << "boss," << osalt << ',' << auth::hashPassword(osalt, "bosspass12") << ",Admin,,,\n";
-        }
-        auth::Authenticator old((dir / "users_old.csv").string());
-        CHECK(!old.exists("juan") && !old.login("juan", "staffpass1").has_value());
-        CHECK(old.login("boss", "bosspass12").has_value());
+        CHECK(reload.users().size() == 2);
+        CHECK(reload.login("juan", "staffpass1")->second == auth::Role::Staff);
+        CHECK(auth::allowed(auth::Role::Staff, auth::Permission::Sell));
+        CHECK(auth::allowed(auth::Role::Staff, auth::Permission::AdjustStock));
+        CHECK(!auth::allowed(auth::Role::Staff, auth::Permission::DeletePart));
+        CHECK(!auth::allowed(auth::Role::Staff, auth::Permission::EditPart));
+        CHECK(!auth::allowed(auth::Role::Staff, auth::Permission::ViewReports));
+        CHECK(auth::allowed(auth::Role::Admin, auth::Permission::ManageUsers));
+        CHECK(reload.resetPassword("juan", "newpass123").empty());
+        CHECK(!reload.login("juan", "staffpass1").has_value());
         CHECK(reload.recoverPassword("owner", "  Fluffy-The-Cat ", "another-pass1").empty());
         auth::LoginThrottle th;
         for (int i = 0; i < 5; ++i) th.fail("k");
@@ -294,6 +291,47 @@ int main() {
         CHECK(!reg.saveCustomer(0, bad, id).empty());                        // name required
         bad.name = "walk-in CUSTOMER";
         CHECK(!reg.saveCustomer(0, bad, id).empty());                        // reserved word
+        // ---- phone detection (mobile vs landline), canonical format, name without digits, customer ID ----
+        {
+            using crm::PhoneKind;
+            auto kindOf = [](const char* t) { return crm::parsePhone(t); };
+            CHECK(kindOf("09171234567").kind == PhoneKind::Mobile && kindOf("09171234567").formatted == "0917 123 4567");
+            CHECK(kindOf("+63 917 123 4567").formatted == "0917 123 4567" && kindOf("639171234567").kind == PhoneKind::Mobile && kindOf("9171234567").kind == PhoneKind::Mobile);
+            CHECK(kindOf("0917-123-4567").kind == PhoneKind::Mobile);
+            CHECK(kindOf("(02) 8123 4567").kind == PhoneKind::Landline && kindOf("(02) 8123 4567").formatted == "(02) 8123 4567");
+            CHECK(kindOf("02-8123-4567").formatted == "(02) 8123 4567" && kindOf("8123 4567").formatted == "(02) 8123 4567" && kindOf("+63 2 8123 4567").kind == PhoneKind::Landline);
+            CHECK(kindOf("032 123 4567").kind == PhoneKind::Landline && kindOf("032 123 4567").formatted == "(032) 123 4567" && kindOf("+63 32 123 4567").formatted == "(032) 123 4567");
+            CHECK(kindOf("").kind == PhoneKind::None && kindOf("").error.empty() && kindOf("   ").error.empty());     // optional
+            CHECK(!kindOf("0917 123 456").error.empty());           // mobile one digit short
+            CHECK(!kindOf("0917 123 45678").error.empty());         // one digit too many
+            CHECK(!kindOf("123 4567").error.empty());               // landline without area code (not NCR style)
+            CHECK(!kindOf("0917abc4567").error.empty() && !kindOf("+1 212 555 0100").error.empty() && !kindOf("0917").error.empty());
+            CHECK(std::string(crm::phoneKindName(PhoneKind::Mobile)) == "Mobile" && std::string(crm::phoneKindName(PhoneKind::Landline)) == "Landline");
+
+            crm::Registry r2;
+            const std::filesystem::path d2 = std::filesystem::temp_directory_path() / "crm_phone_test";
+            std::filesystem::remove_all(d2); std::filesystem::create_directories(d2);
+            r2.open(d2.string());
+            int nid = 0;
+            crm::Customer a; a.name = "Ana Reyes"; a.phone = "02 8123 4567";
+            CHECK(r2.saveCustomer(0, a, nid).empty() && r2.findCustomer(nid)->phone == "(02) 8123 4567");           // stored in canonical form
+            crm::Customer b; b.name = "Ben 2"; CHECK(!r2.saveCustomer(0, b, nid).empty());                           // digit in name
+            b.name = "09171234567"; CHECK(!r2.saveCustomer(0, b, nid).empty());                                      // a phone number typed as the name
+            b.name = "Juan"; b.phone = "12345"; CHECK(!r2.saveCustomer(0, b, nid).empty());                          // bad phone refused
+            b.name = "---"; b.phone = ""; CHECK(!r2.saveCustomer(0, b, nid).empty());                                // no letters
+            b.name = "Mu\xC3\xB1oz, Jose Jr."; CHECK(r2.saveCustomer(0, b, nid).empty());                           // UTF-8 letters, comma and dot are fine
+            // two people with the same name get different IDs
+            crm::Customer j1; j1.name = "Juan dela Cruz"; j1.phone = "0917 111 0001";
+            crm::Customer j2 = j1; j2.phone = "0918 111 0002";
+            int i1 = 0, i2 = 0;
+            CHECK(r2.saveCustomer(0, j1, i1).empty() && r2.saveCustomer(0, j2, i2).empty() && i1 != i2);
+            CHECK(crm::customerCode(i1) != crm::customerCode(i2) && crm::customerCode(7) == "CUST-0007" && crm::customerCode(12345) == "CUST-12345");
+            long long pid = 0;
+            CHECK(crm::parseCustomerCode("cust-0007", pid) && pid == 7 && crm::parseCustomerCode(" CUST 7 ", pid) && pid == 7 && !crm::parseCustomerCode("Juan", pid) && !crm::parseCustomerCode("CUST-", pid));
+            CHECK(r2.search(crm::customerCode(i2)).size() == 1 && r2.search(crm::customerCode(i2))[0].customer->id == i2);   // search by customer ID
+            std::filesystem::remove_all(d2);
+        }
+
         bad.name = std::string(61, 'x');
         CHECK(!reg.saveCustomer(0, bad, id).empty());
         CHECK(reg.customers().size() == 3);
@@ -425,11 +463,11 @@ int main() {
         {   // a namesake record makes the by-name match ambiguous: nobody is charged for it
             crm::Registry two;
             two.open(cd.string());
-            crm::Customer ns; ns.name = "JUAN dela cruz"; ns.phone = "0999";
+            crm::Customer ns; ns.name = "JUAN dela cruz"; ns.phone = "0999 123 4567";
             int nid = 0;
             CHECK(two.saveCustomer(0, ns, nid).empty());                    // a namesake with another phone number is allowed
-            ns.phone = "0999";
-            CHECK(!two.saveCustomer(0, ns, nid).empty());                   // ...the same phone again is not
+            ns.phone = "+63 999 123 4567";
+            CHECK(!two.saveCustomer(0, ns, nid).empty());                   // ...the same phone again is not (even typed another way)
             const crm::Balance linkedOnly = crm::customerBalance(in.invoices().all(), two, *two.findCustomer(1));
             CHECK(linkedOnly.openInvoices == 1 && linkedOnly.balance < jb.balance);
             CHECK(crm::balancesByCustomer(in.invoices().all(), two).count(nid) == 0);
@@ -469,37 +507,6 @@ int main() {
             fs::remove_all(pd);
         }
         fs::remove_all(cd);
-    }
-
-    // ================= selling price = purchase price (cost_price) * 1.20, automatic =================
-    {
-        CHECK(inv::sellingPriceFor(100.0) == 120.0 && inv::sellingPriceFor(99.99) == 119.99 && inv::sellingPriceFor(0.0) == 0.0);
-        CHECK(inv::sellingPriceFor(33.33) == 40.0);   // 39.996 -> whole centavos
-        // addPart: a purchase price overrides whatever selling price was passed in
-        inv::Part ap(3001, "Clutch Plate", "Transmission", 1.0, 5, 1);
-        ap.setCostPrice(250.0);
-        CHECK(in.addPart(ap, "owner").ok);
-        CHECK(in.find(3001)->costPrice() == 250.0 && in.find(3001)->price() == 300.0);
-        // updating the purchase price recomputes the selling price (and survives a reload)
-        CHECK(in.setSourcing(3001, 0, 400.0, "owner").ok);
-        CHECK(in.find(3001)->costPrice() == 400.0 && in.find(3001)->price() == 480.0);
-        { inv::Inventory again(d); CHECK(again.find(3001) && again.find(3001)->price() == 480.0 && again.find(3001)->costPrice() == 400.0); }
-        // supplier-only change (no purchase price given) leaves both prices alone
-        CHECK(in.setSourcing(3001, 0, std::nullopt, "owner").ok && in.find(3001)->price() == 480.0);
-        // clearing the purchase price (0) keeps the selling price as it was
-        CHECK(in.setSourcing(3001, 0, 0.0, "owner").ok && in.find(3001)->costPrice() == 0.0 && in.find(3001)->price() == 480.0);
-        // too large: purchase price * 1.20 would exceed the maximum selling price
-        CHECK(!in.setSourcing(3001, 0, 9000000.0, "owner").ok && in.find(3001)->price() == 480.0 && in.find(3001)->costPrice() == 0.0);
-        // a part without a purchase price (older data) keeps its stored selling price
-        inv::Part legacy(3002, "Old Part", "Engine", 77.5, 1, 1);
-        CHECK(in.addPart(legacy, "owner").ok && in.find(3002)->price() == 77.5);
-        // CSV import: a PurchasePrice column sets the selling price; an unchanged purchase price does not touch it
-        auto imp2 = in.importCsv("id,name,system,price,quantity,purchase_price\n3003,Spring,Chassis,1,4,200\n3002,,,,1,\n", "owner");
-        CHECK(imp2.problems.empty() && in.find(3003) && in.find(3003)->costPrice() == 200.0 && in.find(3003)->price() == 240.0);
-        auto imp3 = in.importCsv("id,price,quantity,purchase_price\n3003,999,4,200\n", "owner");   // same purchase price: stays as it was
-        CHECK(in.find(3003)->price() == 999.0 && imp3.problems.empty());
-        auto imp4 = in.importCsv("id,price,quantity,purchase_price\n3003,999,4,300\n", "owner");   // changed purchase price: selling price follows
-        CHECK(in.find(3003)->price() == 360.0 && in.find(3003)->costPrice() == 300.0 && imp4.problems.empty());
     }
 
     CHECK(in.removePart(106, "owner").ok);

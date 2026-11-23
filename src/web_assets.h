@@ -32,7 +32,6 @@ th.asc::after{content:" \25B2"}th.desc::after{content:" \25BC"}
 tr.low td{background:#fffaf0}tr[hidden]{display:none}
 .tag{display:inline-block;padding:.1rem .55rem;border-radius:99px;font-size:.78rem;font-weight:600;white-space:nowrap}
 .tag.ok{background:var(--okbg);color:var(--ok)}.tag.low{background:var(--warnbg);color:var(--warn)}.tag.out{background:var(--badbg);color:var(--bad)}
-.tag.adm{background:#e8eefc;color:var(--pri2)}.tag.stf{background:#eef0f3;color:#445}
 .plus{color:var(--ok);font-weight:600}.minus{color:var(--bad);font-weight:600}
 .btn,button{font:inherit;cursor:pointer;border:1px solid var(--pri);background:var(--pri);color:#fff;border-radius:7px;padding:.4rem .85rem;text-decoration:none;display:inline-block}
 .btn:hover,button:hover{background:var(--pri2)}
@@ -468,32 +467,6 @@ inline constexpr const char* kJs = R"JS(
   if (f && t) f.addEventListener('change', function () {
     if (f.files[0]) f.files[0].text().then(function (s) { t.value = s; if (window.confirm('Import ' + f.files[0].name + ' now?')) t.form.submit(); });
   });
-  // ---- Customer form: name takes no digits; phone is recognised live as Mobile (SIM) or Landline (mirrors crm::parsePhone) ----
-  var nameIn = document.querySelector('input[data-person]'), phoneIn = document.querySelector('input[data-phone]');
-  var say = function (id, cls, msg) { var e = document.getElementById(id); if (e) { e.className = cls; e.textContent = msg; } };
-  if (nameIn) nameIn.addEventListener('input', function () {
-    var clean = nameIn.value.replace(/[0-9]/g, '');
-    if (clean !== nameIn.value) { nameIn.value = clean; say('name-hint', 'minus', 'Numbers are not allowed in a name. Put the phone number in the Phone box.'); }
-    else say('name-hint', 'mut', '');
-  });
-  if (phoneIn) {
-    var checkPhone = function () {
-      var raw = phoneIn.value.trim();
-      if (!raw) { say('phone-hint', 'mut', ''); return; }
-      if (/[^0-9+\s().-]/.test(raw) || raw.indexOf('+') > 0) { say('phone-hint', 'minus', 'Digits only, please (spaces, dashes and brackets are fine).'); return; }
-      var d = raw.replace(/\D/g, '');
-      if (raw.charAt(0) === '+') { if (d.indexOf('63') !== 0) { say('phone-hint', 'minus', 'Only Philippine numbers (+63).'); return; } d = '0' + d.slice(2); }
-      else if (/^63\d{9,10}$/.test(d)) d = '0' + d.slice(2);
-      else if (/^9\d{9}$/.test(d)) d = '0' + d;
-      else if (/^[2-9]\d{7}$/.test(d)) d = '02' + d;
-      if (/^09\d{9}$/.test(d)) say('phone-hint', 'plus', 'Mobile number (SIM) detected');
-      else if (/^02[2-9]\d{7}$/.test(d) || /^0[3-8]\d{8}$/.test(d)) say('phone-hint', 'plus', 'Landline number detected');
-      else if (/^09/.test(d)) say('phone-hint', d.length < 11 ? 'mut' : 'minus', d.length < 11 ? 'Mobile number? Keep typing - it needs 11 digits.' : 'A mobile number has 11 digits.');
-      else say('phone-hint', d.length < 10 ? 'mut' : 'minus', d.length < 10 ? 'Keep typing...' : 'Not a valid PH number. Landlines need the area code, e.g. (02) 8123 4567.');
-    };
-    phoneIn.addEventListener('input', checkPhone);
-    checkPhone();
-  }
   // ---- New sale: customer / vehicle autocomplete (the server also resolves the typed text, so this is only a convenience) ----
   var cin = document.getElementById('cust-in'), cid = document.getElementById('cust-id'),
       vin = document.getElementById('veh-in'), vid = document.getElementById('veh-id'),
@@ -557,9 +530,12 @@ inline constexpr const char* kJs = R"JS(
   var saleParts = document.getElementById('part-rows'), saleSvc = document.getElementById('svc-rows'), saleList = document.getElementById('plist');
   if (saleParts) {
     var peso = function (n) { return '\u20B1' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); };
-    var priceOf = {}, idOf = {};
+    var priceOf = {}, idOf = {}, stockOf = {};
     if (saleList) Array.prototype.forEach.call(saleList.options, function (o) {
       var p = parseFloat(o.getAttribute('data-price'));
+      var sk = parseInt(o.getAttribute('data-stock'), 10);
+      stockOf[o.value.toLowerCase()] = sk;
+      stockOf[o.getAttribute('data-id')] = sk;
       priceOf[o.value.toLowerCase()] = p;
       priceOf[o.getAttribute('data-id')] = p;
       idOf[o.value.toLowerCase()] = o.getAttribute('data-id');
@@ -589,6 +565,12 @@ inline constexpr const char* kJs = R"JS(
       if (!t || !t.name || t.name.indexOf('p_id_') !== 0) return;
       var k = idOf[t.value.trim().toLowerCase()];
       if (k === undefined) return;
+      if (stockOf[k] === 0) {   // strict: a part with 0 stock can never be put on a sale
+        t.value = '';
+        recalc();
+        window.alert('OUT OF STOCK: that part has 0 units in stock, so it cannot be ordered.');
+        return;
+      }
       for (var i = 0; i < saleParts.rows.length; i++) {
         var o = saleParts.rows[i].querySelectorAll('input');
         if (o[0] !== t && idOf[o[0].value.trim().toLowerCase()] === k) {
@@ -601,6 +583,15 @@ inline constexpr const char* kJs = R"JS(
       }
     });
     saleParts.closest('form').addEventListener('input', recalc);
+    saleParts.closest('form').addEventListener('submit', function (e) {   // last line of defence in the browser (the server checks again)
+      var bad = null;
+      Array.prototype.forEach.call(saleParts.rows, function (tr) {
+        var ins = tr.querySelectorAll('input'), key = ins[0].value.trim().toLowerCase(), qty = parseInt(ins[1].value, 10);
+        if (!bad && stockOf[key] === 0) bad = 'OUT OF STOCK: "' + ins[0].value.trim() + '" has 0 units, so it cannot be ordered. Remove that row.';
+        else if (!bad && stockOf[key] > 0 && qty > stockOf[key]) bad = 'Not enough stock for "' + ins[0].value.trim() + '": ' + stockOf[key] + ' available, ' + qty + ' requested.';
+      });
+      if (bad) { e.preventDefault(); window.alert(bad); }
+    });
     var payType = document.getElementById('pay-type');
     if (payType) {
       var amtInput = document.querySelector('input[name="amount_paid"]'), amtLabel = document.getElementById('amt-label');
@@ -615,7 +606,7 @@ inline constexpr const char* kJs = R"JS(
     var addBtn = document.getElementById('add-part-row');
     if (addBtn) addBtn.addEventListener('click', recalc);
 
-    // ---- new sale: the order being typed is kept while the cashier visits other pages and comes back (per browser tab, per user) ----
+    // ---- new sale: the order being typed is kept while the owner visits other pages and comes back (per browser tab, per user) ----
     var saleForm = document.getElementById('sale-form');
     if (saleForm) {
       var draftKey = 'sale-draft', draftUser = saleForm.getAttribute('data-draft-user') || '', store = null;
@@ -676,6 +667,19 @@ inline constexpr const char* kJs = R"JS(
     }
     recalc();
   }
+  // ---- Add / Edit part: Selling Price is computed live from the Purchase Price (selling = purchase x 1.20; the server recomputes it) ----
+  Array.prototype.forEach.call(document.querySelectorAll('input[data-markup]'), function (buy) {
+    var out = document.getElementById(buy.getAttribute('data-target'));
+    var factor = parseFloat(buy.getAttribute('data-markup')) || 1.2;
+    if (!out) return;
+    function show() {
+      var v = parseFloat(buy.value);
+      if (isFinite(v) && v > 0) out.value = (Math.round(v * factor * 100) / 100).toFixed(2);
+      else if (buy.required) out.value = '';
+    }
+    buy.addEventListener('input', show);
+    if (buy.value !== '') show();
+  });
   // ---- show / hide password: a checkbox with data-toggle-pw="<id of the password box>" ----
   Array.prototype.forEach.call(document.querySelectorAll('input[data-toggle-pw]'), function (cb) {
     var target = document.getElementById(cb.getAttribute('data-toggle-pw'));

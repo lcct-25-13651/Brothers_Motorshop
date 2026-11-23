@@ -9,7 +9,7 @@ CMakeLists.txt  Makefile  README.md
 third_party/httplib.h        <- you add this (single header, see below)
 src/
   util.h/.cpp       CSV, time, HTML-escape, atomic file writes
-  auth.h/.cpp       accounts, salted SHA-256 (20,000 rounds), roles + permissions, login throttle, audit.csv
+  auth.h/.cpp       the owner's account, salted SHA-256 (20,000 rounds), login throttle, audit.csv
   inventory.h/.cpp  parts.csv (incl. cost_price, compatible_models), movements.csv, invoices.csv + payments.csv (credit sales), CSV import/export, backups
   reports.h/.cpp    top sellers, daily/weekly/monthly revenue & expenses, dead stock, reorder list, receivables, daily cash report
   crm.h             Phase 3: customers.csv + vehicles.csv, search, vehicle/customer history (header-only)
@@ -21,6 +21,26 @@ src/
 tests/              smoke_test.cpp (core logic), web_e2e.cpp + stub/ (web layer, no sockets),
                     jobs_test.cpp (Phase 4 core), api_e2e.cpp (Phase 4 endpoints)
 ```
+
+## Single user: the Business Owner (Admin)
+The system is used by one person only: the Business Owner. There are no staff, cashier or other accounts, no roles
+and no permission levels: whoever signs in with the owner account can use every page (inventory, sales, job orders,
+customers, receivables, reports, data & backups, audit). The *Users* page and the add-user / change-role /
+delete-user actions were removed, and `auth::Role`, `auth::Permission` and `auth::allowed` no longer exist.
+`users.csv` keeps its old 7-column layout (the 4th column is a fixed `Admin` marker) so existing files still load;
+rows of any other account are ignored. To change the password use *My account*; "Forgot password" uses the recovery question.
+
+## Purchase Price and Selling Price (automatic 20 % markup)
+- **Purchase Price** (`cost_price` in `parts.csv`) = how much the shop pays to get the item. **Selling Price** (`Price` in `parts.csv`) = what the customer pays.
+- The Selling Price is never typed in: **selling_price = cost_price x 1.20** (rounded to the centavo, `inv::sellingPriceFor` in `inventory.h`).
+  It is set automatically whenever a Purchase Price is entered or changed:
+  *Add part* (Purchase Price is required; the Selling Price box fills in live and is read-only), *Edit part*, *Restock* with
+  "Use this as the part's Purchase Price", and CSV import (`PurchasePrice` / `cost_price` column, only when the value is new or changed).
+- A part with no Purchase Price yet (older data) keeps its stored Selling Price until a Purchase Price is entered. Clearing a Purchase Price does not change the Selling Price.
+- Every automatic change is written to `audit.csv` as `PRICE_CHANGE`.
+- Screens now say *Selling Price* (was Price) and *Purchase Price* (was Cost / Cost price / Unit cost).
+  The CSV column names are unchanged (`Price`, `CostPrice`), so old files and exports still work.
+- `tools/seed_data.cpp` still estimates `cost_price` as 80 % of the receipt SRP; those parts keep their SRP as Selling Price until you enter the real Purchase Price.
 
 ## Build
 1. Download https://raw.githubusercontent.com/yhirose/cpp-httplib/master/httplib.h and save it as `third_party/httplib.h`.
@@ -40,7 +60,7 @@ vs. an in-process stand-in for httplib) and `apie2e` (Phase 4 endpoints).
 ```
 ./re_parts_tracker [--port 8080] [--host 127.0.0.1] [--data <folder>] [--shop "Shop name"] [--no-backup]
 ```
-Open http://localhost:8080. First start asks you to create the Admin account (an existing v2 `users.csv` is read as-is: its account becomes Admin) (an existing v2 `users.csv` is read as-is: its account becomes Admin).
+Open http://localhost:8080. First start asks you to create the owner (Admin) account. An existing `users.csv` is read as-is; leftover Staff accounts from older versions are ignored and cannot log in.
 Use `--host 0.0.0.0` so other PCs on the shop network can connect (the app speaks plain HTTP: keep it on a trusted network).
 
 If the app is shown **inside a frame on another site** (a shop portal, a kiosk screen, a hosted preview), start it with
@@ -57,34 +77,22 @@ instead of bouncing silently.
 signed in as that account, no cookie and no login screen, with one shared server-side session so CSRF tokens
 keep working.
 
-> Security: `--auto-login` means *anyone who can reach the app is that user* - Admin in the example. Use it only
+> Security: `--auto-login` means *anyone who can reach the app is that user* - the owner in the example. Use it only
 > on a machine that only the right people can reach, never for the shop's day-to-day till. It prints a warning at
 > start-up and writes an `AUTO_LOGIN` row to `audit.csv`.
 
 ## Phase 1 additions
 **Cost price.** `parts.csv` now has a 7th column, `cost_price` (what one unit costs the shop). Older 6-column files load fine (cost = 0) and are
-upgraded on the first save; the start-up backup still keeps the original file. Admins set it under *Add part* / *Edit part* or via CSV import
+upgraded on the first save; the start-up backup still keeps the original file. The owner sets it under *Add part* / *Edit part* or via CSV import
 (`cost_price` column; the older `UnitCost` column still means "what I paid for stock arriving in this import" and feeds the expense report).
 The **Top Sellers** report shows `COGS = units sold x cost_price`, `Net profit = Revenue - COGS` and `Margin % = Net profit / Revenue`.
 Parts with no cost price show "n/a" instead of a misleading 100 % margin. COGS uses the part's *current* cost_price.
 
-**Void invoice (Admin only).** *Invoices -> open an invoice -> Void invoice* (reason required). Nothing is deleted: `invoices.csv` is untouched,
+**Void invoice.** *Invoices -> open an invoice -> Void invoice* (reason required). Nothing is deleted: `invoices.csv` is untouched,
 one `VOID` row per part line is appended to `movements.csv` (positive quantity, `ref` = invoice number) and the part quantities in `parts.csv`
 go back up. A services-only invoice gets one marker row (part_id 0, quantity 0). An `INVOICE_VOIDED` event is written to `audit.csv`.
 A voided invoice is shown as VOIDED, cannot be voided twice, and its sales/services no longer count in revenue or Top Sellers
 (they drop out of their original period). If a part on the invoice has since been deleted, re-add it with the same ID first.
-
-## Customer records: phone type, names, customer ID
-- **Phone** (optional, Philippine numbers). The form recognises the number as you type and the app stores it in one format:
-  *Mobile / SIM* `0917 123 4567` (also accepts `+63 917...`, `63917...`, `917...`) or *Landline* `(02) 8123 4567` (Metro Manila; the
-  area code is assumed for a bare 8-digit number) and `(032) 123 4567` (provincial: area code + 7 digits). Anything else is refused with a reason.
-  The Customers list and the customer page show a **Mobile** / **Landline** tag. Old records with a non-standard number show *Check number*
-  until the customer is edited.
-- **Name** must contain letters and **no digits** (checked in the form, on the server, and for free-text names typed on the sale form).
-- **Customer ID**: every customer has a permanent, unique ID shown as `CUST-0001`, `CUST-0002`... (it is the existing numeric `id` in
-  `customers.csv`, so no data migration). Namesakes are told apart by it: it appears in the Customers list, on the customer page, in the sale-form
-  suggestions (`Juan dela Cruz - 0917 111 0001 [CUST-0001]`), and can be typed in the search box or in the sale form's Customer box.
-- Tests: `make custweb` (customer web rules) plus the new cases in `make test`.
 
 ## Importing the client's receipt (tools/seed_data.cpp)
 Standalone C++17 tool that adds the 75 parts from the supplier receipt to `parts.csv` (schema
@@ -107,11 +115,11 @@ make seed        # or: g++ -std=c++17 -O2 -Wall -Wextra tools/seed_data.cpp -o s
 - **Payment status.** Every invoice is `Paid`, `Partial` or `Unpaid`. *New sale* has an **Amount paid now** box and a **Payment method**
   (Cash, GCash, Maya, Bank transfer, Card). Blank = paid in full; a smaller number (or `0`) makes it a credit sale. Credit sales need a
   customer name (walk-in customers must pay in full). Stock is deducted at the time of sale as before.
-- **Receivables / Utang tab** (Staff + Admin): total outstanding, balance per customer (name variants like "Juan  Cruz"/"juan cruz" are merged),
+- **Accounts Receivable tab**: total outstanding, balance per customer (name variants like "Juan  Cruz"/"juan cruz" are merged),
   oldest unpaid date, and the open invoices with a **Record payment** button. The **Invoices** list shows paid / balance / status and has
   All / Unpaid / Partial / Paid filters. Receipts show the balance due and the payment history.
 - **Record payment.** Partial or full instalments; the full balance is pre-filled. Overpayment is refused. The form carries the balance the
-  cashier saw, so a double-click or a second cashier cannot apply the same payment twice.
+  owner saw, so a double-click or a second open tab cannot apply the same payment twice.
 - **Files.** `invoices.csv` gains two columns, `amount_paid` and `payment_status` (invoice-level, repeated on every line row, rewritten
   atomically on each payment). Old 9-column files are read as fully paid and upgraded on the first start (the start-up backup keeps the
   original; if damaged rows are found the file is also kept as `invoices.csv.bak`). New file `payments.csv`
@@ -120,7 +128,7 @@ make seed        # or: g++ -std=c++17 -O2 -Wall -Wextra tools/seed_data.cpp -o s
 - **Audit.** `audit.csv` gets `CREDIT_SALE` (a sale left with a balance) and `PAYMENT_RECORDED` (invoice, customer, amount, method, balance after, status, note).
 
 ### 2. Daily cash report (register close-out)
-*Daily cash report* in the menu (Staff + Admin; pick any past date). Shows invoice counts (paid / partial / unpaid), gross sales
+*Daily cash report* in the menu (pick any past date). Shows invoice counts (paid / partial / unpaid), gross sales
 (parts + services), **net collected** (every payment received that day, split into payments on today's invoices vs. earlier utang),
 credit given that day, all unpaid credit sales outstanding, a payment-method breakdown, expected cash in the drawer (Cash payments only) with
 blank *Counted cash / Over-short* lines, the day's invoices and payments, and signature lines. *Print report* gives a clean print layout.
@@ -128,14 +136,13 @@ Reports for past dates show invoice statuses as they stood at the end of that da
 
 ### 3. Vehicle compatibility
 - `compatible_models` (comma / semicolon / pipe separated, e.g. `Bajaj RE 4S, Bajaj RE Compact, Bajaj RE Maxima`) can now be typed in
-  *Add part* / *Edit part* (Admin) and imported with a `compatible_models` column.
+  *Add part* / *Edit part* and imported with a `compatible_models` column.
 - The inventory search box searches ID, name, system **and models**; several words must all match (`oil maxima`).
 - New **All vehicle models** drop-down next to the system filter lists every distinct model; choosing one shows only parts that list exactly
   that model (parts with no model data are hidden while a model is selected). `/?model=Bajaj%20RE%20Maxima` opens the page pre-filtered.
   A new *Fits (vehicle models)* column shows each part's models. Changing a part's models is written to the audit trail (`PART_MODELS_CHANGED`).
 - Note: `tools/seed_data.cpp` tags all 75 receipt parts with the generic `Bajaj RE`; fill in the specific models for the drop-down to be useful.
 
-Permissions: Staff can use Receivables and the Daily cash report (new permissions `Receivables`, `CashReport` in `auth.cpp::allowed`; remove them from the Staff list there to make them Admin-only).
 
 ## Phase 3 additions - customer & vehicle records
 
@@ -149,7 +156,7 @@ Permissions: Staff can use Receivables and the Daily cash report (new permission
 - **Plates** are stored UPPERCASE with all spaces removed (`" abc  1234 "` -> `ABC1234`; letters, digits and `-`, 2-12 characters) and are **unique** - archived vehicles count too.
 - All three files are covered by the normal start-up / *Backup now* copies (every `*.csv`). They hold personal data: they are in `.gitignore` - never commit them.
 
-### Pages (menu: *Customers*, Staff + Admin)
+### Pages (menu: *Customers*)
 - **Customers** (`/customers`): one search box for **name** (every word must match), **phone** (digits, at least 3) or **plate** (any spelling, at least 2 characters).
   Results show the plate that matched, the vehicles and the utang balance. *Show archived* reveals archived customers.
 - **Customer detail** (`/customer?id=`): info, vehicles, **utang balance**, **invoice history** (newest first, with *Record payment* on open ones), Edit / Add vehicle / New sale.
@@ -168,16 +175,15 @@ Permissions: Staff can use Receivables and the Daily cash report (new permission
 - Old free-text invoices are never rewritten or linked behind your back. On a customer's page they appear marked **(by name)** and **count in the utang balance**
   when the customer's name matches (ignoring case / extra spaces) *and* only one customer record has that name - so the figure equals the Receivables page.
 - Receivables / Utang is unchanged (still grouped by the name on the invoice); the customer name there links to the record when there is exactly one match.
-- A customer or vehicle **with invoices cannot be deleted - only archived** (Admin). Archived records disappear from the sale form but stay in every history and can still be found
-  (a plate of an archived vehicle still finds its owner); their old utang stays collectable. Only a record with no history (and a customer with no vehicles) can be deleted, by an Admin.
-- New permissions in `auth.cpp::allowed`: `Customers` (view / add / edit - Staff + Admin) and `ArchiveCustomers` (archive / restore / delete - Admin only).
+- A customer or vehicle **with invoices cannot be deleted - only archived**. Archived records disappear from the sale form but stay in every history and can still be found
+  (a plate of an archived vehicle still finds its owner); their old utang stays collectable. Only a record with no history (and a customer with no vehicles) can be deleted.
 - Audit events: `CUSTOMER_ADDED/UPDATED/ARCHIVED/RESTORED/DELETED`, `VEHICLE_ADDED/UPDATED/ARCHIVED/RESTORED/DELETED`.
 
 ---
 
 ### Tests
 `make test` (core: plate rules, uniqueness, search, archive/delete rules, persistence, history order, balances, upgrade of an 11-column `invoices.csv` with every value unchanged)
-and `make e2e` (web: add/edit/search by plate, linked + free-text sales, history pages, Staff vs Admin, CSRF, escaping, archive/restore, files on disk).
+and `make e2e` (web: add/edit/search by plate, linked + free-text sales, history pages, CSRF, escaping, archive/restore, files on disk).
 
 ## Phase 4 additions - job orders / repair tickets
 
@@ -197,7 +203,7 @@ tests/api_e2e.cpp     every endpoint, driven through the in-process httplib stan
 The two columns beyond the spec (`invoice_no`, `service_id`) are appended at the end and are optional on
 load: they are what Phase 5 (Job <-> Invoice) and Phase 6 (reminders) need, so no migration is required later.
 `services.csv` is created on first start with **Change Oil** (3 months / 3,000 km), **Brake Pad Replacement**
-(12 months / 10,000 km) and **Engine Overhaul** (36 months / 40,000 km); an Admin edits the fees and intervals.
+(12 months / 10,000 km) and **Engine Overhaul** (36 months / 40,000 km); the owner edits the fees and intervals.
 All three files are covered by the normal start-up / *Backup now* copies (every `*.csv`) and are in `.gitignore`
 (job orders hold customer data - never commit them).
 
@@ -237,7 +243,7 @@ job store is safe to call from several threads directly. `tests/jobs_test.cpp` h
 Lock order is always *request mutex -> JobBook mutex*, never the reverse.
 
 ### REST API (JSON)
-Sessions, roles and CSRF are the same as for the HTML pages: send the session cookie, and for `POST`/`DELETE`
+Sessions and CSRF are the same as for the HTML pages: send the session cookie, and for `POST`/`DELETE`
 the CSRF token either in the `X-CSRF-Token` header, as a `csrf` field, or inside the JSON body.
 
 | Method | Path | Permission | What it does |
@@ -255,14 +261,13 @@ the CSRF token either in the `X-CSRF-Token` header, as a `csrf` field, or inside
 | GET | `/api/jobs/<no>/card` | Jobs | everything the printed job card needs |
 | GET | `/api/jobs/<no>/history` | Jobs | the job's audit trail |
 | GET | `/api/services` | Jobs | the catalogue (`?all=1` includes inactive) |
-| POST | `/api/services` | **Admin** | add (`id` omitted) or edit a service |
-| POST | `/api/services/<id>/active` | **Admin** | activate / deactivate |
+| POST | `/api/services` | Jobs | add (`id` omitted) or edit a service |
+| POST | `/api/services/<id>/active` | Jobs | activate / deactivate |
 | GET | `/api/parts` | ViewInventory | `?q=&limit=&in_stock=1` - picker for part lines |
 | GET | `/api/vehicles` | Customers | `?q=&limit=` - plates for the new-job form |
 
 Failures are `{"ok":false,"error":"...","code":"not_found|conflict|bad_request|forbidden|unauthorized","status":404}`.
-Money is a number with two decimals (`450.00`). New permissions in `auth.cpp::allowed`: `Jobs` (Staff + Admin)
-and `ServiceCatalog` (Admin).
+Money is a number with two decimals (`450.00`). Every endpoint needs the owner's signed-in session.
 
 The **Job orders** page in the menu is a working reference client: server-rendered body, and
 `/static/jobs.js` calls the endpoints above with `fetch`. Replace it with your own TypeScript front-end when
